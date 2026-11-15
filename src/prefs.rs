@@ -42,6 +42,7 @@ impl Autoplay {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prefs {
     pub accent: String,
+    pub language: crate::i18n::Language,
     /// Highest resolution (0 = best there is).
     pub max_height: u32,
     pub codec: Codec,
@@ -62,6 +63,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Prefs {
             accent: "red".into(),
+            language: crate::i18n::Language::English,
             max_height: 2160,
             codec: Codec::Vp9,
             hdr: true,
@@ -87,6 +89,7 @@ impl Prefs {
             };
             let v = v.trim();
             match k.trim() {
+                "language" => p.language = crate::i18n::Language::from_key(v),
                 "accent" if crate::theme::ACCENTS.iter().any(|(n, _)| *n == v) => {
                     p.accent = v.into()
                 }
@@ -150,7 +153,8 @@ impl Prefs {
 
     pub fn to_conf(&self) -> String {
         format!(
-            "# CatTube settings\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\n",
+            "# CatTube settings\nlanguage = {}\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\n",
+            self.language.key(),
             self.accent,
             self.max_height,
             self.codec.key(),
@@ -201,6 +205,7 @@ mod tests {
     fn round_trip() {
         let p = Prefs {
             accent: "teal".into(),
+            language: crate::i18n::Language::Arabic,
             max_height: 1080,
             codec: Codec::Av1,
             hdr: false,

@@ -16,6 +16,9 @@ rm -rf "$A" && mkdir -p "$A/usr"
 cp -a "$S/bin" "$S/lib" "$A/usr/"
 patchelf --set-rpath '$ORIGIN/../lib' "$A/usr/bin/mpv"
 for f in "$A"/usr/lib/*; do patchelf --set-rpath '$ORIGIN' "$f"; done
+for notice in assets/fonts/LICENSE-*.txt; do
+  install -Dm644 "$notice" "$A/usr/share/licenses/cattube/$(basename "$notice")"
+done
 install -Dm644 assets/cattube-osd.lua "$A/usr/share/cattube/cattube-osd.lua"
 install -Dm644 assets/cattube-input.conf "$A/usr/share/cattube/cattube-input.conf"
 install -Dm644 packaging/io.github.coderastic.CatTube.metainfo.xml \

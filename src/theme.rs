@@ -146,11 +146,23 @@ fn load_face(w: Weight) -> Option<FontData> {
 /// Install fonts and base visuals. Call once from the app constructor.
 pub fn setup(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "cattube-arabic".into(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoSansArabic-Regular.ttf"
+        ))),
+    );
     let base = fonts
         .families
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
+    let mut base = base;
+    base.push("cattube-arabic".into());
+    fonts.families.insert(
+        FontFamily::Name("cattube-arabic".into()),
+        vec!["cattube-arabic".into()],
+    );
     let mut family = |w: Weight, key: &str| -> Vec<String> {
         let mut list = base.clone();
         // Regular is the fallback for the heavier weights.
@@ -184,4 +196,30 @@ pub fn setup(ctx: &egui::Context) {
     visuals.window_fill = rgb(BG_TOP);
     visuals.override_text_color = Some(text());
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bundled_arabic_font_covers_joined_letters_in_every_ui_weight() {
+        let ctx = egui::Context::default();
+        setup(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                for family in [
+                    FontFamily::Proportional,
+                    FontFamily::Name(MEDIUM.into()),
+                    FontFamily::Name(SEMIBOLD.into()),
+                ] {
+                    let font = egui::FontId::new(20.0, family);
+                    for c in "العربية مَرْحَبًا".chars().filter(|c| !c.is_whitespace())
+                    {
+                        assert!(fonts.has_glyph(&font, c), "missing {c:?}");
+                    }
+                }
+            });
+        })
+        .drop_without_applying_deltas();
+    }
 }

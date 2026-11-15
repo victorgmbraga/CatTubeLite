@@ -126,6 +126,8 @@ pub enum SettingRow {
     Hdr,
     Speed,
     Subtitles,
+    SubtitleLanguage,
+    Language,
     Autoplay,
     Buffer,
     /// The country recommendations are for.
@@ -180,6 +182,8 @@ pub fn group_of(row: SettingRow) -> SettingGroup {
         SettingRow::Quality | SettingRow::Codec | SettingRow::Hdr => SettingGroup::Video,
         SettingRow::Speed
         | SettingRow::Subtitles
+        | SettingRow::SubtitleLanguage
+        | SettingRow::Language
         | SettingRow::Autoplay
         | SettingRow::Buffer
         | SettingRow::Region => SettingGroup::Playback,
@@ -211,9 +215,11 @@ pub fn setting_rows(accounts: usize, sponsorblock: bool) -> Vec<SettingRow> {
         SettingRow::Hdr,
         SettingRow::Speed,
         SettingRow::Subtitles,
+        SettingRow::SubtitleLanguage,
         SettingRow::Autoplay,
         SettingRow::Buffer,
         SettingRow::Region,
+        SettingRow::Language,
         SettingRow::SponsorBlock,
     ]);
     if sponsorblock {

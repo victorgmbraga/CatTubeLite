@@ -39,6 +39,13 @@ work when your screen and graphics can take them.
   stopped in every video.
 - **A mouse works too.** Point at something to pick it, click to open it.
 
+## Languages
+
+Choose **Settings → Playback → Interface language → العربية** for Arabic.
+Arabic titles and search text also display correctly with the English interface.
+The search keyboard includes Arabic: use **ABC**, then **العربية**, or type
+with your keyboard. Subtitle language is a separate setting.
+
 ## Install
 
 **Flatpak.** Download `CatTube-1.0.4-x86_64.flatpak` from the
@@ -118,5 +125,6 @@ sign-in at Google.
 
 ## License
 
-MIT, see `LICENSE`. CatTube is not made by or connected to YouTube or
+MIT, see `LICENSE`. Bundled Inter and Noto Sans Arabic fonts use the SIL
+Open Font License; their notices are in `assets/fonts/`. CatTube is not made by or connected to YouTube or
 Google.

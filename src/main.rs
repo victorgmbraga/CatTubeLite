@@ -6,6 +6,7 @@
 //! yt-dlp updates) and the player.
 
 mod canvas;
+mod i18n;
 mod icons;
 mod images;
 mod jobs;
@@ -112,6 +113,7 @@ impl App {
         let data = player::data_home();
         let prefs = prefs::load(&config);
         theme::set_accent(&prefs.accent);
+        i18n::set_language(prefs.language);
         let accounts = account::load(&config);
         let positions = player::load_positions(&data);
         let ctx = Ctx {
@@ -201,7 +203,7 @@ impl App {
     }
 
     fn yt_ctx(&self) -> String {
-        ytc::context("en", &self.prefs.region)
+        ytc::context(self.prefs.language.key(), &self.prefs.region)
     }
 
     fn refresh(&self) -> Option<String> {
@@ -531,13 +533,28 @@ impl App {
             SettingRow::Buffer => {
                 self.prefs.buffer = prefs::cycle(&player::BUFFERS, self.prefs.buffer, d)
             }
-            SettingRow::Region => {
-                let cur = player::REGIONS
+            SettingRow::SubtitleLanguage => {
+                let languages = ["en", "ar", "de", "fr", "es", "hi"];
+                let cur = languages
                     .iter()
                     .copied()
-                    .find(|r| *r == self.prefs.region)
-                    .unwrap_or("US");
-                self.prefs.region = prefs::cycle(&player::REGIONS, cur, d).to_string();
+                    .find(|v| *v == self.prefs.sub_lang)
+                    .unwrap_or("en");
+                self.prefs.sub_lang = prefs::cycle(&languages, cur, d).to_string();
+            }
+            SettingRow::Language | SettingRow::Region => {
+                if row == SettingRow::Language {
+                    self.prefs.language =
+                        prefs::cycle(&i18n::Language::ALL, self.prefs.language, d);
+                    i18n::set_language(self.prefs.language);
+                } else {
+                    let cur = player::REGIONS
+                        .iter()
+                        .copied()
+                        .find(|r| *r == self.prefs.region)
+                        .unwrap_or("US");
+                    self.prefs.region = prefs::cycle(&player::REGIONS, cur, d).to_string();
+                }
                 self.reset_requests();
                 // The lists are for the old country: load them again, but
                 // stay on this row.
@@ -931,6 +948,9 @@ fn hit_test(hits: &[(egui::Rect, Target)], pos: egui::Pos2) -> Option<Target> {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(Screen::Search { osk, .. }) = self.tube.stack.last_mut() {
+            osk.configure_arabic(self.prefs.language == i18n::Language::Arabic);
+        }
         for msg in self.jobs.drain() {
             self.message(ctx, msg);
         }
@@ -1145,7 +1165,7 @@ fn feed(which: &str) -> i32 {
         return 2;
     };
     let p = prefs::load(&config);
-    let ctx = ytc::context("en", &p.region);
+    let ctx = ytc::context(p.language.key(), &p.region);
     let refresh = Some(a.refresh_token.as_str());
     let page = match which {
         "home" | "recommended" => yt::page(&ctx, ytc::feeds::HOME, refresh).map(|mut p| {

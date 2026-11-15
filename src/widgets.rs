@@ -196,13 +196,9 @@ pub fn button<H: Copy>(c: &Canvas<H>, rect: Rect, label: &str, style: ButtonStyl
         }
         _ => {}
     }
-    c.painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        c.font(16.0, Weight::Semibold),
-        ink,
-    );
+    let galley = crate::i18n::layout(&c.painter, label, c.font(16.0, Weight::Semibold), ink);
+    c.painter
+        .galley(rect.center() - galley.size() / 2.0, galley, ink);
 }
 
 /// Width a tab needs for `label`.
@@ -597,10 +593,16 @@ pub fn text_field<H: Copy>(
         caret(c, tx - 2.0);
     } else {
         let fitted = c.fit(&shown, w - (tx - x) - 40.0, size, Weight::Medium);
+        let rtl = crate::i18n::is_rtl(&shown);
+        let edge = if rtl { x + w - 24.0 } else { tx };
         c.text(
-            tx,
+            edge,
             cy,
-            Align2::LEFT_CENTER,
+            if rtl {
+                Align2::RIGHT_CENTER
+            } else {
+                Align2::LEFT_CENTER
+            },
             &fitted,
             size,
             theme::text(),
@@ -610,7 +612,12 @@ pub fn text_field<H: Copy>(
         // field was shortened with an ellipsis.
         let fitted_chars = fitted.chars().count();
         let shown_before: String = before.chars().take(fitted_chars).collect();
-        let cx = tx + c.text_width(&shown_before, size, Weight::Medium) + 2.0;
+        let advance = c.text_width(&shown_before, size, Weight::Medium);
+        let cx = if rtl {
+            edge - advance - 2.0
+        } else {
+            tx + advance + 2.0
+        };
         let _ = after;
         caret(c, cx);
     }
@@ -680,7 +687,7 @@ pub fn keys<H: Copy>(
                     cx,
                     cy,
                     Align2::CENTER_CENTER,
-                    &key.label,
+                    crate::i18n::tr(&key.label),
                     size,
                     ink,
                     if special {

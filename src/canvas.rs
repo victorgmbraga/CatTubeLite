@@ -334,15 +334,15 @@ impl<H: Copy> Canvas<H> {
         color: Color32,
         weight: Weight,
     ) -> Rect {
-        self.painter
-            .text(self.p(x, y), anchor, text, self.font(size, weight), color)
+        let galley = crate::i18n::layout(&self.painter, text, self.font(size, weight), color);
+        let rect = anchor.anchor_size(self.p(x, y), galley.size());
+        self.painter.galley(rect.min, galley, color);
+        rect
     }
 
     /// Width of a single line of text, in design units.
     pub fn text_width(&self, text: &str, size: f32, weight: Weight) -> f32 {
-        let g =
-            self.painter
-                .layout_no_wrap(text.to_owned(), self.font(size, weight), Color32::WHITE);
+        let g = crate::i18n::layout(&self.painter, text, self.font(size, weight), Color32::WHITE);
         g.size().x / self.s
     }
 
@@ -351,10 +351,11 @@ impl<H: Copy> Canvas<H> {
         if self.text_width(text, size, weight) <= max_w {
             return text.to_owned();
         }
-        let mut chars: Vec<char> = text.chars().collect();
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut chars: Vec<&str> = text.graphemes(true).collect();
         while !chars.is_empty() {
             chars.pop();
-            let candidate: String = chars.iter().collect::<String>().trim_end().to_string() + "…";
+            let candidate: String = chars.concat().trim_end().to_string() + "…";
             if self.text_width(&candidate, size, weight) <= max_w {
                 return candidate;
             }

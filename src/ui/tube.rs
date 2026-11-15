@@ -8,6 +8,7 @@
 //! focus, the title under each (as on YouTube).
 
 use crate::canvas::Canvas;
+use crate::i18n::tr;
 use crate::icons;
 use crate::images::Images;
 use crate::motion;
@@ -192,7 +193,7 @@ fn now_playing_bar(c: &C, tile: &Tile, focused: bool) {
         124.0,
         y + 19.0,
         Align2::LEFT_CENTER,
-        "Now playing",
+        tr("Now playing"),
         13.0,
         sub,
         Weight::Medium,
@@ -210,7 +211,7 @@ fn now_playing_bar(c: &C, tile: &Tile, focused: bool) {
         1188.0,
         y + 32.0,
         Align2::RIGHT_CENTER,
-        "Return to video",
+        tr("Return to video"),
         16.0,
         ink,
         Weight::Semibold,
@@ -350,10 +351,10 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         theme::text(),
         Weight::Semibold,
     );
-    let labels: Vec<&str> = Section::ALL.iter().map(|s| s.label()).collect();
-    let name = v.accounts.active().map_or("Sign in", |a| {
+    let labels: Vec<&str> = Section::ALL.iter().map(|s| tr(s.label())).collect();
+    let name = v.accounts.active().map_or(tr("Sign in"), |a| {
         if a.name.is_empty() {
-            "Account"
+            tr("Account")
         } else {
             a.name.as_str()
         }
@@ -528,8 +529,8 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
         }
     } else if !t.badge.is_empty() || v.now_playing.is_some_and(|active| active.id == t.id) {
         let playing = v.now_playing.is_some_and(|active| active.id == t.id);
-        let badge = if playing { "Playing" } else { &t.badge };
-        let live = !playing && (t.kind == Kind::Live || t.badge == "LIVE");
+        let badge = if playing { tr("Playing") } else { &t.badge };
+        let live = !playing && (t.kind == Kind::Live || t.badge == tr("LIVE"));
         let tw = c.text_width(badge, 13.0, Weight::Semibold) + 14.0;
         let b = c.r(rx + rw - tw - 8.0, ry + rh - 30.0, tw, 22.0);
         c.fill(
@@ -560,7 +561,7 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
             bx,
             by,
             Align2::CENTER_CENTER,
-            "Short",
+            tr("Short"),
             12.0,
             theme::on_accent(),
             Weight::Semibold,
@@ -781,7 +782,7 @@ fn failed(c: &C, e: &str, y: f32) {
         640.0,
         y + 84.0,
         Align2::CENTER_CENTER,
-        "Press OK to try again",
+        tr("Press OK to try again"),
         16.0,
         theme::text3(),
         Weight::Regular,
@@ -810,8 +811,8 @@ fn draw_browse(c: &C, v: &View) {
     if section.needs_sign_in() && v.accounts.active().is_none() {
         message(
             c,
-            &format!("Sign in to see your {}", section.label().to_lowercase()),
-            "Choose the tab to sign in with a code",
+            &format!("{} {}", tr("Sign in to see"), tr(section.label())),
+            tr("Choose the tab to sign in with a code"),
         );
         return;
     }
@@ -828,11 +829,13 @@ fn draw_browse(c: &C, v: &View) {
             if section == Section::Home && v.accounts.active().is_none() {
                 message(
                     c,
-                    "Search to get started",
-                    "Sign in (the button at the top right) for your recommendations and subscriptions",
+                    tr("Search to get started"),
+                    tr(
+                        "Sign in (the button at the top right) for your recommendations and subscriptions",
+                    ),
                 );
             } else {
-                message(c, "Nothing here yet", "");
+                message(c, tr("Nothing here yet"), "");
             }
         }
         Some(Scan::Failed(e)) => failed(c, e, 320.0),
@@ -852,7 +855,7 @@ fn tools_note(c: &C, v: &View) {
             } else {
                 690.0
             },
-            "Getting the player ready (first start)…",
+            tr("Getting the player ready (first start)…"),
             true,
             v.now,
         );
@@ -914,7 +917,7 @@ fn draw_page(c: &C, v: &View, page: &Scan<Page>, row: usize, cols: &[usize]) {
                 hero(c, f, 64.0, 112.0, 760.0);
             }
             if p.shelves.is_empty() {
-                message(c, "Nothing here yet", "");
+                message(c, tr("Nothing here yet"), "");
             } else {
                 rows(c, v, p, Some((row, cols)), 300.0, "page", true);
             }
@@ -997,7 +1000,7 @@ fn draw_search(
         64.0,
         104.0,
         640.0,
-        "Search YouTube",
+        tr("Search YouTube"),
         suggestion.is_none() && !on_header && !v.tube.now_playing,
         "tube-osk",
         &Target::Key,
@@ -1010,7 +1013,7 @@ fn draw_search(
             x + 22.0,
             104.0,
             Align2::LEFT_CENTER,
-            "Recent searches",
+            tr("Recent searches"),
             14.0,
             theme::text3(),
             Weight::Semibold,
@@ -1070,7 +1073,7 @@ fn draw_search(
                 1216.0,
                 470.0,
                 Align2::RIGHT_TOP,
-                "Down for results",
+                tr("Down for results"),
                 14.0,
                 theme::text3(),
                 Weight::Regular,
@@ -1081,7 +1084,7 @@ fn draw_search(
                 64.0,
                 470.0,
                 Align2::LEFT_TOP,
-                "Nothing found",
+                tr("Nothing found"),
                 17.0,
                 theme::text2(),
                 Weight::Medium,
@@ -1228,7 +1231,7 @@ fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
         640.0,
         204.0,
         Align2::CENTER_CENTER,
-        "Sign in to YouTube",
+        tr("Sign in to YouTube"),
         28.0,
         theme::text(),
         Weight::Semibold,
@@ -1240,7 +1243,7 @@ fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
                 640.0,
                 250.0,
                 Align2::CENTER_CENTER,
-                "On your phone or computer, go to",
+                tr("On your phone or computer, go to"),
                 18.0,
                 theme::text2(),
                 Weight::Regular,
@@ -1305,7 +1308,7 @@ fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
                 }
                 x += w + gap;
             }
-            let msg = "Waiting for you to enter it…";
+            let msg = tr("Waiting for you to enter it…");
             let w = c.text_width(msg, 16.0, Weight::Medium) + 30.0;
             widgets::busy_line(c, 640.0 - w / 2.0, 490.0, msg, true, v.now);
         }
@@ -1324,19 +1327,19 @@ fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
                 640.0,
                 462.0,
                 Align2::CENTER_CENTER,
-                "Press OK for a new code",
+                tr("Press OK for a new code"),
                 16.0,
                 theme::text3(),
                 Weight::Regular,
             );
         }
-        _ => widgets::busy_line(c, 545.0, 380.0, "Getting a code…", true, v.now),
+        _ => widgets::busy_line(c, 545.0, 380.0, tr("Getting a code…"), true, v.now),
     }
     c.text(
         640.0,
         590.0,
         Align2::CENTER_CENTER,
-        "Back to cancel",
+        tr("Back to cancel"),
         15.0,
         theme::text3(),
         Weight::Regular,
@@ -1355,7 +1358,7 @@ fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
         640.0,
         204.0,
         Align2::CENTER_CENTER,
-        "Link your phone",
+        tr("Link your phone"),
         28.0,
         theme::text(),
         Weight::Semibold,
@@ -1366,7 +1369,7 @@ fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
                 640.0,
                 252.0,
                 Align2::CENTER_CENTER,
-                "In the YouTube app on your phone, open Settings → Watch on TV",
+                tr("In the YouTube app on your phone, open Settings → Watch on TV"),
                 18.0,
                 theme::text2(),
                 Weight::Regular,
@@ -1375,7 +1378,7 @@ fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
                 640.0,
                 280.0,
                 Align2::CENTER_CENTER,
-                "→ Link with TV code, and enter",
+                tr("→ Link with TV code, and enter"),
                 18.0,
                 theme::text2(),
                 Weight::Regular,
@@ -1409,7 +1412,7 @@ fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
                 640.0,
                 444.0,
                 Align2::CENTER_CENTER,
-                "Then pick a video on the phone: it plays here, and the phone stays in step.",
+                tr("Then pick a video on the phone: it plays here, and the phone stays in step."),
                 16.0,
                 theme::text3(),
                 Weight::Regular,
@@ -1418,7 +1421,7 @@ fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
                 640.0,
                 472.0,
                 Align2::CENTER_CENTER,
-                "The code changes every few minutes. A linked phone stays linked.",
+                tr("The code changes every few minutes. A linked phone stays linked."),
                 16.0,
                 theme::text3(),
                 Weight::Regular,
@@ -1439,19 +1442,19 @@ fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
                 640.0,
                 442.0,
                 Align2::CENTER_CENTER,
-                "Press OK to try again",
+                tr("Press OK to try again"),
                 16.0,
                 theme::text3(),
                 Weight::Regular,
             );
         }
-        _ => widgets::busy_line(c, 545.0, 360.0, "Getting a code…", true, v.now),
+        _ => widgets::busy_line(c, 545.0, 360.0, tr("Getting a code…"), true, v.now),
     }
     c.text(
         640.0,
         590.0,
         Align2::CENTER_CENTER,
-        "OK for a new code · Back to close",
+        tr("OK for a new code · Back to close"),
         15.0,
         theme::text3(),
         Weight::Regular,
@@ -1471,7 +1474,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
         theme::rgba(theme::INK, 200),
         Weight::Semibold,
     );
-    widgets::title(c, 64.0, 92.0, "Settings", 30.0);
+    widgets::title(c, 64.0, 92.0, tr("Settings"), 30.0);
     let rows = tube::setting_rows(v.accounts.list.len(), v.prefs.sponsorblock);
     let groups = tube::setting_groups(&rows);
     let shown = groups
@@ -1502,7 +1505,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             90.0,
             y + 23.0,
             Align2::LEFT_CENTER,
-            g.label(),
+            tr(g.label()),
             17.0,
             ink,
             if here {
@@ -1523,7 +1526,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
         362.0,
         176.0,
         Align2::LEFT_CENTER,
-        group.label(),
+        tr(group.label()),
         22.0,
         theme::text(),
         Weight::Semibold,
@@ -1545,20 +1548,20 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
         let tools = match v.tools {
             Scan::Done(s) => s.first().cloned().unwrap_or_default(),
             Scan::Failed(e) => e.clone(),
-            _ => "Updating…".into(),
+            _ => tr("Updating…").into(),
         };
         let (title, sub, value, kind, icon): (String, String, String, RowKind, &str) = match row {
             SettingRow::Account(i) => {
                 let a = &v.accounts.list[*i];
                 (
                     if a.name.is_empty() {
-                        "YouTube account".into()
+                        tr("YouTube account").into()
                     } else {
                         a.name.clone()
                     },
-                    "OK uses it · hold OK to sign out".into(),
+                    tr("OK uses it · hold OK to sign out").into(),
                     if *i == v.accounts.active {
-                        "In use".into()
+                        tr("In use").into()
                     } else {
                         String::new()
                     },
@@ -1567,75 +1570,93 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 )
             }
             SettingRow::AddAccount => (
-                "Add an account".into(),
-                "Sign in with a code".into(),
+                tr("Add an account").into(),
+                tr("Sign in with a code").into(),
                 String::new(),
                 RowKind::Action,
                 "plus",
             ),
             SettingRow::Quality => (
-                "Highest quality".into(),
-                "Lower plays smoother on slow connections".into(),
+                tr("Highest quality").into(),
+                tr("Lower plays smoother on slow connections").into(),
                 quality,
                 RowKind::Choice,
                 "display",
             ),
             SettingRow::Codec => (
-                "Preferred codec".into(),
-                "VP9 suits most TVs; AV1 needs newer graphics".into(),
+                tr("Preferred codec").into(),
+                tr("VP9 suits most TVs; AV1 needs newer graphics").into(),
                 p.codec.label().into(),
                 RowKind::Choice,
                 "media",
             ),
             SettingRow::Hdr => (
                 "HDR".into(),
-                "When the video and the TV have it".into(),
+                tr("When the video and the TV have it").into(),
                 String::new(),
                 RowKind::Toggle(Some(p.hdr)),
                 "spark",
             ),
             SettingRow::Buffer => (
-                "Buffer".into(),
-                "Bigger rides out a shaky connection, smaller uses less memory".into(),
+                tr("Buffer").into(),
+                tr("Bigger rides out a shaky connection, smaller uses less memory").into(),
                 match p.buffer {
-                    64 => "Small".into(),
-                    768 => "Large".into(),
-                    _ => "Medium".into(),
+                    64 => tr("Small").into(),
+                    768 => tr("Large").into(),
+                    _ => tr("Medium").into(),
                 },
                 RowKind::Choice,
                 "download",
             ),
             SettingRow::Region => (
-                "Country".into(),
-                "For recommendations, trending and news".into(),
+                tr("Country").into(),
+                tr("For recommendations, trending and news").into(),
                 p.region.clone(),
                 RowKind::Choice,
                 "home",
             ),
             SettingRow::Speed => (
-                "Speed".into(),
-                "Also changed in the player, and kept".into(),
+                tr("Speed").into(),
+                tr("Also changed in the player, and kept").into(),
                 speed,
                 RowKind::Choice,
                 "play",
             ),
+            SettingRow::Language => (
+                tr("Interface language").into(),
+                String::new(),
+                p.language.label().into(),
+                RowKind::Choice,
+                "keyboard",
+            ),
+            SettingRow::SubtitleLanguage => (
+                tr("Subtitle language").into(),
+                String::new(),
+                match p.sub_lang.as_str() {
+                    "ar" => "العربية".into(),
+                    "en" => "English".into(),
+                    other => other.into(),
+                },
+                RowKind::Choice,
+                "keyboard",
+            ),
             SettingRow::Subtitles => (
-                "Subtitles".into(),
-                format!("Language: {}", p.sub_lang),
+                tr("Subtitles").into(),
+                String::new(),
                 String::new(),
                 RowKind::Toggle(Some(p.subs_on)),
                 "keyboard",
             ),
             SettingRow::Autoplay => (
-                "When a video ends".into(),
+                tr("When a video ends").into(),
                 String::new(),
-                p.autoplay.label().into(),
+                tr(p.autoplay.label()).into(),
                 RowKind::Choice,
                 "refresh",
             ),
             SettingRow::SponsorBlock => (
-                "Skip sponsors and more".into(),
-                "Segments marked by SponsorBlock viewers".into(),
+                tr("Skip sponsors and more").into(),
+                tr("Segments marked by SponsorBlock viewers").into(),
                 String::new(),
                 RowKind::Toggle(Some(p.sponsorblock)),
                 "check",
@@ -1643,7 +1664,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             SettingRow::Category(ci) => {
                 let (key, label, _) = community::CATEGORIES[*ci];
                 (
-                    label.into(),
+                    tr(label).into(),
                     String::new(),
                     String::new(),
                     RowKind::Toggle(Some(p.skips(key))),
@@ -1651,14 +1672,14 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 )
             }
             SettingRow::LinkPhone => (
-                "Link a phone".into(),
-                "Pick and control videos from the YouTube app".into(),
+                tr("Link a phone").into(),
+                tr("Pick and control videos from the YouTube app").into(),
                 String::new(),
                 RowKind::Action,
                 "phone",
             ),
             SettingRow::UpdateYtDlp => (
-                "Update the player".into(),
+                tr("Update the player").into(),
                 format!("{tools} · CatTube {}", cattube_core::env::version()),
                 String::new(),
                 RowKind::Action,

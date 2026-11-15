@@ -21,6 +21,7 @@ pub enum Page {
     Lower,
     Upper,
     Symbols,
+    Arabic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,12 +81,14 @@ pub struct Osk {
     pub masked: bool,
     /// Label for the Done key ("Connect", "Search", ...).
     pub done_label: String,
+    language_configured: bool,
 }
 
 impl Osk {
     pub fn new(masked: bool, done_label: impl Into<String>) -> Self {
         Self {
             page: Page::Lower,
+            language_configured: false,
             row: 1,
             col: 0,
             text: String::new(),
@@ -94,6 +97,15 @@ impl Osk {
             max_len: 63, // WPA2 passphrase maximum
             masked,
             done_label: done_label.into(),
+        }
+    }
+
+    pub fn configure_arabic(&mut self, arabic: bool) {
+        if !self.language_configured {
+            self.language_configured = true;
+            if arabic {
+                self.page = Page::Arabic;
+            }
         }
     }
 
@@ -190,13 +202,15 @@ impl Osk {
                 .collect()
         };
         let (r1, r2, r3, r4) = match self.page {
+            Page::Arabic => ("أإآبتثجحخد", "ذرزسشصضطظع", "غفقكلمنهوي", "ءةىؤئـ،؛؟."),
             Page::Lower => ("1234567890", "qwertyuiop", "asdfghjkl@", "zxcvbnm-_."),
             Page::Upper => ("1234567890", "QWERTYUIOP", "ASDFGHJKL@", "ZXCVBNM-_."),
             Page::Symbols => ("1234567890", "!@#$%^&*()", "-_=+[]{};:", "'\",./?\\|~`"),
         };
         let shift_label = match self.page {
             Page::Lower => "ABC",
-            Page::Upper | Page::Symbols => "abc",
+            Page::Upper => "العربية",
+            Page::Symbols | Page::Arabic => "abc",
         };
         let symbols_label = if self.page == Page::Symbols {
             "ABC"
@@ -335,7 +349,8 @@ impl Osk {
             KeyKind::Shift => {
                 self.page = match self.page {
                     Page::Lower => Page::Upper,
-                    Page::Upper | Page::Symbols => Page::Lower,
+                    Page::Upper => Page::Arabic,
+                    Page::Symbols | Page::Arabic => Page::Lower,
                 };
                 OskEvent::Moved
             }
@@ -372,6 +387,34 @@ fn nearest_col(from: &[KeyCap], from_col: usize, to: &[KeyCap]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arabic_keyboard_keeps_logical_queries_and_can_switch_to_latin() {
+        let mut osk = Osk::new(false, "Search");
+        osk.configure_arabic(true);
+        assert_eq!(osk.page(), Page::Arabic);
+        for row in osk.rows() {
+            assert_eq!(row.iter().map(|k| k.width).sum::<u8>(), ROW_UNITS);
+        }
+        osk.set_focus(2, 2);
+        let expected = match osk.focused_key().kind {
+            KeyKind::Char(c) => c,
+            _ => unreachable!(),
+        };
+        assert_eq!(osk.handle(Action::Ok), OskEvent::Edited);
+        assert_eq!(osk.text(), expected.to_string());
+        osk.set_focus(4, 0);
+        osk.handle(Action::Ok);
+        assert_eq!(osk.page(), Page::Lower);
+        osk.configure_arabic(true);
+        assert_eq!(
+            osk.page(),
+            Page::Lower,
+            "a manual alphabet choice survives frames"
+        );
+        osk.handle(Action::Char('ع'));
+        assert!(osk.text().ends_with('ع'));
+    }
 
     #[test]
     fn every_row_fills_the_grid() {

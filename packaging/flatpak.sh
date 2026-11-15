@@ -28,6 +28,9 @@ for l in "$S"/lib/*; do
   esac
   cp -a "$l" "$F/lib/"; kept=$((kept + 1))
 done
+for notice in assets/fonts/LICENSE-*.txt; do
+  install -Dm644 "$notice" "$F/share/licenses/cattube/$(basename "$notice")"
+done
 install -Dm644 assets/cattube-osd.lua "$F/share/cattube/cattube-osd.lua"
 install -Dm644 assets/cattube-input.conf "$F/share/cattube/cattube-input.conf"
 install -Dm644 packaging/$ID.desktop "$F/share/applications/$ID.desktop"

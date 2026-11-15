@@ -71,6 +71,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arabic_reshaper"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb963411bc62b3888e69ad0d821ac03a3176ec7d74c2096bb5555a4cc419545b"
+
+[[package]]
 name = "arboard"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -260,9 +266,12 @@ dependencies = [
 name = "cattube"
 version = "1.0.4"
 dependencies = [
+ "arabic_reshaper",
  "cattube-core",
  "eframe",
  "image",
+ "unicode-bidi",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -2376,6 +2385,12 @@ checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
  "rustc-hash 2.1.3",
 ]
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-general-category"
