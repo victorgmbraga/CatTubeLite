@@ -11,18 +11,42 @@
 //! yt-dlp falls back to the next best format when that one is missing.
 
 use crate::process::Cmd;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+/// The checksums yt-dlp publishes with each release.
+pub const YT_DLP_SUMS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
+/// yt-dlp's name in [`YT_DLP_SUMS_URL`].
+pub const YT_DLP_ASSET: &str = "yt-dlp";
 #[cfg(target_arch = "aarch64")]
-pub const DENO_URL: &str =
-    "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip";
+macro_rules! deno_asset {
+    () => {
+        "deno-aarch64-unknown-linux-gnu.zip"
+    };
+}
 #[cfg(not(target_arch = "aarch64"))]
-pub const DENO_URL: &str =
-    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
+macro_rules! deno_asset {
+    () => {
+        "deno-x86_64-unknown-linux-gnu.zip"
+    };
+}
+pub const DENO_ASSET: &str = deno_asset!();
+pub const DENO_URL: &str = concat!(
+    "https://github.com/denoland/deno/releases/latest/download/",
+    deno_asset!()
+);
+pub const DENO_SUM_URL: &str = concat!(
+    "https://github.com/denoland/deno/releases/latest/download/",
+    deno_asset!(),
+    ".sha256sum"
+);
 /// How often CatTube asks yt-dlp to update itself.
 pub const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// How often CatTube's own Deno is checked for a new release.
+pub const DENO_UPDATE_EVERY: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// `~/.local/share/cattube`: yt-dlp, Deno, positions.
 pub fn data_home() -> PathBuf {
@@ -60,6 +84,36 @@ pub fn download_cmd(url: &str, out: &Path) -> Cmd {
         .timeout(Duration::from_secs(320))
 }
 
+/// `curl` printing a small text file (a release's checksums).
+pub fn fetch_text_cmd(url: &str) -> Cmd {
+    Cmd::new("curl")
+        .args(["-sSL", "--fail", "-m", "30", "--", url])
+        .timeout(Duration::from_secs(35))
+}
+
+/// A file's SHA-256 with the system's Python (yt-dlp needs Python anyway).
+pub fn sha256_cmd(path: &Path) -> Cmd {
+    Cmd::new("python3")
+        .args([
+            "-I".to_string(),
+            "-c".to_string(),
+            "import hashlib,sys\nh=hashlib.sha256()\nwith open(sys.argv[1],'rb') as f:\n  for b in iter(lambda:f.read(65536),b''):\n    h.update(b)\nprint(h.hexdigest())"
+                .to_string(),
+            path.display().to_string(),
+        ])
+        .timeout(Duration::from_secs(120))
+}
+
+/// `name`'s SHA-256 in a checksum list (`<hash>  <name>` lines), lowercase.
+pub fn expected_sha256(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (hash, file) = line.trim().split_once(char::is_whitespace)?;
+        let file = file.trim_start().trim_start_matches('*');
+        (file == name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
 /// Unpack Deno's zip with the system's Python (yt-dlp needs Python anyway).
 pub fn unzip_cmd(zip: &Path, dir: &Path) -> Cmd {
     Cmd::new("python3")
@@ -85,8 +139,10 @@ pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option
     if let Some(p) = find("deno") {
         return Some(format!("deno:{}", p.display()));
     }
+    // Only marked executable once fully unpacked: a file left by an
+    // interrupted install is not a runtime, and gets replaced.
     let own = own_deno_path(data);
-    if own.is_file() {
+    if crate::process::find_executable(&own.display().to_string()).is_some() {
         return Some(format!("deno:{}", own.display()));
     }
     find("node").map(|p| format!("node:{}", p.display()))
@@ -254,7 +310,19 @@ pub fn mpv_argv(
     .map(|s| s.to_string())
     .collect();
     if o.low_power {
-        v.push("--hwdec=auto-safe".into());
+        v.extend(
+            [
+                "--hwdec=auto-safe",
+                "--profile=fast",
+                "--scale=bilinear",
+                "--cscale=bilinear",
+                "--dscale=bilinear",
+                "--dither-depth=no",
+                "--deband=no",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
     }
     v.push(format!(
         "--demuxer-max-bytes={}MiB",
@@ -409,17 +477,46 @@ pub fn store_checkpoint(data: &Path, id: &str, point: Checkpoint) -> std::io::Re
     let folder = data.join("positions");
     std::fs::create_dir_all(&folder)?;
     let path = folder.join(format!("{id}.pos"));
-    let tmp = folder.join(format!("{id}.{}.tmp", std::process::id()));
-    std::fs::write(
-        &tmp,
-        format!(
-            "{:.3} {:.3} {}\n",
-            point.position,
-            point.duration.unwrap_or(0.0),
-            u8::from(point.finished)
-        ),
-    )?;
-    std::fs::rename(tmp, path)
+    let tmp = crate::util::unique_tmp_path(&path, "tmp");
+    let body = format!(
+        "{:.3} {:.3} {}\n",
+        point.position,
+        point.duration.unwrap_or(0.0),
+        u8::from(point.finished)
+    );
+    let res = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Merge finished/stopped playback positions into `positions.conf` atomically.
+pub fn save_positions_merged(
+    data: &Path,
+    ended: &[(String, f64, Option<f64>)],
+) -> std::io::Result<()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    if ended.is_empty() {
+        return Ok(());
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(data)?;
+    let path = data.join("positions.conf");
+    let mut list = std::fs::read_to_string(&path)
+        .map(|t| parse_positions(&t))
+        .unwrap_or_default();
+    for (id, pos, dur) in ended {
+        remember(&mut list, id, *pos, *dur);
+    }
+    let tmp = crate::util::unique_tmp_path(&path, "tmp");
+    let res =
+        std::fs::write(&tmp, positions_text(&list)).and_then(|()| std::fs::rename(&tmp, &path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
@@ -446,8 +543,12 @@ pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
 }
 
 /// Player checkpoints take precedence over the older watcher snapshots.
-pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
-    let mut list = std::fs::read_to_string(data.join("positions.conf"))
+/// Returns both the ordered resume list (newest last) and the raw checkpoints
+/// read from `positions/` in a single pass.
+pub fn load_positions_and_checkpoints(
+    data: &Path,
+) -> (Vec<(String, f64)>, HashMap<String, Checkpoint>) {
+    let base = std::fs::read_to_string(data.join("positions.conf"))
         .map(|s| parse_positions(&s))
         .unwrap_or_default();
     let mut files: Vec<_> = std::fs::read_dir(data.join("positions"))
@@ -471,19 +572,43 @@ pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
     for (_, _, path) in files.drain(..stale) {
         let _ = std::fs::remove_file(path);
     }
+    // Track newest order index per video id in O(N) instead of O(N^2) Vec::retain.
+    let mut order: HashMap<String, (usize, f64)> =
+        HashMap::with_capacity(base.len() + files.len());
+    let mut seq = 0usize;
+    for (id, pos) in base {
+        order.insert(id, (seq, pos));
+        seq += 1;
+    }
+    let mut checkpoints = HashMap::with_capacity(files.len());
     for (_, id, _) in files {
         if let Some(point) = checkpoint(data, &id) {
+            checkpoints.insert(id.clone(), point);
             if point.finished {
-                list.retain(|(video, _)| *video != id);
+                order.remove(&id);
+            } else if point.position.is_finite() && point.position > 0.0 {
+                order.insert(id, (seq, point.position));
+                seq += 1;
             } else {
-                remember(&mut list, &id, point.position, point.duration);
+                order.remove(&id);
             }
         }
     }
-    if list.len() > MAX_POSITIONS {
-        list.drain(..list.len() - MAX_POSITIONS);
+    let mut entries: Vec<(usize, String, f64)> = order
+        .into_iter()
+        .map(|(id, (idx, pos))| (idx, id, pos))
+        .collect();
+    entries.sort_unstable_by_key(|(idx, _, _)| *idx);
+    if entries.len() > MAX_POSITIONS {
+        entries.drain(..entries.len() - MAX_POSITIONS);
     }
-    list
+    let list = entries.into_iter().map(|(_, id, p)| (id, p)).collect();
+    (list, checkpoints)
+}
+
+/// Player checkpoints take precedence over the older watcher snapshots.
+pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
+    load_positions_and_checkpoints(data).0
 }
 
 #[cfg(test)]
@@ -588,6 +713,9 @@ mod tests {
         assert!(!v2.iter().any(|a| a.starts_with("--start")));
         assert!(!v2.iter().any(|a| a.starts_with("--ytdl-raw-options")));
         assert!(v2.iter().any(|a| a == "--hwdec=auto-safe"));
+        assert!(v2.iter().any(|a| a == "--profile=fast"));
+        assert!(v2.iter().any(|a| a == "--scale=bilinear"));
+        assert!(v2.iter().any(|a| a == "--dither-depth=no"));
         assert!(v2.iter().any(|a| a.contains("cattube_osd-low_power=yes")));
         assert!(
             v2.iter()
@@ -608,6 +736,49 @@ mod tests {
         assert_eq!(
             js_runtime(Path::new("/nope"), &deno).as_deref(),
             Some("deno:/usr/bin/deno")
+        );
+    }
+
+    #[test]
+    fn an_unfinished_own_deno_is_not_a_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cattube-deno-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let deno = own_deno_path(&root);
+        std::fs::write(&deno, b"truncated").unwrap();
+        std::fs::set_permissions(&deno, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let none = |_: &str| None;
+        assert_eq!(js_runtime(&root, &none), None);
+        std::fs::set_permissions(&deno, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            js_runtime(&root, &none),
+            Some(format!("deno:{}", deno.display()))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checksum_lists() {
+        let a = "a".repeat(64);
+        let b = "B".repeat(64);
+        let sums = format!("{a}  yt-dlp.tar.gz\n{b}  yt-dlp\nshort  other\n{a} *star.zip\n");
+        assert_eq!(expected_sha256(&sums, "yt-dlp"), Some("b".repeat(64)));
+        assert_eq!(expected_sha256(&sums, "star.zip"), Some(a));
+        assert_eq!(expected_sha256(&sums, "other"), None);
+        assert_eq!(expected_sha256(&sums, "missing"), None);
+    }
+
+    #[test]
+    fn sha256_command_hashes_a_file() {
+        use crate::process::Runner;
+        let p = std::env::temp_dir().join(format!("cattube-sha-{}", std::process::id()));
+        std::fs::write(&p, b"abc").unwrap();
+        let out = crate::process::SystemRunner.run(&sha256_cmd(&p)).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            out.stdout.trim(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
@@ -651,13 +822,51 @@ mod tests {
             "1000.000 1000.000 1\n",
         )
         .unwrap();
-        let loaded = load_positions(&root);
+        let (loaded, checkpoints) = load_positions_and_checkpoints(&root);
         assert_eq!(loaded, vec![("WhWc3b3KhnY".into(), 123.456)]);
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints["B4EPW7JUMTM"].finished);
+        assert_eq!(checkpoints["WhWc3b3KhnY"].duration, Some(130.0));
         assert_eq!(parse_positions(&positions_text(&loaded)), loaded);
         std::fs::write(root.join("positions/WhWc3b3KhnY.pos"), "0.500 20.000 0\n").unwrap();
         assert_eq!(load_positions(&root), vec![("WhWc3b3KhnY".into(), 0.5)]);
         std::fs::write(root.join("positions/WhWc3b3KhnY.pos"), "NaN 20 0\n").unwrap();
         assert!(checkpoint(&root, "WhWc3b3KhnY").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_positions_merged_creates_dir_merges_and_leaves_no_tmp_files() {
+        let root = std::env::temp_dir().join(format!(
+            "cattube-pos-merge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        save_positions_merged(&root, &[("WhWc3b3KhnY".into(), 42.5, Some(200.0))]).unwrap();
+        save_positions_merged(
+            &root,
+            &[
+                ("B4EPW7JUMTM".into(), 10.0, Some(100.0)),
+                ("WhWc3b3KhnY".into(), 88.0, Some(200.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            load_positions(&root),
+            vec![
+                ("B4EPW7JUMTM".into(), 10.0),
+                ("WhWc3b3KhnY".into(), 88.0),
+            ]
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

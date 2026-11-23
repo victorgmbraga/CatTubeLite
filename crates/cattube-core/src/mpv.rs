@@ -372,6 +372,26 @@ pub fn ipc_request(socket: &Path, args: &[Arg]) -> Result<Json> {
     Err(Error::msg("player did not answer"))
 }
 
+/// Ask the player on `socket` (if any) to quit and wait until it has stopped
+/// listening. True when no player is left. The socket file itself stays
+/// behind after mpv exits, so a refused connection is what says it is gone.
+pub fn quit_and_wait(socket: &Path, grace: Duration) -> bool {
+    let Ok(mut conn) = IpcConn::connect(socket) else {
+        return true;
+    };
+    let _ = conn.command_with_timeout(&[Arg::Str("quit")], Duration::from_millis(200));
+    let deadline = Instant::now() + grace;
+    loop {
+        if UnixStream::connect(socket).is_err() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A long-lived IPC connection: commands get their replies, and the
 /// `script-message`s scripts send (mpv delivers them to IPC clients as
 /// `client-message` events) are kept for [`IpcConn::messages`]. CatTube's
@@ -380,6 +400,8 @@ pub struct IpcConn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     messages: Vec<Vec<String>>,
+    pending: Vec<u8>,
+    discarding: bool,
     eof: bool,
 }
 
@@ -397,6 +419,8 @@ impl IpcConn {
             reader: BufReader::new(stream),
             writer,
             messages: Vec::new(),
+            pending: Vec::new(),
+            discarding: false,
             eof: false,
         })
     }
@@ -408,18 +432,55 @@ impl IpcConn {
 
     /// One line, or `None` after `timeout` without one.
     fn line(&mut self, timeout: Duration) -> Option<String> {
-        let _ = self
-            .reader
-            .get_ref()
-            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))));
-        let mut line = String::new();
-        match (&mut self.reader).take(MAX_IPC_BYTES).read_line(&mut line) {
-            Ok(0) => {
-                self.eof = true;
-                None
+        let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
             }
-            Ok(_) => Some(line),
-            Err(_) => None,
+            let _ = self
+                .reader
+                .get_ref()
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))));
+            let avail = match self.reader.fill_buf() {
+                Ok(&[]) => {
+                    self.eof = true;
+                    return None;
+                }
+                Ok(buf) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return None;
+                }
+                Err(_) => {
+                    self.eof = true;
+                    return None;
+                }
+            };
+            let nl = avail.iter().position(|&b| b == b'\n');
+            let take = nl.map_or(avail.len(), |pos| pos + 1);
+            if !self.discarding {
+                if self.pending.len() + take > MAX_IPC_BYTES as usize {
+                    self.pending.clear();
+                    self.discarding = true;
+                } else {
+                    self.pending.extend_from_slice(&avail[..take]);
+                }
+            }
+            self.reader.consume(take);
+            if nl.is_some() {
+                if self.discarding {
+                    self.discarding = false;
+                    continue;
+                }
+                let bytes = std::mem::take(&mut self.pending);
+                return Some(String::from_utf8_lossy(&bytes).into_owned());
+            }
         }
     }
 
@@ -443,7 +504,10 @@ impl IpcConn {
 
     pub fn command_with_timeout(&mut self, args: &[Arg], timeout: Duration) -> Result<Json> {
         let id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        self.writer.write_all(command_line(args, id).as_bytes())?;
+        if let Err(e) = self.writer.write_all(command_line(args, id).as_bytes()) {
+            self.eof = true;
+            return Err(e.into());
+        }
         let deadline = Instant::now() + timeout;
         while !self.eof {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -507,6 +571,13 @@ impl IpcConn {
         self.command(&[Arg::Str("get_property"), Arg::Str(name)])
             .ok()?
             .as_bool()
+    }
+
+    pub fn get_str(&mut self, name: &str) -> Option<String> {
+        self.command(&[Arg::Str("get_property"), Arg::Str(name)])
+            .ok()?
+            .as_str()
+            .map(str::to_string)
     }
 }
 
@@ -748,5 +819,69 @@ mod tests {
             ])
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quit_and_wait_sees_a_player_stop_listening() {
+        let path =
+            std::env::temp_dir().join(format!("cattube-mpv-quit-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(quit_and_wait(&path, Duration::from_millis(10)), "no player");
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req = parse_json(line.trim()).unwrap();
+            let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+            writeln!(s, "{{\"error\":\"success\",\"request_id\":{id}}}").unwrap();
+            line
+        });
+        // Like mpv, the socket file stays after the listener is gone.
+        assert!(quit_and_wait(&path, Duration::from_secs(2)));
+        assert!(server.join().unwrap().contains("quit"));
+        assert!(path.exists());
+
+        let _ = std::fs::remove_file(&path);
+        let stuck = UnixListener::bind(&path).unwrap();
+        assert!(!quit_and_wait(&path, Duration::from_millis(30)));
+        drop(stuck);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ipc_conn_reassembles_partial_lines_recovers_from_oversized_and_detects_eof() {
+        let (a, mut peer) = UnixStream::pair().unwrap();
+        let mut conn = IpcConn::from_stream(a).unwrap();
+        // Partial write split across a timeout must not drop the prefix.
+        peer.write_all(br#"{"event":"client-message","args":["#)
+            .unwrap();
+        assert!(conn.messages(Duration::from_millis(20)).is_empty());
+        peer.write_all(br#""cattube-hide"]}"#).unwrap();
+        peer.write_all(b"\n").unwrap();
+        assert_eq!(
+            conn.messages(Duration::from_millis(100)),
+            vec![vec!["cattube-hide".to_string()]]
+        );
+        // Oversized line (> 64 KiB) is skipped cleanly without corrupting the next event.
+        let huge = format!("{{\"event\":\"big\",\"data\":\"{}\"}}\n", "x".repeat(70_000));
+        peer.write_all(huge.as_bytes()).unwrap();
+        writeln!(
+            peer,
+            r#"{{"event":"client-message","args":["cattube-card-result","play"]}}"#
+        )
+        .unwrap();
+        assert_eq!(
+            conn.messages(Duration::from_millis(200)),
+            vec![vec!["cattube-card-result".to_string(), "play".to_string()]]
+        );
+        // Closing the peer immediately marks the connection closed without waiting out IPC_TIMEOUT.
+        drop(peer);
+        let at = Instant::now();
+        assert!(conn.command(&[Arg::Str("get_property"), Arg::Str("time-pos")]).is_err());
+        assert!(conn.closed());
+        assert!(at.elapsed() < Duration::from_millis(250));
     }
 }

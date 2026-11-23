@@ -130,6 +130,7 @@ pub fn tr(text: &str) -> &str {
         "Waiting for you to enter it…" => "في انتظار إدخال الرمز…",
         "Back to cancel" => "رجوع للإلغاء",
         "On your phone or computer, go to" => "على هاتفك أو حاسوبك، افتح",
+        "and enter this code" => "وأدخل هذا الرمز",
         "Link your phone" => "ربط هاتفك",
         "Link with TV code" => "الربط برمز التلفزيون",
         "In the YouTube app on your phone, open Settings → Watch on TV" => {
@@ -166,6 +167,9 @@ pub fn tr(text: &str) -> &str {
 }
 
 pub fn is_rtl(text: &str) -> bool {
+    if text.is_ascii() {
+        return false;
+    }
     BidiInfo::new(text, None)
         .paragraphs
         .first()
@@ -180,7 +184,7 @@ static SHAPER: LazyLock<arabic_reshaper::ArabicReshaper<'static>> = LazyLock::ne
 });
 
 fn display(text: &str) -> Cow<'_, str> {
-    if !BidiInfo::new(text, None).has_rtl() {
+    if text.is_ascii() || !BidiInfo::new(text, None).has_rtl() {
         return Cow::Borrowed(text);
     }
     let mut visual = String::new();
@@ -254,6 +258,9 @@ mod tests {
             let marked = layout(ui.painter(), "مَرْحَبًا\nالعربية", font, egui::Color32::WHITE);
             assert_eq!(marked.rows.len(), 2);
             assert!(marked.rows.iter().all(|r| !r.glyphs.is_empty()));
+            assert!(!is_rtl("YouTube 2026"));
+            assert!(is_rtl("بحث YouTube 2026"));
+            assert!(matches!(display("YouTube 2026"), Cow::Borrowed("YouTube 2026")));
         })
         .drop_without_applying_deltas();
     }

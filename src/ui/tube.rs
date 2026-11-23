@@ -56,6 +56,7 @@ pub struct View<'a> {
     pub positions: &'a [(String, f64)],
     pub votes: &'a HashMap<String, (u64, u64)>,
     pub tools: &'a Scan<String>,
+    pub yt_dlp_ready: bool,
     pub now: f64,
     /// The video playing behind the browser.
     pub now_playing: Option<&'a Tile>,
@@ -337,20 +338,21 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         }
     });
     let acct_w = c.text_width(name, 16.0, Weight::Semibold) + 96.0;
-    let tabs_w: f32 = labels.iter().map(|l| widgets::tab_width(c, l)).sum::<f32>()
-        + 6.0 * (labels.len() as f32 + 1.0);
+    let tab_widths: Vec<f32> = labels.iter().map(|l| widgets::tab_width(c, l)).collect();
+    let tabs_w: f32 = tab_widths.iter().sum::<f32>() + 6.0 * (labels.len() as f32 + 1.0);
     let right_edge = 1216.0 - acct_w;
     let cx = 640.0_f32
         .min(right_edge - 20.0 - tabs_w / 2.0)
         .max(220.0 + tabs_w / 2.0);
     let selected = Section::ALL.iter().position(|s| *s == v.tube.section);
-    let rects = widgets::tab_bar(
+    let rects = widgets::tab_bar_with_widths(
         c,
         "tube-tabs",
         cx,
         y,
         52.0,
         &labels,
+        &tab_widths,
         selected,
         focus.filter(|i| *i < labels.len()),
         focus.is_some_and(|i| i >= labels.len()),
@@ -368,12 +370,8 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
     }
     let x = 1216.0 - w;
     let cy = y + 26.0;
-    let photo = v
-        .accounts
-        .active()
-        .map(|a| a.photo.clone())
-        .unwrap_or_default();
-    match v.pics.get(&c.ctx, &photo, false) {
+    let photo = v.accounts.active().map_or("", |a| a.photo.as_str());
+    match v.pics.get(&c.ctx, photo, false) {
         Some(tex) => c.image_rounded(
             c.r(x + 11.0, cy - 15.0, 30.0, 30.0),
             15.0,
@@ -437,12 +435,14 @@ fn resumed(v: &View, t: &Tile) -> Option<f32> {
 fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
     let rect = widgets::lifted(c, c.r(x, y, CARD_W, CARD_H), focus);
     widgets::focus_lift(c, rect, RADIUS, focus);
-    c.fill(rect, RADIUS, theme::rgba(theme::BG_TOP, 220));
     let (rx, ry) = c.to_design(rect.min);
     let (rw, rh) = c.dsize(rect);
     match (t.kind, v.pics.get(&c.ctx, &t.thumb, focused)) {
         // Channels: their round picture on a soft card.
         (Kind::Channel, tex) => {
+            if !theme::FLAT {
+                c.fill(rect, RADIUS, theme::rgba(theme::BG_TOP, 220));
+            }
             c.fill(rect, RADIUS, theme::glass());
             let d = rh * 0.62;
             let (cx, cy) = (rx + rw / 2.0, ry + rh / 2.0);
@@ -481,7 +481,12 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
                 Color32::from_gray((255.0 * k) as u8),
             );
         }
-        (_, None) => c.fill(rect, RADIUS, theme::glass()),
+        (_, None) => {
+            if !theme::FLAT {
+                c.fill(rect, RADIUS, theme::rgba(theme::BG_TOP, 220));
+            }
+            c.fill(rect, RADIUS, theme::glass());
+        }
     }
     if t.kind == Kind::Playlist {
         // A strip on the right with the video count, as YouTube shows it.
@@ -508,8 +513,14 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
         }
     } else if !t.badge.is_empty() || v.now_playing.is_some_and(|active| active.id == t.id) {
         let playing = v.now_playing.is_some_and(|active| active.id == t.id);
-        let badge = if playing { tr("Playing") } else { &t.badge };
-        let live = !playing && (t.kind == Kind::Live || t.badge == tr("LIVE"));
+        let live = !playing && (t.kind == Kind::Live || t.badge == "LIVE" || t.badge == tr("LIVE"));
+        let badge = if playing {
+            tr("Playing")
+        } else if live && t.badge == "LIVE" {
+            tr("LIVE")
+        } else {
+            &t.badge
+        };
         let tw = c.text_width(badge, 13.0, Weight::Semibold) + 14.0;
         let b = c.r(rx + rw - tw - 8.0, ry + rh - 30.0, tw, 22.0);
         c.fill(
@@ -586,15 +597,15 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
         );
     }
     let sub = if t.kind == Kind::Channel {
-        t.meta.clone()
+        t.meta.as_str()
     } else {
-        t.byline.clone()
+        t.byline.as_str()
     };
     c.text(
         x,
         ty + if l2.is_empty() { 20.0 } else { 39.0 },
         Align2::LEFT_TOP,
-        &c.fit(&sub, CARD_W, 13.0, Weight::Regular),
+        &c.fit(sub, CARD_W, 13.0, Weight::Regular),
         13.0,
         theme::text3(),
         Weight::Regular,
@@ -603,29 +614,7 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
 
 /// Break `s` into two lines that fit `w` (the second one cut short).
 fn two_lines(c: &C, s: &str, w: f32, size: f32) -> (String, String) {
-    if c.text_width(s, size, Weight::Semibold) <= w {
-        return (s.to_string(), String::new());
-    }
-    let words: Vec<&str> = s.split_whitespace().collect();
-    let mut first = String::new();
-    let mut i = 0;
-    while i < words.len() {
-        let try_ = if first.is_empty() {
-            words[i].to_string()
-        } else {
-            format!("{first} {}", words[i])
-        };
-        if c.text_width(&try_, size, Weight::Semibold) > w {
-            break;
-        }
-        first = try_;
-        i += 1;
-    }
-    if first.is_empty() {
-        return (c.fit(s, w, size, Weight::Semibold), String::new());
-    }
-    let rest = words[i..].join(" ");
-    (first, c.fit(&rest, w, size, Weight::Semibold))
+    c.two_lines(s, w, size, Weight::Semibold)
 }
 
 /// The focused tile, large: title, channel, facts.
@@ -826,7 +815,7 @@ fn draw_browse(c: &C, v: &View) {
 
 /// While CatTube fetches its player (the first start).
 fn tools_note(c: &C, v: &View) {
-    if matches!(v.tools, Scan::Busy) && !player::yt_dlp_path(&player::data_home()).is_file() {
+    if matches!(v.tools, Scan::Busy) && !v.yt_dlp_ready {
         widgets::busy_line(
             c,
             64.0,
@@ -1163,7 +1152,7 @@ fn draw_menu(
         widgets::button(
             c,
             r,
-            it.label(subscribed),
+            tr(it.label(subscribed)),
             if i == 0 {
                 widgets::ButtonStyle::Primary
             } else {
@@ -1243,7 +1232,7 @@ fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
                 640.0,
                 326.0,
                 Align2::CENTER_CENTER,
-                "and enter this code",
+                tr("and enter this code"),
                 18.0,
                 theme::text2(),
                 Weight::Regular,
@@ -1518,18 +1507,22 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
     let scroll = c.anim(("tube-settings-scroll", shown), target);
     let list = c.clipped(330.0, 204.0, 898.0, 480.0);
     let p = v.prefs;
+    let speed = format!("{}×", p.speed);
+    let quality = player::resolution_label(p.max_height);
+    let tools = match v.tools {
+        Scan::Done(s) => s.first().cloned().unwrap_or_default(),
+        Scan::Failed(e) => e.clone(),
+        _ => tr("Updating…").into(),
+    };
     let mut y = 212.0 - scroll;
     for (i, row) in rows.iter().enumerate() {
         if !range.contains(&i) {
             continue;
         }
-        let speed = format!("{}×", p.speed);
-        let quality = player::resolution_label(p.max_height);
-        let tools = match v.tools {
-            Scan::Done(s) => s.first().cloned().unwrap_or_default(),
-            Scan::Failed(e) => e.clone(),
-            _ => tr("Updating…").into(),
-        };
+        if y + h < 204.0 || y > 684.0 {
+            y += step;
+            continue;
+        }
         let (title, sub, value, kind, icon): (String, String, String, RowKind, &str) = match row {
             SettingRow::Account(i) => {
                 let a = &v.accounts.list[*i];
@@ -1559,7 +1552,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             SettingRow::Quality => (
                 tr("Highest quality").into(),
                 tr("Lower plays smoother on slow connections").into(),
-                quality,
+                quality.clone(),
                 RowKind::Choice,
                 "display",
             ),
@@ -1598,7 +1591,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             SettingRow::Speed => (
                 tr("Speed").into(),
                 tr("Also changed in the player, and kept").into(),
-                speed,
+                speed.clone(),
                 RowKind::Choice,
                 "play",
             ),
@@ -1681,8 +1674,8 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             },
             t,
         );
-        if y > 204.0 && y + h < 684.0 {
-            c.hit(rect, Target::Tube(1, i));
+        if y + h > 204.0 && y < 684.0 {
+            list.hit(rect, Target::Tube(1, i));
         }
         y += step;
     }

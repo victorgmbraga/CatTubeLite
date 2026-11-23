@@ -586,7 +586,6 @@ impl Tube {
         if self.header && matches!(self.stack.last(), Some(Screen::Search { .. })) {
             return self.handle_search_header(action, ctx);
         }
-        let recent = self.recent.clone();
         let Some(screen) = self.stack.last_mut() else {
             return vec![Effect::Close];
         };
@@ -598,7 +597,6 @@ impl Tube {
                 cols,
                 browse_id,
             } => {
-                let pg = page.items().first().cloned();
                 let id = browse_id.clone();
                 match action {
                     Action::Back => self.back(),
@@ -607,8 +605,10 @@ impl Tube {
                         vec![Effect::Load(id)]
                     }
                     a => {
-                        let Some(p) = pg else { return vec![] };
-                        match rows_move(&p, row, cols, a) {
+                        let Some(p) = page.items().first() else {
+                            return vec![];
+                        };
+                        match rows_move(p, row, cols, a) {
                             RowMove::Open(t) => self.open_tile(t),
                             RowMove::Menu(t) => self.open_menu(t),
                             RowMove::More(tok) => vec![Effect::LoadMore {
@@ -632,7 +632,7 @@ impl Tube {
                 ..
             } => {
                 if *in_results {
-                    let Some(p) = results.items().first().cloned() else {
+                    let Some(p) = results.items().first() else {
                         *in_results = false;
                         return vec![];
                     };
@@ -642,7 +642,7 @@ impl Tube {
                     }
                     // Up and down the grid of videos, the column stays.
                     let from = (*row, cols.get(*row).copied().unwrap_or(0));
-                    let mv = rows_move(&p, row, cols, action);
+                    let mv = rows_move(p, row, cols, action);
                     let grid =
                         |r: usize| p.shelves.get(r).is_some_and(|sh| sh.title != CHANNELS_ROW);
                     if *row != from.0 && grid(*row) && grid(from.0) {
@@ -670,13 +670,21 @@ impl Tube {
                         Action::Up if i == 0 => *suggestion = None,
                         Action::Up => *suggestion = Some(i - 1),
                         Action::Down if i + 1 < suggestions.len() => *suggestion = Some(i + 1),
-                        Action::Down if !results.items().is_empty() => {
+                        Action::Down
+                            if results
+                                .items()
+                                .first()
+                                .is_some_and(|p| !p.shelves.is_empty()) =>
+                        {
                             *suggestion = None;
                             *in_results = true;
                         }
                         Action::Left | Action::Back => *suggestion = None,
                         Action::Ok | Action::OkLong => {
-                            let q = suggestions[i].clone();
+                            let Some(q) = suggestions.get(i).cloned() else {
+                                *suggestion = None;
+                                return vec![];
+                            };
                             osk.set_text(&q);
                             *suggestion = None;
                             *results = Scan::Busy;
@@ -704,7 +712,12 @@ impl Tube {
                         *suggestion = Some(0);
                         return vec![];
                     }
-                    OskEvent::Edge(Edge::Down) if !results.items().is_empty() => {
+                    OskEvent::Edge(Edge::Down)
+                        if results
+                            .items()
+                            .first()
+                            .is_some_and(|p| !p.shelves.is_empty()) =>
+                    {
                         *in_results = true;
                         return vec![];
                     }
@@ -729,7 +742,7 @@ impl Tube {
                             vec![Effect::Suggest(now)]
                         } else {
                             if now.trim().is_empty() {
-                                *suggestions = recent;
+                                *suggestions = self.recent.clone();
                             } else if now.trim().len() < 2 {
                                 suggestions.clear();
                             }
@@ -879,7 +892,20 @@ impl Tube {
                         self.stack.push(Screen::TvCode { code: Scan::Busy });
                         vec![Effect::TvCode]
                     }
-                    (Action::Ok | Action::Right, Some(r)) => vec![Effect::Setting(r, 1)],
+                    (Action::Ok, Some(r)) => vec![Effect::Setting(r, 1)],
+                    (
+                        Action::Right,
+                        Some(
+                            r @ (SettingRow::Quality
+                            | SettingRow::Codec
+                            | SettingRow::Speed
+                            | SettingRow::SubtitleLanguage
+                            | SettingRow::Language
+                            | SettingRow::Autoplay
+                            | SettingRow::Buffer
+                            | SettingRow::Region),
+                        ),
+                    ) => vec![Effect::Setting(r, 1)],
                     (Action::Left, Some(r)) => vec![Effect::Setting(r, -1)],
                     _ => vec![],
                 }
@@ -956,7 +982,11 @@ impl Tube {
             }
             return vec![];
         }
-        let Some(page) = self.current().and_then(|p| p.items().first()).cloned() else {
+        let has_page = self
+            .current()
+            .and_then(|p| p.items().first())
+            .is_some();
+        if !has_page {
             match action {
                 Action::Up | Action::Back => self.header = true,
                 Action::Ok if matches!(self.current(), Some(Scan::Failed(_))) => {
@@ -965,13 +995,20 @@ impl Tube {
                 _ => {}
             }
             return vec![];
-        };
+        }
         if action == Action::Back {
             return self.back();
         }
         let id = self.section.browse_id().unwrap_or_default().to_string();
         let (mut row, mut cols) = (self.row, std::mem::take(&mut self.cols));
-        let m = rows_move(&page, &mut row, &mut cols, action);
+        let m = {
+            let page = self
+                .pages
+                .get(&id)
+                .and_then(|p| p.items().first())
+                .expect("checked above");
+            rows_move(page, &mut row, &mut cols, action)
+        };
         self.row = row;
         self.cols = cols;
         match m {
@@ -1195,11 +1232,21 @@ impl Tube {
 
     pub fn on_suggestions(&mut self, query: &str, list: Vec<String>) {
         if let Some(Screen::Search {
-            osk, suggestions, ..
+            osk,
+            suggestions,
+            suggestion,
+            ..
         }) = self.stack.last_mut()
             && osk.text() == query
         {
             *suggestions = list;
+            if let Some(i) = *suggestion {
+                *suggestion = if suggestions.is_empty() {
+                    None
+                } else {
+                    Some(i.min(suggestions.len() - 1))
+                };
+            }
         }
     }
 
@@ -1981,5 +2028,68 @@ mod tests {
         assert!(idx(&t).1);
         t.handle(Back, IN, &no);
         assert!(!matches!(t.screen(), Some(Screen::Settings { .. })));
+    }
+
+    #[test]
+    fn shrinking_suggestions_clamps_focus_and_empty_search_stays_on_keyboard() {
+        let (mut t, _) = Tube::open(IN);
+        t.stack.push(search_screen());
+        if let Some(Screen::Search {
+            osk,
+            suggestions,
+            suggestion,
+            ..
+        }) = t.stack.last_mut()
+        {
+            osk.set_text("abc");
+            *suggestions = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+            *suggestion = Some(3);
+        }
+        // Fewer suggestions arrive while focused on index 3: must clamp instead of panicking.
+        t.on_suggestions("abc", vec!["abc one".into()]);
+        assert_eq!(
+            t.handle(Action::Ok, IN, &no),
+            vec![Effect::Search("abc one".into())]
+        );
+        // Empty search results must not enter `in_results`.
+        t.on_search(ok(Page::default()));
+        for _ in 0..8 {
+            t.handle(Action::Down, IN, &no);
+        }
+        assert!(matches!(
+            t.screen(),
+            Some(Screen::Search {
+                in_results: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn right_arrow_in_settings_does_not_toggle_or_trigger_actions() {
+        let (mut t, _) = Tube::open(IN);
+        let rows = setting_rows(IN.accounts, IN.sponsorblock);
+        let hdr = rows.iter().position(|r| *r == SettingRow::Hdr).unwrap();
+        let update = rows
+            .iter()
+            .position(|r| *r == SettingRow::UpdateYtDlp)
+            .unwrap();
+        t.stack.push(Screen::Settings {
+            index: hdr,
+            groups: false,
+        });
+        assert!(t.handle(Action::Right, IN, &no).is_empty());
+        assert_eq!(
+            t.handle(Action::Ok, IN, &no),
+            vec![Effect::Setting(SettingRow::Hdr, 1)]
+        );
+        if let Some(Screen::Settings { index, .. }) = t.stack.last_mut() {
+            *index = update;
+        }
+        assert!(t.handle(Action::Right, IN, &no).is_empty());
+        assert_eq!(
+            t.handle(Action::Ok, IN, &no),
+            vec![Effect::Setting(SettingRow::UpdateYtDlp, 1)]
+        );
     }
 }

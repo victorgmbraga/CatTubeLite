@@ -57,10 +57,17 @@ pub fn draw<H: Copy>(c: &Canvas<H>, name: &str, cx: f32, cy: f32, size: f32, col
                 &[
                     at(-0.8, -0.3),
                     at(-0.4, -0.3),
+                    at(-0.4, 0.3),
+                    at(-0.8, 0.3),
+                ],
+                color,
+            );
+            c.polygon(
+                &[
+                    at(-0.4, -0.3),
                     at(0.05, -0.75),
                     at(0.05, 0.75),
                     at(-0.4, 0.3),
-                    at(-0.8, 0.3),
                 ],
                 color,
             );
@@ -257,13 +264,18 @@ pub fn draw<H: Copy>(c: &Canvas<H>, name: &str, cx: f32, cy: f32, size: f32, col
             c.polygon(
                 &[
                     at(0.0, -0.95),
-                    at(0.22, -0.22),
-                    at(0.95, 0.0),
-                    at(0.22, 0.22),
+                    at(0.22, 0.0),
                     at(0.0, 0.95),
-                    at(-0.22, 0.22),
+                    at(-0.22, 0.0),
+                ],
+                color,
+            );
+            c.polygon(
+                &[
                     at(-0.95, 0.0),
-                    at(-0.22, -0.22),
+                    at(0.0, -0.22),
+                    at(0.95, 0.0),
+                    at(0.0, 0.22),
                 ],
                 color,
             );

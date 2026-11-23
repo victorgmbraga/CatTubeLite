@@ -98,8 +98,9 @@ pub fn parse_segments(body: &str) -> Vec<Segment> {
 }
 
 /// Where to jump to at `pos`: the end of a segment that `pos` is in and
-/// that was not skipped before (`done` holds their starts). A segment that
-/// ends with the video is left to play out (nothing to jump to).
+/// that was not skipped before (`done` holds their starts). Segments running
+/// to the end of the video are returned too so the player can loop or finish
+/// cleanly instead of seeking past EOF.
 pub fn skip_at(
     segs: &[Segment],
     pos: f64,
@@ -110,8 +111,8 @@ pub fn skip_at(
         .find(|s| {
             pos >= s.start
                 && pos < s.end - 0.5
+                && duration.is_none_or(|d| pos < d - 1.0)
                 && !done.iter().any(|d| (d - s.start).abs() < 0.01)
-                && duration.is_none_or(|d| s.end < d - 1.0)
         })
         .map(|s| (s.end, s.category.clone()))
 }
@@ -178,8 +179,13 @@ mod tests {
         );
         // Skipped once (the viewer may go back into it on purpose).
         assert_eq!(skip_at(&s, 6.0, Some(600.0), &[5.0]), None);
-        // A segment running to the end is not jumped over.
-        assert_eq!(skip_at(&s, 70.0, Some(90.5), &[]), None);
+        // A segment running to the end is returned so the player can finish or loop cleanly,
+        // unless playback is already within the final second.
+        assert_eq!(
+            skip_at(&s, 70.0, Some(90.5), &[]),
+            Some((90.0, "sponsor".into()))
+        );
+        assert_eq!(skip_at(&s, 89.8, Some(90.5), &[]), None);
         assert!(parse_segments("Not Found").is_empty());
         assert_eq!(category_label("selfpromo"), "Unpaid or self promotion");
     }

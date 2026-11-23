@@ -206,7 +206,7 @@ pub fn load(config: &Path) -> Prefs {
 
 pub fn save(config: &Path, p: &Prefs) -> std::io::Result<()> {
     std::fs::create_dir_all(config)?;
-    std::fs::write(path(config), p.to_conf())
+    cattube_core::util::write_atomic(&path(config), &p.to_conf())
 }
 
 /// The next value in `list` in `delta`'s direction, wrapping.

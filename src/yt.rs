@@ -119,9 +119,28 @@ fn token_request(body: &str) -> Result<cattube_core::process::Output, String> {
     out.map_err(|e| e.to_string())
 }
 
+/// Quote a string for `curl -K` config syntax so paths and URLs cannot inject
+/// additional options.
+fn curl_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' | '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Many plain GETs at once in one `curl` (one HTTP/2 connection, in
 /// parallel). Each answer in order; empty when that one failed.
-fn fetch_many(urls: &[String]) -> Vec<String> {
+fn fetch_many(urls: &[String], low_power: bool) -> Vec<String> {
+    if urls.is_empty() {
+        return Vec::new();
+    }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir =
@@ -134,9 +153,17 @@ fn fetch_many(urls: &[String]) -> Vec<String> {
     let config: String = urls
         .iter()
         .enumerate()
-        .map(|(i, u)| format!("url = \"{u}\"\noutput = \"{}/{i}\"\n", dir.display()))
+        .map(|(i, u)| {
+            format!(
+                "url = {}\noutput = {}\n",
+                curl_quote(u),
+                curl_quote(&dir.join(i.to_string()).display().to_string())
+            )
+        })
         .collect();
     let list = dir.join("list");
+    let parallel_max = if low_power { "8" } else { "24" };
+    let total_secs = (30 + urls.len() as u64 / 3).min(120);
     if std::fs::write(&list, config).is_ok() {
         let _ = SystemRunner.run(
             &Cmd::new("curl")
@@ -146,13 +173,13 @@ fn fetch_many(urls: &[String]) -> Vec<String> {
                     "--fail".to_string(),
                     "--parallel".to_string(),
                     "--parallel-max".to_string(),
-                    "40".to_string(),
+                    parallel_max.to_string(),
                     "-m".to_string(),
                     "20".to_string(),
                     "-K".to_string(),
                     list.display().to_string(),
                 ])
-                .timeout(Duration::from_secs(30)),
+                .timeout(Duration::from_secs(total_secs)),
         );
     }
     let out = (0..urls.len())
@@ -373,6 +400,9 @@ pub fn revoke(refresh: &str) -> bool {
 
 /// Access tokens by refresh token (they last an hour).
 static TOKENS: Mutex<Option<HashMap<String, (String, u64)>>> = Mutex::new(None);
+/// Serializes OAuth token refreshes so concurrent requests do not hammer the
+/// token endpoint on startup or expiry.
+static TOKEN_REFRESH: Mutex<()> = Mutex::new(());
 
 pub fn remember_token(refresh: &str, access: &str, expires_at: u64) {
     TOKENS
@@ -382,15 +412,23 @@ pub fn remember_token(refresh: &str, access: &str, expires_at: u64) {
         .insert(refresh.to_string(), (access.to_string(), expires_at));
 }
 
-/// A working token for the account with this refresh token.
-pub fn bearer(refresh: &str) -> Result<String, String> {
-    if let Some((a, exp)) = TOKENS
+fn cached_token(refresh: &str) -> Option<String> {
+    TOKENS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .and_then(|m| m.get(refresh).cloned())
-        && now() + 60 < exp
-    {
+        .filter(|(_, exp)| now() + 60 < *exp)
+        .map(|(a, _)| a)
+}
+
+/// A working token for the account with this refresh token.
+pub fn bearer(refresh: &str) -> Result<String, String> {
+    if let Some(a) = cached_token(refresh) {
+        return Ok(a);
+    }
+    let _refresh_guard = TOKEN_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = cached_token(refresh) {
         return Ok(a);
     }
     for retry in 0..2 {
@@ -519,9 +557,11 @@ fn follow_chat(first: String, region: String, on: std::sync::Arc<std::sync::atom
                         .filter(|m| m.id.is_empty() || !seen.contains(&m.id))
                         .collect();
                     for m in &fresh {
-                        seen.push_back(m.id.clone());
-                        if seen.len() > 500 {
-                            seen.pop_front();
+                        if !m.id.is_empty() {
+                            seen.push_back(m.id.clone());
+                            if seen.len() > 500 {
+                                seen.pop_front();
+                            }
                         }
                     }
                     if !fresh.is_empty() && on.load(Ordering::SeqCst) {
@@ -622,10 +662,11 @@ pub fn subscription_feeds(
         .iter()
         .filter_map(|c| subs::feed_url(&c.id))
         .collect();
-    let uploads: Vec<Vec<subs::Upload>> = fetch_many(&urls)
-        .iter()
-        .map(|xml| subs::parse_feed(xml, now))
-        .collect();
+    let uploads: Vec<Vec<subs::Upload>> =
+        fetch_many(&urls, cattube_core::env::low_power())
+            .iter()
+            .map(|xml| subs::parse_feed(xml, now))
+            .collect();
     if !channels.is_empty() && uploads.iter().all(Vec::is_empty) {
         return Err("YouTube didn't answer".into());
     }
@@ -682,8 +723,8 @@ pub fn search(ctx: &str, q: &str, refresh: Option<&str>) -> Result<Page, String>
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
-pub fn suggestions(q: &str) -> Vec<String> {
-    curl(&yt::suggest_url(q), None, None)
+pub fn suggestions(q: &str, hl: &str) -> Vec<String> {
+    curl(&yt::suggest_url_for(q, hl), None, None)
         .map(|b| yt::parse_suggestions(&b))
         .unwrap_or_default()
 }
@@ -747,12 +788,24 @@ fn image_path(cache: &Path, url: &str) -> PathBuf {
     cache.join("images").join(format!("{h:016x}.{ext}"))
 }
 
-/// A softened copy of a picture (backdrops): scaled down and blurred.
+/// A softened copy of a picture (backdrops): scaled down and blurred, written
+/// atomically so concurrent readers never see a half-written JPEG.
 fn blur_into(src: &Path, out: &Path) -> Option<()> {
     let img = image::load_from_memory(&std::fs::read(src).ok()?).ok()?;
     let small = img.resize(480, 270, image::imageops::FilterType::Triangle);
     let soft = image::imageops::blur(&small.to_rgb8(), 7.0);
-    soft.save_with_format(out, image::ImageFormat::Jpeg).ok()
+    let _ = std::fs::create_dir_all(out.parent()?);
+    let tmp = cattube_core::util::unique_tmp_path(out, "part");
+    if soft
+        .save_with_format(&tmp, image::ImageFormat::Jpeg)
+        .is_ok()
+        && std::fs::rename(&tmp, out).is_ok()
+    {
+        Some(())
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        None
+    }
 }
 
 /// Download a picture into the cache; returns its path. An address ending
@@ -777,9 +830,7 @@ pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
     let _ = std::fs::create_dir_all(path.parent()?);
     // Each download its own partial file: the card and the blurred
     // backdrop can ask for the same picture at once.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = path.with_extension(format!("{}-{n}.part", std::process::id()));
+    let tmp = cattube_core::util::unique_tmp_path(&path, "part");
     let ok = SystemRunner
         .run(
             &Cmd::new("curl")
@@ -805,41 +856,310 @@ pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
     }
 }
 
+/// Fetch a batch of pictures into the disk cache using a single `curl --parallel`
+/// invocation for all cache misses (reusing HTTP/2 + TLS connections). Returns
+/// `(url, Some(local_path))` in the same order as `urls`.
+pub fn fetch_images_batch(
+    cache: &Path,
+    urls: &[String],
+    low_power: bool,
+) -> Vec<(String, Option<String>)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut missing: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
+    for url in urls {
+        let base = url.strip_suffix("#blur").unwrap_or(url.as_str());
+        if !cattube_core::mpv::is_playable_url(base) {
+            continue;
+        }
+        // If `#blur` itself is already cached, its base doesn't need downloading.
+        if url.ends_with("#blur") && image_path(cache, url).is_file() {
+            continue;
+        }
+        let target = image_path(cache, base);
+        if !target.is_file() && seen.insert(target.clone()) {
+            let tmp = cattube_core::util::unique_tmp_path(&target, "part");
+            missing.push((base, target, tmp));
+        }
+    }
+
+    if missing.len() == 1 {
+        let _ = fetch_image(cache, missing[0].0);
+    } else if missing.len() > 1 {
+        let img_dir = cache.join("images");
+        if std::fs::create_dir_all(&img_dir).is_ok() {
+            let config: String = missing
+                .iter()
+                .map(|(url, _, tmp)| {
+                    format!(
+                        "url = {}\noutput = {}\n",
+                        curl_quote(url),
+                        curl_quote(&tmp.display().to_string())
+                    )
+                })
+                .collect();
+            let list = cattube_core::util::unique_tmp_path(
+                &cattube_core::env::runtime_dir().join("cattube-img-batch"),
+                "cfg",
+            );
+            let parallel_max = if low_power { "4" } else { "8" };
+            let timed_out = if std::fs::write(&list, config).is_ok() {
+                let res = SystemRunner.run(
+                    &Cmd::new("curl")
+                        .args([
+                            "-sS".to_string(),
+                            "--fail".to_string(),
+                            "--parallel".to_string(),
+                            "--parallel-max".to_string(),
+                            parallel_max.to_string(),
+                            "-m".to_string(),
+                            "20".to_string(),
+                            "-K".to_string(),
+                            list.display().to_string(),
+                        ])
+                        .timeout(Duration::from_secs(30)),
+                );
+                let _ = std::fs::remove_file(&list);
+                res.map(|o| o.timed_out).unwrap_or(true)
+            } else {
+                true
+            };
+            for (_, target, tmp) in &missing {
+                let valid = !timed_out
+                    && std::fs::metadata(tmp).is_ok_and(|m| m.len() > 0)
+                    && std::fs::rename(tmp, target).is_ok();
+                if !valid {
+                    let _ = std::fs::remove_file(tmp);
+                }
+            }
+        }
+    }
+
+    urls.iter()
+        .map(|url| {
+            let resolved = if let Some(base) = url.strip_suffix("#blur") {
+                let path = image_path(cache, url);
+                if path.is_file() {
+                    Some(path.to_string_lossy().into_owned())
+                } else {
+                    let src = image_path(cache, base);
+                    if src.is_file() && blur_into(&src, &path).is_some() {
+                        Some(path.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                }
+            } else if cattube_core::mpv::is_playable_url(url) {
+                let path = image_path(cache, url);
+                path.is_file().then(|| path.to_string_lossy().into_owned())
+            } else {
+                None
+            };
+            (url.clone(), resolved)
+        })
+        .collect()
+}
+
+/// Evict oldest cached images when `cache/images` grows beyond `max_bytes` or
+/// `max_files`, and clean up abandoned `.part` files left by crashed runs.
+pub fn prune_image_cache(cache: &Path, max_bytes: u64, max_files: usize) {
+    prune_image_cache_with_age(cache, max_bytes, max_files, Duration::from_secs(3600));
+}
+
+fn prune_image_cache_with_age(
+    cache: &Path,
+    max_bytes: u64,
+    max_files: usize,
+    part_max_age: Duration,
+) {
+    let dir = cache.join("images");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        if path.extension().is_some_and(|e| e == "part") {
+            let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+            if age >= part_max_age {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        let len = meta.len();
+        total_bytes = total_bytes.saturating_add(len);
+        files.push((modified, len, path));
+    }
+    if files.len() <= max_files && total_bytes <= max_bytes {
+        return;
+    }
+    files.sort_unstable_by_key(|(m, _, _)| *m);
+    let mut remaining = files.len();
+    for (_, len, path) in files {
+        if remaining <= max_files && total_bytes <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total_bytes = total_bytes.saturating_sub(len);
+            remaining -= 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- tools
+
+static TOOLS_LOCK: Mutex<()> = Mutex::new(());
+
+/// True when `yt-dlp` has not been checked recently and a background check is due.
+pub fn tools_stale(data: &Path) -> bool {
+    stale(&data.join("yt-dlp.checked"))
+}
 
 /// Make sure yt-dlp (and a JavaScript runtime for it) are there, and keep
 /// yt-dlp up to date. Returns a line for Settings.
 pub fn ensure_tools(data: &Path) -> Result<String, String> {
-    let _ = std::fs::create_dir_all(data);
-    let ytdlp = player::yt_dlp_path(data);
-    if !ytdlp.is_file() {
-        let tmp = ytdlp.with_extension("part");
-        run(&player::download_cmd(player::YT_DLP_URL, &tmp))
-            .map_err(|_| "Could not download yt-dlp".to_string())?;
-        set_exec(&tmp);
-        std::fs::rename(&tmp, &ytdlp).map_err(|e| e.to_string())?;
-        touch(&data.join("yt-dlp.checked"));
-    } else if stale(&data.join("yt-dlp.checked")) {
-        let _ = run(&player::update_cmd(&ytdlp));
-        touch(&data.join("yt-dlp.checked"));
-    }
-    let find = |n: &str| cattube_core::process::find_executable(n);
-    if player::js_runtime(data, &find).is_none() {
-        let zip = data.join("deno.zip");
-        run(&player::download_cmd(player::DENO_URL, &zip))
-            .map_err(|_| "Could not download Deno (needed for full quality)".to_string())?;
-        let r = run(&player::unzip_cmd(&zip, data));
-        let _ = std::fs::remove_file(&zip);
-        r.map_err(|_| "Could not unpack Deno".to_string())?;
-        set_exec(&player::own_deno_path(data));
-    }
-    Ok(ytdlp_version(data))
+    ensure_tools_inner(data, false)
 }
 
 /// Update yt-dlp now (Settings).
 pub fn update_tools(data: &Path) -> Result<String, String> {
-    let _ = std::fs::remove_file(data.join("yt-dlp.checked"));
-    ensure_tools(data)
+    ensure_tools_inner(data, true)
+}
+
+fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String> {
+    let _guard = TOOLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = std::fs::create_dir_all(data);
+    let ytdlp = player::yt_dlp_path(data);
+    let checked = data.join("yt-dlp.checked");
+    if !ytdlp.is_file() {
+        let tmp = cattube_core::util::unique_tmp_path(&ytdlp, "part");
+        if let Err(e) = download_verified(
+            player::YT_DLP_URL,
+            player::YT_DLP_SUMS_URL,
+            player::YT_DLP_ASSET,
+            &tmp,
+        ) {
+            eprintln!("cattube: yt-dlp: {e}");
+            let _ = std::fs::remove_file(&tmp);
+            return Err("Could not download yt-dlp".to_string());
+        }
+        set_exec(&tmp);
+        if let Err(e) = std::fs::rename(&tmp, &ytdlp) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+        touch(&checked);
+    } else if force_update || stale(&checked) {
+        match run(&player::update_cmd(&ytdlp)) {
+            Ok(_) => touch(&checked),
+            Err(e) if force_update => return Err(format!("Could not update yt-dlp ({e})")),
+            Err(_) => {}
+        }
+    }
+    let find = |n: &str| cattube_core::process::find_executable(n);
+    if player::js_runtime(data, &find).is_none() {
+        // A Deno that cannot run on this device is not fetched again for a day.
+        if force_update || stale(&data.join(DENO_FAILED)) {
+            install_deno(data)?;
+        }
+    } else if find("deno").is_none()
+        && cattube_core::process::find_executable(
+            &player::own_deno_path(data).display().to_string(),
+        )
+        .is_some()
+    {
+        refresh_deno(data, force_update);
+    }
+    Ok(ytdlp_version(data))
+}
+
+const DENO_CHECKED: &str = "deno.checked";
+const DENO_FAILED: &str = "deno.failed";
+const DENO_SHA256: &str = "deno.sha256";
+
+/// Download `url` to `out` and compare it with the release's published
+/// checksum. Returns that checksum.
+fn download_verified(url: &str, sums_url: &str, asset: &str, out: &Path) -> Result<String, String> {
+    run(&player::download_cmd(url, out))?;
+    let sums = run(&player::fetch_text_cmd(sums_url))?;
+    let want = player::expected_sha256(&sums, asset)
+        .ok_or_else(|| format!("no checksum published for {asset}"))?;
+    let got = run(&player::sha256_cmd(out))?;
+    if got.trim().eq_ignore_ascii_case(&want) {
+        Ok(want)
+    } else {
+        Err(format!("checksum mismatch for {asset}"))
+    }
+}
+
+/// Fetch, verify and try Deno away from its final place, then move it in
+/// with one rename: an interruption never leaves a broken runtime.
+fn install_deno(data: &Path) -> Result<(), String> {
+    let zip = cattube_core::util::unique_tmp_path(&data.join("deno.zip"), "part");
+    let dir = cattube_core::util::unique_tmp_path(&data.join("deno-new"), "dir");
+    let result = (|| {
+        let sum = download_verified(
+            player::DENO_URL,
+            player::DENO_SUM_URL,
+            player::DENO_ASSET,
+            &zip,
+        )
+        .map_err(|e| {
+            eprintln!("cattube: Deno: {e}");
+            "Could not download Deno (needed for full quality)".to_string()
+        })?;
+        std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        run(&player::unzip_cmd(&zip, &dir)).map_err(|_| "Could not unpack Deno".to_string())?;
+        let new = player::own_deno_path(&dir);
+        set_exec(&new);
+        let check = SystemRunner.run(
+            &Cmd::new(new.display().to_string())
+                .arg("--version")
+                .timeout(Duration::from_secs(30)),
+        );
+        match check {
+            Ok(o) if o.success() => {}
+            Ok(o) if o.timed_out => return Err("Deno did not start in time".to_string()),
+            _ => {
+                touch(&data.join(DENO_FAILED));
+                return Err("Deno does not run on this device".to_string());
+            }
+        }
+        std::fs::rename(&new, player::own_deno_path(data)).map_err(|e| e.to_string())?;
+        let _ = std::fs::write(data.join(DENO_SHA256), &sum);
+        let _ = std::fs::remove_file(data.join(DENO_FAILED));
+        touch(&data.join(DENO_CHECKED));
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&zip);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Keep CatTube's own Deno current; the installed one stays on any failure.
+fn refresh_deno(data: &Path, force: bool) {
+    let checked = data.join(DENO_CHECKED);
+    if !force && !stale_after(&checked, player::DENO_UPDATE_EVERY) {
+        return;
+    }
+    let Ok(sums) = run(&player::fetch_text_cmd(player::DENO_SUM_URL)) else {
+        return;
+    };
+    let Some(latest) = player::expected_sha256(&sums, player::DENO_ASSET) else {
+        return;
+    };
+    let installed = std::fs::read_to_string(data.join(DENO_SHA256)).unwrap_or_default();
+    if installed.trim() == latest {
+        touch(&checked);
+    } else if let Err(e) = install_deno(data) {
+        eprintln!("cattube: Deno update: {e}");
+    }
 }
 
 pub fn ytdlp_version(data: &Path) -> String {
@@ -857,14 +1177,21 @@ fn set_exec(p: &Path) {
 }
 
 fn touch(p: &Path) {
-    let _ = std::fs::write(p, now().to_string());
+    let tmp = cattube_core::util::unique_tmp_path(p, "tmp");
+    if std::fs::write(&tmp, now().to_string()).is_err() || std::fs::rename(&tmp, p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 fn stale(p: &Path) -> bool {
+    stale_after(p, player::UPDATE_EVERY)
+}
+
+fn stale_after(p: &Path, every: Duration) -> bool {
     std::fs::read_to_string(p)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_none_or(|t| now().saturating_sub(t) > player::UPDATE_EVERY.as_secs())
+        .is_none_or(|t| now().saturating_sub(t) > every.as_secs())
 }
 
 // ---------------------------------------------------------------- player
@@ -916,8 +1243,70 @@ pub fn checkpoint_player(data: &Path) {
     }
 }
 
+/// Shared handle to a running `mpv` child so both the UI/remote and the
+/// watcher can check exit status and reap it without hanging.
+#[derive(Clone)]
+pub struct PlayerHandle {
+    child: std::sync::Arc<Mutex<Option<std::process::Child>>>,
+}
+
+impl PlayerHandle {
+    pub fn new(child: std::process::Child) -> Self {
+        Self {
+            child: std::sync::Arc::new(Mutex::new(Some(child))),
+        }
+    }
+
+    /// True once the process has exited (reaping it immediately if so).
+    pub fn exited(&self) -> bool {
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(child) = slot.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *slot = None;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => {
+                *slot = None;
+                true
+            }
+        }
+    }
+
+    /// Terminate the player if it is still running and reap it.
+    pub fn stop_and_reap(&self) {
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut child) = slot.take() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Wait briefly for an already-closing player, then kill and reap so the
+    /// caller can never deadlock on a wedged `mpv`.
+    pub fn reap_or_kill(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        while !self.exited() {
+            if Instant::now() >= deadline {
+                self.stop_and_reap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+/// How long a player from another CatTube process gets to close.
+const PLAYER_CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
 /// Start mpv for a video (its own process group, stdin closed).
-pub fn start_player(o: &PlayOptions, data: &Path) -> Result<std::process::Child, String> {
+pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String> {
     std::fs::create_dir_all(data.join("positions"))
         .map_err(|e| format!("Could not save playback positions ({e})"))?;
     let find = |n: &str| cattube_core::process::find_executable(n);
@@ -929,6 +1318,13 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<std::process::Child,
         &player::player_socket(),
         js.as_deref(),
     );
+    // One screen, one player: the app and the phone remote are separate
+    // processes sharing this socket, so whichever starts a video first
+    // closes the other's (keeping its place).
+    checkpoint_player(data);
+    if !mpv::quit_and_wait(&player::player_socket(), PLAYER_CLOSE_GRACE) {
+        eprintln!("cattube: the previous player did not close in time");
+    }
     let _ = std::fs::remove_file(player::player_socket());
     std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -936,6 +1332,7 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<std::process::Child,
         // In CatTube's own process group: a TV shell that closes CatTube
         // (signalling the group) closes the player with it.
         .spawn()
+        .map(PlayerHandle::new)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => "mpv is not installed".to_string(),
             _ => format!("Could not start the player ({e})"),
@@ -999,16 +1396,22 @@ fn card(conn: &mut mpv::IpcConn, args: &[&str]) {
     let _ = conn.command(&v);
 }
 
-/// Raw thumbnail pixels for a player overlay.
-fn bgra_thumbnail(
+fn thumbnail_size(osd_width: f64, width: f64) -> (u32, u32) {
+    let scale = (osd_width / 1920.0).clamp(0.5, 4.0);
+    (
+        (width * scale) as u32,
+        (width * 9.0 / 16.0 * scale) as u32,
+    )
+}
+
+/// Decode and scale a thumbnail directly into BGRA bytes in memory.
+fn bgra_thumbnail_pixels(
     cache: &Path,
     id: &str,
     osd_width: f64,
     width: f64,
-    name: &str,
-) -> Option<(String, u32, u32)> {
-    let scale = (osd_width / 1920.0).clamp(0.5, 4.0);
-    let (w, h) = ((width * scale) as u32, (width * 9.0 / 16.0 * scale) as u32);
+) -> Option<(Vec<u8>, u32, u32)> {
+    let (w, h) = thumbnail_size(osd_width, width);
     let pic = fetch_image(cache, &yt::video_thumb(id))?;
     let img = image::load_from_memory(&std::fs::read(pic).ok()?).ok()?;
     let mut px = img
@@ -1018,17 +1421,33 @@ fn bgra_thumbnail(
     for p in px.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
+    Some((px, w, h))
+}
+
+/// Raw thumbnail pixels written once for a player overlay.
+fn bgra_thumbnail(
+    cache: &Path,
+    id: &str,
+    osd_width: f64,
+    width: f64,
+    name: &str,
+) -> Option<(String, u32, u32)> {
+    let (px, w, h) = bgra_thumbnail_pixels(cache, id, osd_width, width)?;
     let path = player::player_socket().with_file_name(name);
     std::fs::write(&path, px).ok()?;
     Some((path.to_string_lossy().into_owned(), w, h))
 }
 
-/// The related browser shows up to six rows, loading pictures progressively.
+/// The related browser shows up to six rows (three on low-power devices),
+/// loading pictures in row batches without per-thumbnail temp files.
 const RELATED: usize = 24;
+const RELATED_LOW_POWER: usize = 12;
 const RELATED_THUMB_W: f64 = 390.0;
 const RELATED_STEP_X: usize = 430;
 const RELATED_STEP_Y: usize = 320;
 const RELATED_ATLAS_W: usize = 1680;
+const RELATED_FLUSH_BATCH: usize = 4;
+const RELATED_FLUSH_INTERVAL: Duration = Duration::from_millis(400);
 
 fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize)>) -> String {
     let list: Vec<_> = tiles
@@ -1122,11 +1541,16 @@ fn send_related(
             return;
         }
     };
+    let limit = if session.low_power {
+        RELATED_LOW_POWER
+    } else {
+        RELATED
+    };
     let tiles: Vec<_> = details
         .related
         .into_iter()
         .filter(|t| t.playable())
-        .take(RELATED)
+        .take(limit)
         .collect();
     if tiles.is_empty() {
         send("{\"error\":\"No related videos\"}");
@@ -1147,22 +1571,21 @@ fn send_related(
     let name = path.to_string_lossy().into_owned();
     let mut tracked = false;
     let mut revision = 0;
-    let mut changed = false;
+    let mut pending = 0usize;
     let mut sent_at = Instant::now();
-    for (i, tile) in tiles.iter().enumerate() {
+    for (chunk_idx, chunk) in tiles.chunks(RELATED_FLUSH_BATCH).enumerate() {
         if !current() {
             return;
         }
-        if let Some((pic, w, h)) = bgra_thumbnail(
-            &session.cache,
-            &tile.id,
-            1920.0,
-            RELATED_THUMB_W,
-            &format!("cattube-related-{safe_id}-{request}-thumb.bgra"),
-        ) {
-            let bytes = std::fs::read(&pic);
-            let _ = std::fs::remove_file(&pic);
-            if let Ok(bytes) = bytes
+        let urls: Vec<String> = chunk.iter().map(|t| yt::video_thumb(&t.id)).collect();
+        let _ = fetch_images_batch(&session.cache, &urls, session.low_power);
+        for (offset, tile) in chunk.iter().enumerate() {
+            if !current() {
+                return;
+            }
+            let i = chunk_idx * RELATED_FLUSH_BATCH + offset;
+            if let Some((bytes, w, h)) =
+                bgra_thumbnail_pixels(&session.cache, &tile.id, 1920.0, RELATED_THUMB_W)
                 && bytes.len() == w as usize * h as usize * 4
             {
                 for row in 0..h as usize {
@@ -1173,33 +1596,37 @@ fn send_related(
                     pixels[dest..dest + w as usize * 4]
                         .copy_from_slice(&bytes[source..source + w as usize * 4]);
                 }
-                changed = true;
+                pending += 1;
             }
-        }
-        if changed && (sent_at.elapsed() >= Duration::from_millis(80) || i + 1 == tiles.len()) {
-            if !current() {
-                return;
-            }
-            if std::fs::write(&tmp, &pixels).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            let flush = pending > 0
+                && (pending >= RELATED_FLUSH_BATCH
+                    || sent_at.elapsed() >= RELATED_FLUSH_INTERVAL
+                    || i + 1 == tiles.len());
+            if flush {
                 if !current() {
-                    let _ = std::fs::remove_file(&path);
                     return;
                 }
-                if !tracked {
-                    if !requests.keep(&name, expected) {
+                if std::fs::write(&tmp, &pixels).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                    if !current() {
+                        let _ = std::fs::remove_file(&path);
                         return;
                     }
-                    tracked = true;
+                    if !tracked {
+                        if !requests.keep(&name, expected) {
+                            return;
+                        }
+                        tracked = true;
+                    }
+                    revision += 1;
+                    send(&related_json(
+                        &tiles,
+                        Some((&name, RELATED_ATLAS_W, height, revision)),
+                    ));
+                    sent_at = Instant::now();
+                    pending = 0;
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
                 }
-                revision += 1;
-                send(&related_json(
-                    &tiles,
-                    Some((&name, RELATED_ATLAS_W, height, revision)),
-                ));
-                sent_at = Instant::now();
-                changed = false;
-            } else {
-                let _ = std::fs::remove_file(&tmp);
             }
         }
     }
@@ -1227,6 +1654,9 @@ impl Drop for CardThumbnail {
     }
 }
 
+/// Design-canvas width of the Up Next card thumbnail (`TW` in `cattube-osd.lua`).
+const CARD_THUMB_W: f64 = 256.0;
+
 fn fetch_card_thumbnail(
     cache: PathBuf,
     id: String,
@@ -1241,7 +1671,7 @@ fn fetch_card_thumbnail(
                 &cache,
                 &id,
                 width,
-                512.0,
+                CARD_THUMB_W,
                 &format!("cattube-next-{}-{serial}.bgra", std::process::id()),
             )
             .map(CardThumbnail)
@@ -1253,11 +1683,44 @@ fn fetch_card_thumbnail(
     rx
 }
 
+/// Replace the active file with per-file options; falls back to the 3-argument
+/// `loadfile` signature used by mpv < 0.38 if mpv rejects the 4-argument form.
+fn loadfile_replace(conn: &mut mpv::IpcConn, url: &str, opts: &str) {
+    let r = conn.command(&[
+        Arg::Str("loadfile"),
+        Arg::Str(url),
+        Arg::Str("replace"),
+        Arg::Num(-1.0),
+        Arg::Str(opts),
+    ]);
+    if r.is_err() && !conn.closed() {
+        let _ = conn.command(&[
+            Arg::Str("loadfile"),
+            Arg::Str(url),
+            Arg::Str("replace"),
+            Arg::Str(opts),
+        ]);
+    }
+}
+
+fn safe_media_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect()
+}
+
 /// Watch the player until it goes away: SponsorBlock skips, the speed the
 /// viewer picked, quality changes from the control bar, and what plays
 /// next (an "Up next" card counting down, a loop, or nothing). Runs on
 /// its own thread; `done` is called when the player has gone.
-pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Send + 'static) {
+pub fn spawn_watcher(
+    first: yt::Tile,
+    player: PlayerHandle,
+    s: Session,
+    done: impl FnOnce(Ended) + Send + 'static,
+) {
     let _ = std::thread::Builder::new()
         .name("cattube-player".into())
         .spawn(move || {
@@ -1265,22 +1728,30 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
             let mut ended = Ended::default();
             let started = Instant::now();
             let mut conn = loop {
+                if player.exited() {
+                    done(ended);
+                    return;
+                }
                 if let Ok(mut c) = mpv::IpcConn::connect(&socket)
                     && c.get_f64("time-pos").is_some()
                 {
                     break c;
                 }
                 if started.elapsed() > Duration::from_secs(60) {
+                    player.stop_and_reap();
                     done(ended);
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_millis(250));
             };
             let mut queue = s.queue.clone();
             let mut history: Vec<yt::Tile> = Vec::new();
             let mut cur = first;
             let related_requests = std::sync::Arc::new(RelatedRequests::default());
+            let video_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             'videos: loop {
+                let current_gen =
+                    video_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 cattube_core::watched::record(&player::data_home(), &cur);
                 if let Some(on_video) = &s.on_video {
                     on_video(cur.clone());
@@ -1351,9 +1822,16 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     .and_then(|j| j.as_str().map(|s| s == "true"))
                     .unwrap_or(false);
                 if is_live || cur.kind == yt::Kind::Live {
-                    let (id, region, slot) = (cur.id.clone(), s.region.clone(), chat_token.clone());
+                    let (id, region, slot, vg) = (
+                        cur.id.clone(),
+                        s.region.clone(),
+                        chat_token.clone(),
+                        video_gen.clone(),
+                    );
                     std::thread::spawn(move || {
-                        if let Some(t) = live_chat_token(&id, &region) {
+                        if let Some(t) = live_chat_token(&id, &region)
+                            && vg.load(std::sync::atomic::Ordering::SeqCst) == current_gen
+                        {
                             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
                             let _ = mpv::ipc_request(
                                 &player::player_socket(),
@@ -1391,6 +1869,8 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                 let mut skipped: Vec<f64> = Vec::new();
                 let mut last = (0.0f64, None::<f64>);
                 let mut card_until: Option<Instant> = None;
+                let mut last_count: Option<u64> = None;
+                let mut quit_sent = false;
                 // A skip that runs to the end (end cards, outros) ends the
                 // video here: seeking past the real end can leave mpv
                 // paused without reporting it.
@@ -1435,7 +1915,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                         }
                     }
                     let msgs = conn.messages(Duration::from_millis(400));
-                    if conn.closed() {
+                    if conn.closed() || player.exited() {
                         ended.positions.push((cur.id.clone(), last.0, last.1));
                         stop_chat();
                         break 'videos;
@@ -1501,6 +1981,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                                 f(cur.clone());
                             }
                         } else {
+                            quit_sent = true;
                             let _ = conn.command(&[Arg::Str("quit")]);
                         }
                     }
@@ -1512,14 +1993,17 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                             Arg::Str("ytdl-format"),
                             Arg::Str(&fmt),
                         ]);
-                        let opts = format!("start={:.3}", last.0);
-                        let _ = conn.command(&[
-                            Arg::Str("loadfile"),
-                            Arg::Str(&cur.watch_url()),
-                            Arg::Str("replace"),
-                            Arg::Num(-1.0),
-                            Arg::Str(&opts),
-                        ]);
+                        let title = safe_media_title(&cur.title);
+                        let opts = if title.trim().is_empty() {
+                            format!("start={:.3}", last.0)
+                        } else {
+                            format!(
+                                "start={:.3},force-media-title={}",
+                                last.0,
+                                mpv::option_value(&title)
+                            )
+                        };
+                        loadfile_replace(&mut conn, &cur.watch_url(), &opts);
                         osd(
                             &mut conn,
                             &format!("Quality: {}", player::resolution_label(h)),
@@ -1541,18 +2025,25 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     // so skipping and the bar stay on time.
                     if let Some(arg) = want("cattube-comments") {
                         let token_ = if arg == "first" { String::new() } else { arg };
-                        let (ctx, refresh, id) = (s.ctx.clone(), s.refresh.clone(), cur.id.clone());
+                        let (ctx, refresh, id, vg) = (
+                            s.ctx.clone(),
+                            s.refresh.clone(),
+                            cur.id.clone(),
+                            video_gen.clone(),
+                        );
                         std::thread::spawn(move || {
                             let json =
                                 comments_json(comments(&ctx, &id, &token_, refresh.as_deref()));
-                            let _ = mpv::ipc_request(
-                                &player::player_socket(),
-                                &[
-                                    Arg::Str("script-message"),
-                                    Arg::Str("cattube-comments-data"),
-                                    Arg::Str(&json),
-                                ],
-                            );
+                            if vg.load(std::sync::atomic::Ordering::SeqCst) == current_gen {
+                                let _ = mpv::ipc_request(
+                                    &player::player_socket(),
+                                    &[
+                                        Arg::Str("script-message"),
+                                        Arg::Str("cattube-comments-data"),
+                                        Arg::Str(&json),
+                                    ],
+                                );
+                            }
                         });
                     }
                     // A new request supersedes prior work, including replies from
@@ -1612,7 +2103,8 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     .or(picked);
                     let eof = conn.get_bool("eof-reached").unwrap_or(false) || skipped_to_end;
                     // The end: "Up next" counts down five seconds.
-                    if eof && !next_pending && card_until.is_none() && jump.is_none() {
+                    if eof && !quit_sent && !next_pending && card_until.is_none() && jump.is_none()
+                    {
                         match &next_id {
                             Some(n) => {
                                 let mut args: Vec<String> =
@@ -1624,21 +2116,29 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                                 let a: Vec<&str> = args.iter().map(String::as_str).collect();
                                 card(&mut conn, &a);
                                 card_until = Some(Instant::now() + Duration::from_secs(5));
+                                last_count = Some(5);
                             }
                             None => {
+                                quit_sent = true;
                                 let _ = conn.command(&[Arg::Str("quit")]);
                             }
                         }
                     }
                     let result = want("cattube-card-result");
                     if let Some(until) = card_until {
-                        let left = until.saturating_duration_since(Instant::now()).as_secs();
-                        card(&mut conn, &["count", &left.to_string()]);
+                        let ms = until.saturating_duration_since(Instant::now()).as_millis();
+                        let left = (ms as u64).div_ceil(1000);
+                        if last_count != Some(left) {
+                            card(&mut conn, &["count", &left.to_string()]);
+                            last_count = Some(left);
+                        }
                         if result.as_deref() == Some("cancel") || result.as_deref() == Some("stop")
                         {
                             card(&mut conn, &["hide"]);
+                            quit_sent = true;
                             let _ = conn.command(&[Arg::Str("quit")]);
                             card_until = None;
+                            last_count = None;
                         }
                     }
                     let go_next = jump.clone().or_else(|| {
@@ -1657,20 +2157,9 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                                 queue.remove(0);
                             }
                         }
-                        let title: String = n
-                            .title
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(120)
-                            .collect();
+                        let title = safe_media_title(&n.title);
                         let opts = format!("force-media-title={}", mpv::option_value(&title));
-                        let _ = conn.command(&[
-                            Arg::Str("loadfile"),
-                            Arg::Str(&n.watch_url()),
-                            Arg::Str("replace"),
-                            Arg::Num(-1.0),
-                            Arg::Str(&opts),
-                        ]);
+                        loadfile_replace(&mut conn, &n.watch_url(), &opts);
                         // The end left it paused on the last frame (for the card).
                         let _ = conn.command(&[
                             Arg::Str("set_property"),
@@ -1678,15 +2167,23 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                             Arg::Str("no"),
                         ]);
                         cur = n;
-                        // Wait for it to load before watching it.
+                        // Wait for the replacement video itself to load (not the previous
+                        // video's leftover `time-pos` or `eof-reached`).
                         let t0 = Instant::now();
-                        while conn.get_f64("time-pos").is_none()
-                            && t0.elapsed() < Duration::from_secs(45)
-                        {
-                            if conn.closed() {
+                        while t0.elapsed() < Duration::from_secs(45) {
+                            if conn.closed() || player.exited() {
                                 break 'videos;
                             }
-                            std::thread::sleep(Duration::from_millis(300));
+                            let switched = conn
+                                .get_str("path")
+                                .is_some_and(|p| p.contains(&cur.id));
+                            let ready = switched
+                                && conn.get_f64("time-pos").is_some()
+                                && !conn.get_bool("eof-reached").unwrap_or(false);
+                            if ready {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(250));
                         }
                         continue 'videos;
                     }
@@ -1695,4 +2192,179 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
             related_requests.begin();
             done(ended);
         });
+}
+
+#[cfg(test)]
+mod player_tests {
+    use super::*;
+
+    #[test]
+    fn downloads_must_match_their_published_checksum() {
+        let root = std::env::temp_dir().join(format!("cattube-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let tool = root.join("tool");
+        let sums = root.join("sums");
+        let out = root.join("out");
+        std::fs::write(&tool, b"abc").unwrap();
+        let url = format!("file://{}", tool.display());
+        let sums_url = format!("file://{}", sums.display());
+        std::fs::write(
+            &sums,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  tool\n",
+        )
+        .unwrap();
+        assert!(download_verified(&url, &sums_url, "tool", &out).is_ok());
+        std::fs::write(&tool, b"tampered").unwrap();
+        assert!(download_verified(&url, &sums_url, "tool", &out).is_err());
+        assert!(download_verified(&url, &sums_url, "absent", &out).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn card_thumbnail_matches_osd_slot_dimensions() {
+        assert_eq!(thumbnail_size(1920.0, CARD_THUMB_W), (256, 144));
+        assert_eq!(thumbnail_size(1280.0, CARD_THUMB_W), (170, 96));
+        assert_eq!(thumbnail_size(3840.0, CARD_THUMB_W), (512, 288));
+    }
+
+    #[test]
+    fn player_handle_detects_early_exit_and_kills_stuck_child() {
+        let fast = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let handle = PlayerHandle::new(fast);
+        let t0 = Instant::now();
+        while !handle.exited() && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.exited());
+
+        let stuck = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let stuck_handle = PlayerHandle::new(stuck);
+        assert!(!stuck_handle.exited());
+        let at = Instant::now();
+        stuck_handle.reap_or_kill(Duration::from_millis(40));
+        assert!(stuck_handle.exited());
+        assert!(at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn loadfile_replace_falls_back_to_three_arg_signature_for_older_mpv() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(b.try_clone().unwrap());
+            let mut seen = Vec::new();
+            for reply_err in ["invalid parameter", "success"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req = mpv::parse_json(line.trim()).unwrap();
+                let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+                let cmd = req.get("command").unwrap().as_arr().unwrap().len();
+                seen.push(cmd);
+                writeln!(b, r#"{{"error":"{reply_err}","data":null,"request_id":{id}}}"#).unwrap();
+            }
+            seen
+        });
+        let mut conn = mpv::IpcConn::from_stream(a).unwrap();
+        loadfile_replace(&mut conn, "https://www.youtube.com/watch?v=WhWc3b3KhnY", "start=1.000");
+        drop(conn);
+        // 5 elements: ["loadfile", url, "replace", -1, opts] -> fallback to 4 elements without -1.
+        assert_eq!(server.join().unwrap(), vec![5, 4]);
+    }
+
+    #[test]
+    fn curl_quote_escapes_quotes_backslashes_and_newlines() {
+        assert_eq!(
+            curl_quote("https://example.com/a\"b\\c\nd\re"),
+            "\"https://example.com/a\\\"b\\\\cde\""
+        );
+    }
+
+    #[test]
+    fn prune_image_cache_evicts_oldest_files_and_stale_parts() {
+        let root = std::env::temp_dir().join(format!(
+            "cattube-cache-prune-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let img = root.join("images");
+        std::fs::create_dir_all(&img).unwrap();
+        let write_sleep = |name: &str, size: usize| {
+            let p = img.join(name);
+            std::fs::write(&p, vec![b'x'; size]).unwrap();
+            std::thread::sleep(Duration::from_millis(15));
+            p
+        };
+        let old1 = write_sleep("01.jpg", 100);
+        let old2 = write_sleep("02.jpg", 100);
+        let new1 = write_sleep("03.jpg", 100);
+        let new2 = write_sleep("04.jpg", 100);
+        let stale_part = write_sleep("abandoned.part", 50);
+
+        // Max 2 files and 250 bytes, and prune any .part immediately.
+        prune_image_cache_with_age(&root, 250, 2, Duration::ZERO);
+        assert!(!old1.exists());
+        assert!(!old2.exists());
+        assert!(!stale_part.exists());
+        assert!(new1.exists());
+        assert!(new2.exists());
+
+        // Byte cap below 200 evicts the next oldest image too.
+        prune_image_cache_with_age(&root, 150, 10, Duration::from_secs(3600));
+        assert!(!new1.exists());
+        assert!(new2.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn fetch_images_batch_uses_cached_entries_blurs_atomically_and_rejects_bad_urls() {
+        let root = std::env::temp_dir().join(format!(
+            "cattube-img-batch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = "https://i.ytimg.com/vi/WhWc3b3KhnY/hqdefault.jpg";
+        let blur_url = format!("{url}#blur");
+        let cached = image_path(&root, url);
+        std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
+        let img = image::RgbImage::from_pixel(16, 9, image::Rgb([30, 60, 90]));
+        img.save_with_format(&cached, image::ImageFormat::Jpeg)
+            .unwrap();
+
+        let res = fetch_images_batch(
+            &root,
+            &[
+                url.to_string(),
+                blur_url.clone(),
+                "javascript:alert(1)".to_string(),
+            ],
+            true,
+        );
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].1.as_deref(), Some(cached.to_string_lossy().as_ref()));
+        let blur_path = res[1].1.as_deref().expect("blur image generated");
+        assert!(Path::new(blur_path).is_file());
+        assert!(res[2].1.is_none());
+        // No leftover .part files.
+        let parts: Vec<_> = std::fs::read_dir(root.join("images"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
+            .collect();
+        assert!(parts.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

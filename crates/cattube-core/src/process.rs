@@ -182,8 +182,32 @@ impl Runner for SystemRunner {
     }
 }
 
+/// Maximum bytes buffered from a child's stdout / stderr (excess output is
+/// still drained so the child never blocks on a full pipe).
+const MAX_STDOUT: usize = 32 * 1024 * 1024;
+const MAX_STDERR: usize = 4 * 1024 * 1024;
+/// Extra grace after child exit/kill to receive pipe EOF without hanging on a
+/// grandchild that inherited the pipe descriptors.
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+fn read_capped(mut r: impl Read, limit: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+    while let Ok(n) = r.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        let room = limit.saturating_sub(out.len());
+        if room > 0 {
+            out.extend_from_slice(&chunk[..n.min(room)]);
+        }
+    }
+    out
+}
+
 /// Spawn `cmd`, capture stdout/stderr, kill it if it exceeds its timeout.
 pub fn run_with_timeout(cmd: &Cmd) -> Result<Output> {
+    use std::sync::mpsc;
     let mut child = Command::new(&cmd.program)
         .args(&cmd.args)
         .stdin(Stdio::null())
@@ -200,39 +224,61 @@ pub fn run_with_timeout(cmd: &Cmd) -> Result<Output> {
 
     // Drain pipes on helper threads so a chatty process cannot block on a
     // full pipe while we wait for it.
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let out_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(s) = stdout.as_mut() {
-            let _ = s.read_to_end(&mut buf);
-        }
-        buf
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    thread::spawn(move || {
+        let buf = stdout.map(|s| read_capped(s, MAX_STDOUT)).unwrap_or_default();
+        let _ = out_tx.send(buf);
     });
-    let err_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(s) = stderr.as_mut() {
-            let _ = s.read_to_end(&mut buf);
-        }
-        buf
+    thread::spawn(move || {
+        let buf = stderr.map(|s| read_capped(s, MAX_STDERR)).unwrap_or_default();
+        let _ = err_tx.send(buf);
     });
 
-    let start = Instant::now();
+    let deadline = Instant::now() + cmd.timeout;
+    let mut out_buf = None;
+    let mut err_buf = None;
+    // Block on pipe EOF instead of polling every 10 ms while the process runs.
+    if let Ok(b) = out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        out_buf = Some(b);
+        if let Ok(b) = err_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            err_buf = Some(b);
+        }
+    }
+
     let mut timed_out = false;
+    let mut backoff = Duration::from_millis(1);
     let status = loop {
         match child.try_wait()? {
             Some(status) => break Some(status),
-            None if start.elapsed() >= cmd.timeout => {
-                timed_out = true;
-                let _ = child.kill();
-                break child.wait().ok();
+            None => {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child.wait().ok();
+                }
+                thread::sleep(backoff.min(rem));
+                backoff = (backoff * 2).min(Duration::from_millis(25));
             }
-            None => thread::sleep(Duration::from_millis(10)),
         }
     };
 
-    let stdout = String::from_utf8_lossy(&out_thread.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_thread.join().unwrap_or_default()).into_owned();
+    let drain_deadline = Instant::now() + DRAIN_GRACE;
+    let out_bytes = out_buf.unwrap_or_else(|| {
+        out_rx
+            .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    });
+    let err_bytes = err_buf.unwrap_or_else(|| {
+        err_rx
+            .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    });
+    let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&err_bytes).into_owned();
     Ok(Output {
         code: if timed_out {
             None
@@ -249,7 +295,7 @@ pub fn run_with_timeout(cmd: &Cmd) -> Result<Output> {
 /// and `\r`, so progress output from pacman/curl arrives as it happens) to
 /// `on_line` while the command runs. The full output is still returned.
 pub fn run_with_lines(cmd: &Cmd, on_line: &mut dyn FnMut(&str)) -> Result<Output> {
-    use std::sync::mpsc;
+    use std::sync::mpsc::{self, RecvTimeoutError};
     let mut child = Command::new(&cmd.program)
         .args(&cmd.args)
         .stdin(Stdio::null())
@@ -263,9 +309,11 @@ pub fn run_with_lines(cmd: &Cmd, on_line: &mut dyn FnMut(&str)) -> Result<Output
                 Error::msg(format!("could not start {}: {e}", cmd.program))
             }
         })?;
-    let (tx, rx) = mpsc::channel::<String>();
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
     let mut stdout = child.stdout.take();
-    let out_thread = thread::spawn(move || {
+    thread::spawn(move || {
         let mut all = Vec::new();
         let mut line = Vec::new();
         let mut buf = [0u8; 4096];
@@ -274,53 +322,73 @@ pub fn run_with_lines(cmd: &Cmd, on_line: &mut dyn FnMut(&str)) -> Result<Output
                 if n == 0 {
                     break;
                 }
-                all.extend_from_slice(&buf[..n]);
+                let room = MAX_STDOUT.saturating_sub(all.len());
+                if room > 0 {
+                    all.extend_from_slice(&buf[..n.min(room)]);
+                }
                 for &b in &buf[..n] {
                     if b == b'\n' || b == b'\r' {
                         if !line.is_empty() {
-                            let _ = tx.send(String::from_utf8_lossy(&line).into_owned());
+                            let _ = line_tx.send(String::from_utf8_lossy(&line).into_owned());
                             line.clear();
                         }
-                    } else {
+                    } else if line.len() < 16 * 1024 {
                         line.push(b);
                     }
                 }
             }
         }
         if !line.is_empty() {
-            let _ = tx.send(String::from_utf8_lossy(&line).into_owned());
+            let _ = line_tx.send(String::from_utf8_lossy(&line).into_owned());
         }
-        all
+        drop(line_tx);
+        let _ = out_tx.send(all);
     });
-    let mut stderr = child.stderr.take();
-    let err_thread = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(s) = stderr.as_mut() {
-            let _ = s.read_to_end(&mut buf);
+    let stderr = child.stderr.take();
+    thread::spawn(move || {
+        let buf = stderr.map(|s| read_capped(s, MAX_STDERR)).unwrap_or_default();
+        let _ = err_tx.send(buf);
+    });
+    let deadline = Instant::now() + cmd.timeout;
+    loop {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        match line_rx.recv_timeout(rem) {
+            Ok(l) => on_line(&l),
+            Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => break,
         }
-        buf
-    });
-    let start = Instant::now();
+    }
     let mut timed_out = false;
+    let mut backoff = Duration::from_millis(1);
     let status = loop {
-        while let Ok(l) = rx.try_recv() {
+        while let Ok(l) = line_rx.try_recv() {
             on_line(&l);
         }
         match child.try_wait()? {
             Some(status) => break Some(status),
-            None if start.elapsed() >= cmd.timeout => {
-                timed_out = true;
-                let _ = child.kill();
-                break child.wait().ok();
+            None => {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child.wait().ok();
+                }
+                thread::sleep(backoff.min(rem));
+                backoff = (backoff * 2).min(Duration::from_millis(25));
             }
-            None => thread::sleep(Duration::from_millis(50)),
         }
     };
-    let stdout = String::from_utf8_lossy(&out_thread.join().unwrap_or_default()).into_owned();
-    while let Ok(l) = rx.try_recv() {
+    let drain_deadline = Instant::now() + DRAIN_GRACE;
+    let out_bytes = out_rx
+        .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
+    while let Ok(l) = line_rx.try_recv() {
         on_line(&l);
     }
-    let stderr = String::from_utf8_lossy(&err_thread.join().unwrap_or_default()).into_owned();
+    let err_bytes = err_rx
+        .recv_timeout(drain_deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&out_bytes).into_owned();
+    let stderr = String::from_utf8_lossy(&err_bytes).into_owned();
     Ok(Output {
         code: if timed_out {
             None
@@ -448,6 +516,56 @@ mod tests {
             c.display_redacted(),
             "nmcli device wifi connect 'My Net' password '********'"
         );
+    }
+
+    #[test]
+    fn timeout_does_not_hang_when_grandchild_holds_pipe_open() {
+        let start = Instant::now();
+        let out = run_with_timeout(
+            &Cmd::new("sh")
+                .args(["-c", "sleep 4 & sleep 4"])
+                .timeout(Duration::from_millis(150)),
+        )
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn early_closed_pipes_still_wait_for_exit_code_and_timeout() {
+        let out = run_with_timeout(
+            &Cmd::new("sh")
+                .args(["-c", "echo ok; exec >/dev/null 2>&1; sleep 0.05; exit 7"])
+                .timeout(Duration::from_secs(2)),
+        )
+        .unwrap();
+        assert!(!out.timed_out);
+        assert_eq!(out.code, Some(7));
+        assert_eq!(out.stdout.trim(), "ok");
+
+        let start = Instant::now();
+        let hung = run_with_timeout(
+            &Cmd::new("sh")
+                .args(["-c", "exec >/dev/null 2>&1; sleep 4"])
+                .timeout(Duration::from_millis(150)),
+        )
+        .unwrap();
+        assert!(hung.timed_out);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn run_with_lines_streams_output_and_respects_timeout() {
+        let mut lines = Vec::new();
+        let out = run_with_lines(
+            &Cmd::new("sh")
+                .args(["-c", "printf 'one\\ntwo\\rthree\\n'"])
+                .timeout(Duration::from_secs(2)),
+            &mut |l| lines.push(l.to_string()),
+        )
+        .unwrap();
+        assert!(out.success());
+        assert_eq!(lines, vec!["one", "two", "three"]);
     }
 
     #[test]
