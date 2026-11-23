@@ -1039,7 +1039,13 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
     let checked = data.join("yt-dlp.checked");
     if !ytdlp.is_file() {
         let tmp = cattube_core::util::unique_tmp_path(&ytdlp, "part");
-        if run(&player::download_cmd(player::YT_DLP_URL, &tmp)).is_err() {
+        if let Err(e) = download_verified(
+            player::YT_DLP_URL,
+            player::YT_DLP_SUMS_URL,
+            player::YT_DLP_ASSET,
+            &tmp,
+        ) {
+            eprintln!("cattube: yt-dlp: {e}");
             let _ = std::fs::remove_file(&tmp);
             return Err("Could not download yt-dlp".to_string());
         }
@@ -1058,17 +1064,102 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
     }
     let find = |n: &str| cattube_core::process::find_executable(n);
     if player::js_runtime(data, &find).is_none() {
-        let zip = cattube_core::util::unique_tmp_path(&data.join("deno.zip"), "part");
-        if run(&player::download_cmd(player::DENO_URL, &zip)).is_err() {
-            let _ = std::fs::remove_file(&zip);
-            return Err("Could not download Deno (needed for full quality)".to_string());
+        // A Deno that cannot run on this device is not fetched again for a day.
+        if force_update || stale(&data.join(DENO_FAILED)) {
+            install_deno(data)?;
         }
-        let r = run(&player::unzip_cmd(&zip, data));
-        let _ = std::fs::remove_file(&zip);
-        r.map_err(|_| "Could not unpack Deno".to_string())?;
-        set_exec(&player::own_deno_path(data));
+    } else if find("deno").is_none()
+        && cattube_core::process::find_executable(
+            &player::own_deno_path(data).display().to_string(),
+        )
+        .is_some()
+    {
+        refresh_deno(data, force_update);
     }
     Ok(ytdlp_version(data))
+}
+
+const DENO_CHECKED: &str = "deno.checked";
+const DENO_FAILED: &str = "deno.failed";
+const DENO_SHA256: &str = "deno.sha256";
+
+/// Download `url` to `out` and compare it with the release's published
+/// checksum. Returns that checksum.
+fn download_verified(url: &str, sums_url: &str, asset: &str, out: &Path) -> Result<String, String> {
+    run(&player::download_cmd(url, out))?;
+    let sums = run(&player::fetch_text_cmd(sums_url))?;
+    let want = player::expected_sha256(&sums, asset)
+        .ok_or_else(|| format!("no checksum published for {asset}"))?;
+    let got = run(&player::sha256_cmd(out))?;
+    if got.trim().eq_ignore_ascii_case(&want) {
+        Ok(want)
+    } else {
+        Err(format!("checksum mismatch for {asset}"))
+    }
+}
+
+/// Fetch, verify and try Deno away from its final place, then move it in
+/// with one rename: an interruption never leaves a broken runtime.
+fn install_deno(data: &Path) -> Result<(), String> {
+    let zip = cattube_core::util::unique_tmp_path(&data.join("deno.zip"), "part");
+    let dir = cattube_core::util::unique_tmp_path(&data.join("deno-new"), "dir");
+    let result = (|| {
+        let sum = download_verified(
+            player::DENO_URL,
+            player::DENO_SUM_URL,
+            player::DENO_ASSET,
+            &zip,
+        )
+        .map_err(|e| {
+            eprintln!("cattube: Deno: {e}");
+            "Could not download Deno (needed for full quality)".to_string()
+        })?;
+        std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
+        run(&player::unzip_cmd(&zip, &dir)).map_err(|_| "Could not unpack Deno".to_string())?;
+        let new = player::own_deno_path(&dir);
+        set_exec(&new);
+        let check = SystemRunner.run(
+            &Cmd::new(new.display().to_string())
+                .arg("--version")
+                .timeout(Duration::from_secs(30)),
+        );
+        match check {
+            Ok(o) if o.success() => {}
+            Ok(o) if o.timed_out => return Err("Deno did not start in time".to_string()),
+            _ => {
+                touch(&data.join(DENO_FAILED));
+                return Err("Deno does not run on this device".to_string());
+            }
+        }
+        std::fs::rename(&new, player::own_deno_path(data)).map_err(|e| e.to_string())?;
+        let _ = std::fs::write(data.join(DENO_SHA256), &sum);
+        let _ = std::fs::remove_file(data.join(DENO_FAILED));
+        touch(&data.join(DENO_CHECKED));
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&zip);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// Keep CatTube's own Deno current; the installed one stays on any failure.
+fn refresh_deno(data: &Path, force: bool) {
+    let checked = data.join(DENO_CHECKED);
+    if !force && !stale_after(&checked, player::DENO_UPDATE_EVERY) {
+        return;
+    }
+    let Ok(sums) = run(&player::fetch_text_cmd(player::DENO_SUM_URL)) else {
+        return;
+    };
+    let Some(latest) = player::expected_sha256(&sums, player::DENO_ASSET) else {
+        return;
+    };
+    let installed = std::fs::read_to_string(data.join(DENO_SHA256)).unwrap_or_default();
+    if installed.trim() == latest {
+        touch(&checked);
+    } else if let Err(e) = install_deno(data) {
+        eprintln!("cattube: Deno update: {e}");
+    }
 }
 
 pub fn ytdlp_version(data: &Path) -> String {
@@ -1093,10 +1184,14 @@ fn touch(p: &Path) {
 }
 
 fn stale(p: &Path) -> bool {
+    stale_after(p, player::UPDATE_EVERY)
+}
+
+fn stale_after(p: &Path, every: Duration) -> bool {
     std::fs::read_to_string(p)
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .is_none_or(|t| now().saturating_sub(t) > player::UPDATE_EVERY.as_secs())
+        .is_none_or(|t| now().saturating_sub(t) > every.as_secs())
 }
 
 // ---------------------------------------------------------------- player
@@ -1207,6 +1302,9 @@ impl PlayerHandle {
     }
 }
 
+/// How long a player from another CatTube process gets to close.
+const PLAYER_CLOSE_GRACE: Duration = Duration::from_millis(1500);
+
 /// Start mpv for a video (its own process group, stdin closed).
 pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String> {
     std::fs::create_dir_all(data.join("positions"))
@@ -1220,6 +1318,13 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
         &player::player_socket(),
         js.as_deref(),
     );
+    // One screen, one player: the app and the phone remote are separate
+    // processes sharing this socket, so whichever starts a video first
+    // closes the other's (keeping its place).
+    checkpoint_player(data);
+    if !mpv::quit_and_wait(&player::player_socket(), PLAYER_CLOSE_GRACE) {
+        eprintln!("cattube: the previous player did not close in time");
+    }
     let _ = std::fs::remove_file(player::player_socket());
     std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -2092,6 +2197,29 @@ pub fn spawn_watcher(
 #[cfg(test)]
 mod player_tests {
     use super::*;
+
+    #[test]
+    fn downloads_must_match_their_published_checksum() {
+        let root = std::env::temp_dir().join(format!("cattube-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let tool = root.join("tool");
+        let sums = root.join("sums");
+        let out = root.join("out");
+        std::fs::write(&tool, b"abc").unwrap();
+        let url = format!("file://{}", tool.display());
+        let sums_url = format!("file://{}", sums.display());
+        std::fs::write(
+            &sums,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  tool\n",
+        )
+        .unwrap();
+        assert!(download_verified(&url, &sums_url, "tool", &out).is_ok());
+        std::fs::write(&tool, b"tampered").unwrap();
+        assert!(download_verified(&url, &sums_url, "tool", &out).is_err());
+        assert!(download_verified(&url, &sums_url, "absent", &out).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn card_thumbnail_matches_osd_slot_dimensions() {

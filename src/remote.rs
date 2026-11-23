@@ -11,7 +11,7 @@
 use crate::{prefs, theme, yt};
 use cattube_core::account;
 use cattube_core::lounge::{self, Bind, Command, Lost, Msg, Out, Playing, Queue, Screen, Token};
-use cattube_core::mpv::{self, Arg, IpcConn};
+use cattube_core::mpv::{Arg, IpcConn};
 use cattube_core::player::{self, PlayOptions};
 use cattube_core::youtube as ytc;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -449,6 +449,10 @@ impl Remote {
 
     fn conn(&mut self) -> Option<&mut IpcConn> {
         let p = self.player.as_mut()?;
+        // Once ours has closed, the socket may belong to the app's player.
+        if p.child.exited() {
+            return None;
+        }
         if p.conn.as_ref().is_none_or(|c| c.closed()) {
             p.conn = IpcConn::connect(&player::player_socket()).ok();
         }
@@ -563,8 +567,6 @@ impl Remote {
             return self.stop();
         };
         self.close_player();
-        // A player the app started is told to close too (one screen).
-        let _ = mpv::ipc_request(&player::player_socket(), &[Arg::Str("quit")]);
         let p = prefs::load(&self.config);
         let low_power = cattube_core::env::low_power();
         let (r, g, b) = theme::accent_rgb_of(&p.accent);
@@ -596,7 +598,10 @@ impl Remote {
             }
         } else if let Err(e) = yt::ensure_tools(&self.data) {
             log(&format!("player not ready: {e}"));
-            return;
+            // Without a JavaScript runtime yt-dlp still plays, in lower quality.
+            if !player::yt_dlp_path(&self.data).is_file() {
+                return;
+            }
         }
         if !casting_enabled() {
             return;

@@ -25,6 +25,19 @@ pub fn unique_tmp_path(path: &std::path::Path, suffix: &str) -> std::path::PathB
 /// Write a file only its owner can read (it holds a sign-in or a pairing),
 /// in one step: a reader never sees half a file.
 pub fn write_private(path: &std::path::Path, text: &str) -> io::Result<()> {
+    replace_file(path, text, 0o600)
+}
+
+/// Replace a settings file in one step, surviving a power cut. A symlinked
+/// file (a managed dotfile) stays a symlink: its target is what is replaced.
+pub fn write_atomic(path: &std::path::Path, text: &str) -> io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    replace_file(&target, text, 0o666)
+}
+
+/// TV boxes are often switched off at the wall: the data reaches the disk
+/// before the rename, and the rename before this returns.
+fn replace_file(path: &std::path::Path, text: &str, mode: u32) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = unique_tmp_path(path, "tmp");
@@ -32,16 +45,24 @@ pub fn write_private(path: &std::path::Path, text: &str) -> io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .mode(mode)
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
-        Ok(())
+        f.sync_all()
     })()
     .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
+        return res;
     }
-    res
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 /// Make an existing file private (files written before
@@ -106,6 +127,34 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_keeps_symlinks() {
+        let dir = std::env::temp_dir().join(format!("cattube-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.conf");
+        let link = dir.join("settings.conf");
+        std::fs::write(&real, "old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        super::write_atomic(&link, "new").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        let fresh = dir.join("fresh.conf");
+        super::write_atomic(&fresh, "first").unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "first");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            3,
+            "no temporary left"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

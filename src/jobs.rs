@@ -7,6 +7,7 @@
 //! never freezes on a slow server.
 
 use eframe::egui;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -68,12 +69,48 @@ impl<M: Send + 'static> Jobs<M> {
     where
         F: FnOnce() -> M + Send + 'static,
     {
+        self.queue(f, None::<fn() -> M>)
+    }
+
+    /// Like [`Jobs::spawn`], for a job a screen is waiting on: if it panics,
+    /// `on_panic`'s message is delivered instead, so no spinner stays forever.
+    pub fn spawn_or<F, R>(&self, f: F, on_panic: R)
+    where
+        F: FnOnce() -> M + Send + 'static,
+        R: FnOnce() -> M + Send + 'static,
+    {
+        self.queue(f, Some(on_panic));
+    }
+
+    /// [`Jobs::spawn_or`] for callers that track "in flight" state.
+    pub fn try_spawn_or<F, R>(&self, f: F, on_panic: R) -> bool
+    where
+        F: FnOnce() -> M + Send + 'static,
+        R: FnOnce() -> M + Send + 'static,
+    {
+        self.queue(f, Some(on_panic))
+    }
+
+    fn queue<F, R>(&self, f: F, on_panic: Option<R>) -> bool
+    where
+        F: FnOnce() -> M + Send + 'static,
+        R: FnOnce() -> M + Send + 'static,
+    {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let job: Task = Box::new(move || {
-            let msg = f();
-            let _ = tx.send(msg);
-            ctx.request_repaint();
+            // A failed job must not take its worker thread with it.
+            let msg = match catch_unwind(AssertUnwindSafe(f)) {
+                Ok(msg) => Some(msg),
+                Err(_) => {
+                    eprintln!("cattube: a background job failed");
+                    on_panic.map(|r| r())
+                }
+            };
+            if let Some(msg) = msg {
+                let _ = tx.send(msg);
+                ctx.request_repaint();
+            }
         });
         match self.work_tx.send(job) {
             Ok(()) => true,
@@ -130,5 +167,21 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, (0..10).collect::<Vec<_>>());
         assert!(peak.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn a_panicking_job_keeps_the_worker_and_reports_its_failure() {
+        let ctx = egui::Context::default();
+        let jobs: Jobs<usize> = Jobs::new(&ctx, 1);
+        jobs.spawn(|| panic!("expected in this test"));
+        jobs.spawn_or(|| panic!("expected in this test"), || 1);
+        assert!(jobs.try_spawn(|| 2));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = Vec::new();
+        while got.len() < 2 && Instant::now() < deadline {
+            got.extend(jobs.drain());
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(got, [1, 2]);
     }
 }

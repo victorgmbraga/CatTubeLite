@@ -65,6 +65,8 @@ enum Msg {
 }
 
 const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(200);
+/// Shown when a background job crashed instead of answering.
+const JOB_FAILED: &str = "Something went wrong, try again";
 
 enum PendingSuggest {
     Ready(String),
@@ -187,7 +189,10 @@ impl App {
         let pos_data = data.clone();
         app.jobs
             .spawn(move || Msg::Positions(player::load_positions(&pos_data)));
-        app.jobs.spawn(move || Msg::Tools(yt::ensure_tools(&data)));
+        app.jobs.spawn_or(
+            move || Msg::Tools(yt::ensure_tools(&data)),
+            || Msg::Tools(Err(JOB_FAILED.into())),
+        );
         let (cache_max_bytes, cache_max_files) = if low_power {
             (64 * 1024 * 1024, 1500)
         } else {
@@ -275,44 +280,53 @@ impl App {
             // History is what was watched here (read off the UI thread).
             Effect::Load(id) if id == ytc::feeds::HISTORY => {
                 let data = self.data.clone();
-                self.jobs.spawn(move || {
-                    let (positions, checkpoints) = player::load_positions_and_checkpoints(&data);
-                    let mut list = std::fs::read_to_string(data.join("watched.conf"))
-                        .map(|t| cattube_core::watched::parse(&t))
-                        .unwrap_or_default();
-                    for tile in &mut list {
-                        if let Some(point) = checkpoints.get(&tile.id) {
-                            tile.progress = if point.finished {
-                                Some(1.0)
-                            } else {
-                                point
-                                    .duration
-                                    .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
-                            };
-                            tile.meta = if point.finished {
-                                "Watched".into()
-                            } else {
-                                format!("Resume at {}", player::position_clock(point.position))
-                            };
-                            if tile.badge.is_empty()
-                                && let Some(d) = point.duration
-                            {
-                                tile.badge = player::position_clock(d);
+                let failed = move || Msg::Page(generation, id, Err(JOB_FAILED.into()));
+                self.jobs.spawn_or(
+                    move || {
+                        let (positions, checkpoints) =
+                            player::load_positions_and_checkpoints(&data);
+                        let mut list = std::fs::read_to_string(data.join("watched.conf"))
+                            .map(|t| cattube_core::watched::parse(&t))
+                            .unwrap_or_default();
+                        for tile in &mut list {
+                            if let Some(point) = checkpoints.get(&tile.id) {
+                                tile.progress = if point.finished {
+                                    Some(1.0)
+                                } else {
+                                    point
+                                        .duration
+                                        .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
+                                };
+                                tile.meta = if point.finished {
+                                    "Watched".into()
+                                } else {
+                                    format!("Resume at {}", player::position_clock(point.position))
+                                };
+                                if tile.badge.is_empty()
+                                    && let Some(d) = point.duration
+                                {
+                                    tile.badge = player::position_clock(d);
+                                }
                             }
                         }
-                    }
-                    Msg::History(cattube_core::watched::page(&list), positions)
-                });
+                        Msg::History(cattube_core::watched::page(&list), positions)
+                    },
+                    failed,
+                );
             }
             Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
                 let key = (id.clone(), String::new());
                 if !self.page_requests.insert(key.clone()) {
                     return;
                 }
-                if !self.jobs.try_spawn(move || {
-                    let r = yt::subscriptions(&yctx, refresh.as_deref());
-                    Msg::Page(generation, id, r)
-                }) {
+                let failed_id = id.clone();
+                if !self.jobs.try_spawn_or(
+                    move || {
+                        let r = yt::subscriptions(&yctx, refresh.as_deref());
+                        Msg::Page(generation, id, r)
+                    },
+                    move || Msg::Page(generation, failed_id, Err(JOB_FAILED.into())),
+                ) {
                     self.page_requests.remove(&key);
                 }
             }
@@ -324,15 +338,19 @@ impl App {
                 if id == ytc::feeds::HOME {
                     self.home_prefetches = 0;
                 }
-                if !self.jobs.try_spawn(move || {
-                    let mut r = yt::page(&yctx, &id, refresh.as_deref());
-                    if id == ytc::feeds::HOME
-                        && let Ok(p) = r.as_mut()
-                    {
-                        ytc::tidy_home(p);
-                    }
-                    Msg::Page(generation, id, r)
-                }) {
+                let failed_id = id.clone();
+                if !self.jobs.try_spawn_or(
+                    move || {
+                        let mut r = yt::page(&yctx, &id, refresh.as_deref());
+                        if id == ytc::feeds::HOME
+                            && let Ok(p) = r.as_mut()
+                        {
+                            ytc::tidy_home(p);
+                        }
+                        Msg::Page(generation, id, r)
+                    },
+                    move || Msg::Page(generation, failed_id, Err(JOB_FAILED.into())),
+                ) {
                     self.page_requests.remove(&key);
                 }
             }
@@ -341,15 +359,19 @@ impl App {
                 if !self.page_requests.insert(key.clone()) {
                     return;
                 }
-                if !self.jobs.try_spawn(move || {
-                    let mut r = yt::more(&yctx, &token, refresh.as_deref());
-                    if browse_id == ytc::feeds::HOME
-                        && let Ok(p) = r.as_mut()
-                    {
-                        ytc::tidy_home(p);
-                    }
-                    Msg::More(generation, browse_id, token, r)
-                }) {
+                let (failed_id, failed_token) = key.clone();
+                if !self.jobs.try_spawn_or(
+                    move || {
+                        let mut r = yt::more(&yctx, &token, refresh.as_deref());
+                        if browse_id == ytc::feeds::HOME
+                            && let Ok(p) = r.as_mut()
+                        {
+                            ytc::tidy_home(p);
+                        }
+                        Msg::More(generation, browse_id, token, r)
+                    },
+                    move || Msg::More(generation, failed_id, failed_token, Err(JOB_FAILED.into())),
+                ) {
                     self.page_requests.remove(&key);
                 }
             }
@@ -373,16 +395,23 @@ impl App {
                 self.search_generation += 1;
                 self.search_query = q.clone();
                 let generation = self.search_generation;
-                self.jobs.spawn(move || {
-                    let result = yt::search(&yctx, &q, refresh.as_deref());
-                    Msg::Search(generation, q, result)
-                })
+                let failed_q = q.clone();
+                self.jobs.spawn_or(
+                    move || {
+                        let result = yt::search(&yctx, &q, refresh.as_deref());
+                        Msg::Search(generation, q, result)
+                    },
+                    move || Msg::Search(generation, failed_q, Err(JOB_FAILED.into())),
+                )
             }
             Effect::SearchMore(t) => {
                 let generation = self.search_generation;
-                self.jobs.spawn(move || {
-                    Msg::SearchMore(generation, yt::search_more(&yctx, &t, refresh.as_deref()))
-                })
+                self.jobs.spawn_or(
+                    move || {
+                        Msg::SearchMore(generation, yt::search_more(&yctx, &t, refresh.as_deref()))
+                    },
+                    move || Msg::SearchMore(generation, Err(JOB_FAILED.into())),
+                )
             }
             Effect::Suggest(q) => {
                 self.suggest_generation += 1;
@@ -393,10 +422,14 @@ impl App {
                 let id2 = id.clone();
                 self.jobs
                     .spawn(move || Msg::Votes(id2.clone(), yt::votes(&id2)));
-                self.jobs.spawn(move || {
-                    let r = yt::details(&yctx, &id, refresh.as_deref());
-                    Msg::Details(id, r)
-                })
+                let failed_id = id.clone();
+                self.jobs.spawn_or(
+                    move || {
+                        let r = yt::details(&yctx, &id, refresh.as_deref());
+                        Msg::Details(id, r)
+                    },
+                    move || Msg::Details(failed_id, Err(JOB_FAILED.into())),
+                )
             }
             Effect::Play { tile, from_start } => {
                 // The rest of the row it came from plays after it.
@@ -433,11 +466,14 @@ impl App {
             Effect::TvCode => {
                 self.tv_code_at = Some(Instant::now());
                 let config = cattube_core::env::config_dir();
-                self.jobs.spawn(move || {
-                    // The service the phone talks to (CatosTV runs it already).
-                    remote::ensure_running();
-                    Msg::TvCode(remote::tv_code(&config))
-                });
+                self.jobs.spawn_or(
+                    move || {
+                        // The service the phone talks to (CatosTV runs it already).
+                        remote::ensure_running();
+                        Msg::TvCode(remote::tv_code(&config))
+                    },
+                    || Msg::TvCode(Err(JOB_FAILED.into())),
+                );
             }
             Effect::SignInStop => {
                 self.sign_in_wait.fetch_add(1, Ordering::SeqCst);
@@ -639,7 +675,10 @@ impl App {
             SettingRow::UpdateYtDlp => {
                 self.tools = Scan::Busy;
                 let data = self.data.clone();
-                self.jobs.spawn(move || Msg::Tools(yt::update_tools(&data)));
+                self.jobs.spawn_or(
+                    move || Msg::Tools(yt::update_tools(&data)),
+                    || Msg::Tools(Err(JOB_FAILED.into())),
+                );
                 return;
             }
             SettingRow::Account(_) | SettingRow::AddAccount => return,
@@ -998,23 +1037,27 @@ impl App {
         let cache = self.cache.clone();
         let low_power = self.low_power;
         let requested = batch.clone();
-        if !self.jobs.try_spawn(move || {
-            let fetched = yt::fetch_images_batch(&cache, &requested, low_power);
-            let decoded = fetched
-                .into_iter()
-                .map(|(url, path)| {
-                    let image = path.and_then(|p| {
-                        let d = images::decode(&p, max_side);
-                        if d.is_none() {
-                            let _ = std::fs::remove_file(&p);
-                        }
-                        d
-                    });
-                    (url, image)
-                })
-                .collect();
-            Msg::Images(decoded)
-        }) {
+        let failed = batch.clone();
+        if !self.jobs.try_spawn_or(
+            move || {
+                let fetched = yt::fetch_images_batch(&cache, &requested, low_power);
+                let decoded = fetched
+                    .into_iter()
+                    .map(|(url, path)| {
+                        let image = path.and_then(|p| {
+                            let d = images::decode(&p, max_side);
+                            if d.is_none() {
+                                let _ = std::fs::remove_file(&p);
+                            }
+                            d
+                        });
+                        (url, image)
+                    })
+                    .collect();
+                Msg::Images(decoded)
+            },
+            move || Msg::Images(failed.into_iter().map(|url| (url, None)).collect()),
+        ) {
             for url in batch {
                 self.fetching.remove(&url);
             }

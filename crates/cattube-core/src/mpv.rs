@@ -372,6 +372,26 @@ pub fn ipc_request(socket: &Path, args: &[Arg]) -> Result<Json> {
     Err(Error::msg("player did not answer"))
 }
 
+/// Ask the player on `socket` (if any) to quit and wait until it has stopped
+/// listening. True when no player is left. The socket file itself stays
+/// behind after mpv exits, so a refused connection is what says it is gone.
+pub fn quit_and_wait(socket: &Path, grace: Duration) -> bool {
+    let Ok(mut conn) = IpcConn::connect(socket) else {
+        return true;
+    };
+    let _ = conn.command_with_timeout(&[Arg::Str("quit")], Duration::from_millis(200));
+    let deadline = Instant::now() + grace;
+    loop {
+        if UnixStream::connect(socket).is_err() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A long-lived IPC connection: commands get their replies, and the
 /// `script-message`s scripts send (mpv delivers them to IPC clients as
 /// `client-message` events) are kept for [`IpcConn::messages`]. CatTube's
@@ -798,6 +818,36 @@ mod tests {
                 Json::Str("time-pos".into())
             ])
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn quit_and_wait_sees_a_player_stop_listening() {
+        let path =
+            std::env::temp_dir().join(format!("cattube-mpv-quit-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(quit_and_wait(&path, Duration::from_millis(10)), "no player");
+
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(s.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req = parse_json(line.trim()).unwrap();
+            let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+            writeln!(s, "{{\"error\":\"success\",\"request_id\":{id}}}").unwrap();
+            line
+        });
+        // Like mpv, the socket file stays after the listener is gone.
+        assert!(quit_and_wait(&path, Duration::from_secs(2)));
+        assert!(server.join().unwrap().contains("quit"));
+        assert!(path.exists());
+
+        let _ = std::fs::remove_file(&path);
+        let stuck = UnixListener::bind(&path).unwrap();
+        assert!(!quit_and_wait(&path, Duration::from_millis(30)));
+        drop(stuck);
         let _ = std::fs::remove_file(&path);
     }
 

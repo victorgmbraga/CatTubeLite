@@ -16,14 +16,37 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+/// The checksums yt-dlp publishes with each release.
+pub const YT_DLP_SUMS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
+/// yt-dlp's name in [`YT_DLP_SUMS_URL`].
+pub const YT_DLP_ASSET: &str = "yt-dlp";
 #[cfg(target_arch = "aarch64")]
-pub const DENO_URL: &str =
-    "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip";
+macro_rules! deno_asset {
+    () => {
+        "deno-aarch64-unknown-linux-gnu.zip"
+    };
+}
 #[cfg(not(target_arch = "aarch64"))]
-pub const DENO_URL: &str =
-    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
+macro_rules! deno_asset {
+    () => {
+        "deno-x86_64-unknown-linux-gnu.zip"
+    };
+}
+pub const DENO_ASSET: &str = deno_asset!();
+pub const DENO_URL: &str = concat!(
+    "https://github.com/denoland/deno/releases/latest/download/",
+    deno_asset!()
+);
+pub const DENO_SUM_URL: &str = concat!(
+    "https://github.com/denoland/deno/releases/latest/download/",
+    deno_asset!(),
+    ".sha256sum"
+);
 /// How often CatTube asks yt-dlp to update itself.
 pub const UPDATE_EVERY: Duration = Duration::from_secs(24 * 3600);
+/// How often CatTube's own Deno is checked for a new release.
+pub const DENO_UPDATE_EVERY: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// `~/.local/share/cattube`: yt-dlp, Deno, positions.
 pub fn data_home() -> PathBuf {
@@ -61,6 +84,36 @@ pub fn download_cmd(url: &str, out: &Path) -> Cmd {
         .timeout(Duration::from_secs(320))
 }
 
+/// `curl` printing a small text file (a release's checksums).
+pub fn fetch_text_cmd(url: &str) -> Cmd {
+    Cmd::new("curl")
+        .args(["-sSL", "--fail", "-m", "30", "--", url])
+        .timeout(Duration::from_secs(35))
+}
+
+/// A file's SHA-256 with the system's Python (yt-dlp needs Python anyway).
+pub fn sha256_cmd(path: &Path) -> Cmd {
+    Cmd::new("python3")
+        .args([
+            "-I".to_string(),
+            "-c".to_string(),
+            "import hashlib,sys\nh=hashlib.sha256()\nwith open(sys.argv[1],'rb') as f:\n  for b in iter(lambda:f.read(65536),b''):\n    h.update(b)\nprint(h.hexdigest())"
+                .to_string(),
+            path.display().to_string(),
+        ])
+        .timeout(Duration::from_secs(120))
+}
+
+/// `name`'s SHA-256 in a checksum list (`<hash>  <name>` lines), lowercase.
+pub fn expected_sha256(sums: &str, name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (hash, file) = line.trim().split_once(char::is_whitespace)?;
+        let file = file.trim_start().trim_start_matches('*');
+        (file == name && hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| hash.to_ascii_lowercase())
+    })
+}
+
 /// Unpack Deno's zip with the system's Python (yt-dlp needs Python anyway).
 pub fn unzip_cmd(zip: &Path, dir: &Path) -> Cmd {
     Cmd::new("python3")
@@ -86,8 +139,10 @@ pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option
     if let Some(p) = find("deno") {
         return Some(format!("deno:{}", p.display()));
     }
+    // Only marked executable once fully unpacked: a file left by an
+    // interrupted install is not a runtime, and gets replaced.
     let own = own_deno_path(data);
-    if own.is_file() {
+    if crate::process::find_executable(&own.display().to_string()).is_some() {
         return Some(format!("deno:{}", own.display()));
     }
     find("node").map(|p| format!("node:{}", p.display()))
@@ -681,6 +736,49 @@ mod tests {
         assert_eq!(
             js_runtime(Path::new("/nope"), &deno).as_deref(),
             Some("deno:/usr/bin/deno")
+        );
+    }
+
+    #[test]
+    fn an_unfinished_own_deno_is_not_a_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("cattube-deno-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let deno = own_deno_path(&root);
+        std::fs::write(&deno, b"truncated").unwrap();
+        std::fs::set_permissions(&deno, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let none = |_: &str| None;
+        assert_eq!(js_runtime(&root, &none), None);
+        std::fs::set_permissions(&deno, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            js_runtime(&root, &none),
+            Some(format!("deno:{}", deno.display()))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checksum_lists() {
+        let a = "a".repeat(64);
+        let b = "B".repeat(64);
+        let sums = format!("{a}  yt-dlp.tar.gz\n{b}  yt-dlp\nshort  other\n{a} *star.zip\n");
+        assert_eq!(expected_sha256(&sums, "yt-dlp"), Some("b".repeat(64)));
+        assert_eq!(expected_sha256(&sums, "star.zip"), Some(a));
+        assert_eq!(expected_sha256(&sums, "other"), None);
+        assert_eq!(expected_sha256(&sums, "missing"), None);
+    }
+
+    #[test]
+    fn sha256_command_hashes_a_file() {
+        use crate::process::Runner;
+        let p = std::env::temp_dir().join(format!("cattube-sha-{}", std::process::id()));
+        std::fs::write(&p, b"abc").unwrap();
+        let out = crate::process::SystemRunner.run(&sha256_cmd(&p)).unwrap();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(
+            out.stdout.trim(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 
