@@ -17,6 +17,8 @@ use cattube_core::youtube as ytc;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -300,6 +302,63 @@ enum Event {
     Closed(u64, u16),
     /// The player of play number `seq` closed.
     Ended(u64, yt::Ended),
+    /// The tools a play was waiting for are there (or could not be fetched).
+    ToolsReady(u64, String, f64, Result<String, String>),
+}
+
+/// Most reports waiting to go out. Past it the network is down: new ones are
+/// left out (the state is reported again within seconds) rather than piling up.
+const MAX_PENDING_REPORTS: usize = 16;
+
+struct Report {
+    round: u64,
+    url: String,
+    body: String,
+}
+
+/// Sends reports in order on their own thread, so a slow network never holds
+/// up a pause or a seek from the phone.
+struct Reporter {
+    tx: Sender<Report>,
+    pending: Arc<AtomicUsize>,
+    round: Arc<AtomicU64>,
+}
+
+impl Reporter {
+    fn new(mut post: impl FnMut(&str, &str) -> u16 + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel::<Report>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let round = Arc::new(AtomicU64::new(0));
+        let (left, current) = (Arc::clone(&pending), Arc::clone(&round));
+        std::thread::spawn(move || {
+            for r in rx {
+                // A report for a session that has ended has nowhere to go.
+                if r.round == current.load(Ordering::Relaxed) {
+                    let status = post(&r.url, &r.body);
+                    if status != 200 {
+                        log(&format!("report not taken ({status})"));
+                    }
+                }
+                left.fetch_sub(1, Ordering::Relaxed);
+            }
+        });
+        Self { tx, pending, round }
+    }
+
+    fn has_room(&self) -> bool {
+        self.pending.load(Ordering::Relaxed) < MAX_PENDING_REPORTS
+    }
+
+    fn set_round(&self, round: u64) {
+        self.round.store(round, Ordering::Relaxed);
+    }
+
+    fn send(&self, round: u64, url: String, body: String) {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        if self.tx.send(Report { round, url, body }).is_err() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn listen(url: String, round: u64, tx: Sender<Event>) -> Option<Child> {
@@ -355,18 +414,22 @@ struct Remote {
     last_poll: Option<Instant>,
     volume: (u32, bool),
     listener: Option<Child>,
+    reporter: Reporter,
+    /// Bumped when a play is replaced or stopped while tools are fetched.
+    tools_wait: u64,
 }
 
 impl Remote {
     fn send(&mut self, out: &[Out]) {
+        // Checked first: a skipped report must not use up a request number.
+        if !self.reporter.has_room() {
+            return;
+        }
         let zx = random(6);
         let Some((url, body)) = self.bind.send(&self.screen, &zx, out) else {
             return;
         };
-        let (status, _) = request(&url, Some(&body));
-        if status != 200 {
-            log(&format!("report not taken ({status})"));
-        }
+        self.reporter.send(self.round, url, body);
     }
 
     /// Open a session (a new token first when needed). Err: wait and retry.
@@ -404,6 +467,7 @@ impl Remote {
             return Err("session not opened (no session id)".into());
         }
         self.round += 1;
+        self.reporter.set_round(self.round);
         log(&format!("online as {}", lounge::quote(&self.screen.name)));
         self.handle(&msgs);
         self.relisten();
@@ -433,6 +497,7 @@ impl Remote {
     fn disable_casting(&mut self) {
         self.stop_listening();
         self.round += 1;
+        self.reporter.set_round(self.round);
         self.bind = Bind::new("", 0);
         self.token = None;
         self.queue = Queue::default();
@@ -541,6 +606,7 @@ impl Remote {
     }
 
     fn close_player(&mut self) {
+        self.tools_wait += 1;
         if let Some(mut p) = self.player.take()
             && !p.child.exited()
         {
@@ -569,6 +635,44 @@ impl Remote {
             return self.stop();
         };
         self.close_player();
+        let find = |n: &str| cattube_core::process::find_executable(n);
+        if player::yt_dlp_path(&self.data).is_file()
+            && player::js_runtime(&self.data, &find).is_some()
+        {
+            if yt::tools_stale(&self.data) {
+                let data = self.data.clone();
+                std::thread::spawn(move || {
+                    let _ = yt::ensure_tools(&data);
+                });
+            }
+            return self.start_video(id, start);
+        }
+        // First use: fetching the tools takes minutes, the phone stays heard.
+        let (token, data, tx) = (self.tools_wait, self.data.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let result = yt::ensure_tools(&data);
+            let _ = tx.send(Event::ToolsReady(token, id, start, result));
+        });
+    }
+
+    fn tools_ready(&mut self, token: u64, id: String, start: f64, result: Result<String, String>) {
+        if token != self.tools_wait || self.queue.current() != Some(id.as_str()) {
+            return; // something else was picked meanwhile
+        }
+        if let Err(e) = result {
+            log(&format!("player not ready: {e}"));
+            // Without a JavaScript runtime yt-dlp still plays, in lower quality.
+            if !player::yt_dlp_path(&self.data).is_file() {
+                return;
+            }
+        }
+        self.start_video(id, start);
+    }
+
+    fn start_video(&mut self, id: String, start: f64) {
+        if !casting_enabled() {
+            return;
+        }
         let p = prefs::load(&self.config);
         let low_power = cattube_core::env::low_power();
         let (r, g, b) = theme::accent_rgb_of(&p.accent);
@@ -587,27 +691,8 @@ impl Remote {
             buffer_mib: p.buffer,
             // Played from the phone: nothing of CatTube's to go back to.
             hide_on_back: false,
+            stats: p.player_stats,
         };
-        let find = |n: &str| cattube_core::process::find_executable(n);
-        if player::yt_dlp_path(&self.data).is_file()
-            && player::js_runtime(&self.data, &find).is_some()
-        {
-            if yt::tools_stale(&self.data) {
-                let data = self.data.clone();
-                std::thread::spawn(move || {
-                    let _ = yt::ensure_tools(&data);
-                });
-            }
-        } else if let Err(e) = yt::ensure_tools(&self.data) {
-            log(&format!("player not ready: {e}"));
-            // Without a JavaScript runtime yt-dlp still plays, in lower quality.
-            if !player::yt_dlp_path(&self.data).is_file() {
-                return;
-            }
-        }
-        if !casting_enabled() {
-            return;
-        }
         let child = match yt::start_player(&o, &self.data) {
             Ok(c) => c,
             Err(e) => return log(&e),
@@ -840,6 +925,8 @@ pub fn run() -> i32 {
         last_poll: None,
         volume: (100, false),
         listener: None,
+        reporter: Reporter::new(|url, body| request(url, Some(body)).0),
+        tools_wait: 0,
     };
     let mut retry_at: Option<Instant> = Some(Instant::now());
     let mut wait = Duration::from_secs(5);
@@ -887,6 +974,9 @@ pub fn run() -> i32 {
                 }
             }
             Ok(Event::Ended(seq, ended)) => r.ended(seq, ended),
+            Ok(Event::ToolsReady(token, id, start, result)) => {
+                r.tools_ready(token, id, start, result)
+            }
             Ok(_) => {}
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return 1,
@@ -910,6 +1000,44 @@ mod tests {
         assert!(casting_allowed(
             "cast_enabled = false\ncast_enabled = true\n"
         ));
+    }
+
+    #[test]
+    fn reports_go_out_in_order_without_blocking_and_skip_ended_sessions() {
+        let (seen_tx, seen) = mpsc::channel();
+        let (gate_tx, gate) = mpsc::channel::<()>();
+        let reporter = Reporter::new(move |url, _| {
+            let _ = gate.recv();
+            let _ = seen_tx.send(url.to_string());
+            200
+        });
+        reporter.set_round(1);
+        let at = Instant::now();
+        for n in 0..MAX_PENDING_REPORTS {
+            assert!(reporter.has_room());
+            reporter.send(1, n.to_string(), String::new());
+        }
+        assert!(at.elapsed() < Duration::from_millis(100), "never waits");
+        assert!(!reporter.has_room(), "a stuck network stops the queue");
+        for _ in 0..2 {
+            gate_tx.send(()).unwrap();
+        }
+        let wait = Duration::from_secs(2);
+        assert_eq!(seen.recv_timeout(wait).unwrap(), "0");
+        assert_eq!(seen.recv_timeout(wait).unwrap(), "1");
+        reporter.set_round(2);
+        reporter.send(2, "new".into(), String::new());
+        for _ in 0..3 {
+            let _ = gate_tx.send(());
+        }
+        // The one in flight when the session changed may still finish.
+        let next = seen.recv_timeout(wait).unwrap();
+        let last = if next == "new" {
+            next
+        } else {
+            seen.recv_timeout(wait).unwrap()
+        };
+        assert_eq!(last, "new");
     }
 
     #[test]

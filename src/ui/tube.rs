@@ -1651,6 +1651,13 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 RowKind::Action,
                 "phone",
             ),
+            SettingRow::PlayerStats => (
+                tr("Player statistics").into(),
+                tr("Decoder, dropped frames and memory over the video").into(),
+                String::new(),
+                RowKind::Toggle(Some(p.player_stats)),
+                "check",
+            ),
             SettingRow::UpdateYtDlp => (
                 tr("Update the player").into(),
                 format!("{tools} · CatTube {}", cattube_core::env::version()),

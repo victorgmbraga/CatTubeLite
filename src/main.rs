@@ -7,6 +7,7 @@
 
 mod canvas;
 mod i18n;
+mod i18n_pt;
 mod icons;
 mod images;
 mod jobs;
@@ -448,20 +449,26 @@ impl App {
                         let _ = tx.send(m);
                         rctx.request_repaint();
                     };
-                    let code = match yt::sign_in_code(&device) {
-                        Ok(c) => c,
-                        Err(e) => return send(Msg::SignInCode(Err(e))),
-                    };
-                    let url = code
-                        .url
-                        .trim_start_matches("https://")
-                        .trim_start_matches("www.")
-                        .to_string();
-                    send(Msg::SignInCode(Ok((code.user_code.clone(), url))));
                     let keep = || wait.load(Ordering::SeqCst) == generation;
-                    let r = yt::sign_in_wait(&code, &keep);
-                    if keep() {
-                        send(Msg::SignedIn(r));
+                    let flow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let code = match yt::sign_in_code(&device) {
+                            Ok(c) => c,
+                            Err(e) => return send(Msg::SignInCode(Err(e))),
+                        };
+                        let url = code
+                            .url
+                            .trim_start_matches("https://")
+                            .trim_start_matches("www.")
+                            .to_string();
+                        send(Msg::SignInCode(Ok((code.user_code.clone(), url))));
+                        let r = yt::sign_in_wait(&code, &keep);
+                        if keep() {
+                            send(Msg::SignedIn(r));
+                        }
+                    }));
+                    // The sign-in screen must not keep waiting for a dead thread.
+                    if flow.is_err() && keep() {
+                        send(Msg::SignInCode(Err(JOB_FAILED.into())));
                     }
                 });
             }
@@ -674,6 +681,7 @@ impl App {
             }
             // Opens its own screen (the tube handles it).
             SettingRow::LinkPhone => {}
+            SettingRow::PlayerStats => self.prefs.player_stats = !self.prefs.player_stats,
             SettingRow::UpdateYtDlp => {
                 self.tools = Scan::Busy;
                 let data = self.data.clone();
@@ -729,6 +737,7 @@ impl App {
             accent: format!("{r:02x}{g:02x}{b:02x}"),
             buffer_mib: self.prefs.buffer,
             hide_on_back: on_catostv() && !self.quit_after_play,
+            stats: self.prefs.player_stats,
         };
         if !self.yt_dlp_ready && !player::yt_dlp_path(&self.data).is_file() {
             return self.toast(ctx, "Getting the player ready, try again in a moment");
@@ -1376,12 +1385,15 @@ fn feed(which: &str) -> i32 {
     0
 }
 
+#[cfg_attr(not(feature = "wgpu"), allow(unused_variables))]
 fn renderer_for(choice: Option<&str>, low_power: bool) -> (eframe::Renderer, bool) {
     match choice {
         Some("glow") => (eframe::Renderer::Glow, true),
+        #[cfg(feature = "wgpu")]
         Some("wgpu") => (eframe::Renderer::Wgpu, true),
-        _ if low_power => (eframe::Renderer::Glow, false),
-        _ => (eframe::Renderer::Wgpu, false),
+        #[cfg(feature = "wgpu")]
+        _ if !low_power => (eframe::Renderer::Wgpu, false),
+        _ => (eframe::Renderer::Glow, false),
     }
 }
 
@@ -1505,6 +1517,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, start.take().unwrap_or(Start::Home))))),
     );
+    #[cfg(not(feature = "wgpu"))]
+    let _ = explicit; // built with OpenGL only: nothing to fall back to
+    #[cfg(feature = "wgpu")]
     if let Err(e) = &result
         && !explicit
     {
@@ -1552,11 +1567,22 @@ mod tests {
     #[test]
     fn renderer_defaults_to_glow_on_low_power_and_honors_override() {
         assert_eq!(renderer_for(None, true), (eframe::Renderer::Glow, false));
-        assert_eq!(renderer_for(None, false), (eframe::Renderer::Wgpu, false));
-        assert_eq!(
-            renderer_for(Some("wgpu"), true),
-            (eframe::Renderer::Wgpu, true)
-        );
+        #[cfg(feature = "wgpu")]
+        {
+            assert_eq!(renderer_for(None, false), (eframe::Renderer::Wgpu, false));
+            assert_eq!(
+                renderer_for(Some("wgpu"), true),
+                (eframe::Renderer::Wgpu, true)
+            );
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            assert_eq!(renderer_for(None, false), (eframe::Renderer::Glow, false));
+            assert_eq!(
+                renderer_for(Some("wgpu"), false),
+                (eframe::Renderer::Glow, false)
+            );
+        }
         assert_eq!(
             renderer_for(Some("glow"), false),
             (eframe::Renderer::Glow, true)

@@ -22,7 +22,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne quatro frentes de mudanças volt
 - **Layout de texto e listas mais rápido:** adiciona cache limitado de medição de texto (`fit` / `two_lines` com busca binária), fast path ASCII que pula processamento Unicode BiDi/shaping, menos segmentos de curva com movimento reduzido, culling vertical em Configurações e remoção de `stat()` por frame e clones de `Page` a cada tecla.
 
 ### Reprodução otimizada para ARM64 e dispositivos fracos
-- **Perfil de baixo desempenho automático (`CATTUBE_LOW_POWER`):** ativado por padrão em `aarch64` (pode ser forçado com `CATTUBE_LOW_POWER=1` ou desativado com `0`). Novas configurações passam a usar **720p SDR**, **H.264** e buffer de **64 MiB** por padrão, preservando preferências já salvas.
+- **Perfil de baixo desempenho automático (`CATTUBE_LOW_POWER`):** ativado automaticamente com até 3 GiB de RAM, em GPUs Mali-400/450 ou VideoCore IV e em máquinas ARM com menos de 6 GiB (pode ser forçado com `CATTUBE_LOW_POWER=1` ou desativado com `0`). Novas configurações passam a usar **720p SDR**, **H.264** e buffer de **64 MiB** por padrão, preservando preferências já salvas.
 - **Deno nativo em ARM64 e prioridade para até 30 fps:** baixa o binário `aarch64-unknown-linux-gnu` do Deno em ARM64 e prioriza streams `<= 30 fps` antes de recorrer a taxas mais altas.
 - **`mpv` e OSD mais leves:** adiciona `--hwdec=auto-safe`, `--profile=fast`, `--scale=bilinear`, `--cscale=bilinear`, `--dscale=bilinear`, `--dither-depth=no` e `--deband=no` no modo `low_power`; substitui os desfoques gaussianos pesados em CPU do libass (`\blur140` / `\blur70`) por faixa sólida no OSD; reduz a geometria do spinner; remove o IPC `cattube-input` a cada seta pressionada; troca a escrita por frame de `time-pos` por timer periódico (`10 s` em `low_power`, `5 s` padrão); e mapeia a tecla Voltar do controle remoto (`GO_BACK`) no `mpv`.
 - **Atlas de vídeos relacionados em memória e em lotes:** monta o painel de vídeos relacionados diretamente em memória (limite de 12 vídeos em `low_power`, 24 padrão), baixa linhas em paralelo e atualiza o overlay em lotes de 4 thumbnails sem criar arquivos temporários individuais.
@@ -57,7 +57,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne quatro frentes de mudanças volt
 
 ## Idiomas
 
-Em **Settings → Playback → Interface language → العربية** é possível usar a interface em árabe. Títulos e buscas em árabe também funcionam corretamente com a interface em inglês, e o teclado virtual inclui layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
+Em **Settings → Playback → Interface language** é possível escolher **Português (Brasil)** ou **العربية** (árabe). Os controles sobre o vídeo continuam em inglês. Títulos e buscas em árabe também funcionam corretamente com a interface em inglês, e o teclado virtual inclui layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
 
 ## Compilação e instalação
 
@@ -84,6 +84,8 @@ tar -xzf dist/cattube-*-"$(uname -m)".tar.gz -C dist
 dist/cattube-*-"$(uname -m)"/install.sh
 ```
 
+Em `aarch64`, o pacote é compilado sem o renderizador `wgpu` (`--no-default-features`), o que deixa o binário cerca de 31% menor. Nesse caso, ele sempre desenha com OpenGL.
+
 O pacote não inclui `mpv`, `curl` nem Python 3, que precisam estar instalados no aparelho.
 
 Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](https://github.com/yt-dlp/yt-dlp) e do [Deno](https://deno.com) (usando o binário nativo ARM64 em `aarch64`) em `~/.local/share/cattube`, verifica os arquivos e os mantém atualizados automaticamente.
@@ -94,11 +96,11 @@ Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](http
 
 | Variável de ambiente | Valores | Efeito |
 |---|---|---|
-| `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (padrão `1` em `aarch64`, `0` nas demais arquiteturas) |
+| `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido) |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface (padrão `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido) |
 | `CATTUBE_CAST_ENABLED_FILE` | caminho | Arquivo opcional contendo `cast_enabled = true` ou `false` para ativar/desativar casting em tempo real |
 
-Para conferir decodificação por hardware e quadros descartados na TV box durante a reprodução, consulte as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `${XDG_RUNTIME_DIR:-/tmp}/cattube-mpv.sock`.
+Para ver decodificação por hardware, quadros descartados e memória sobre o vídeo, ative **Settings → About → Player statistics**. Também é possível consultar as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` sem essa variável).
 
 ## Controles
 
