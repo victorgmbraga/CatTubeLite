@@ -508,8 +508,14 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
         }
     } else if !t.badge.is_empty() || v.now_playing.is_some_and(|active| active.id == t.id) {
         let playing = v.now_playing.is_some_and(|active| active.id == t.id);
-        let badge = if playing { tr("Playing") } else { &t.badge };
-        let live = !playing && (t.kind == Kind::Live || t.badge == tr("LIVE"));
+        let live = !playing && (t.kind == Kind::Live || t.badge == "LIVE" || t.badge == tr("LIVE"));
+        let badge = if playing {
+            tr("Playing")
+        } else if live && t.badge == "LIVE" {
+            tr("LIVE")
+        } else {
+            &t.badge
+        };
         let tw = c.text_width(badge, 13.0, Weight::Semibold) + 14.0;
         let b = c.r(rx + rw - tw - 8.0, ry + rh - 30.0, tw, 22.0);
         c.fill(
@@ -1163,7 +1169,7 @@ fn draw_menu(
         widgets::button(
             c,
             r,
-            it.label(subscribed),
+            tr(it.label(subscribed)),
             if i == 0 {
                 widgets::ButtonStyle::Primary
             } else {
@@ -1243,7 +1249,7 @@ fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
                 640.0,
                 326.0,
                 Align2::CENTER_CENTER,
-                "and enter this code",
+                tr("and enter this code"),
                 18.0,
                 theme::text2(),
                 Weight::Regular,

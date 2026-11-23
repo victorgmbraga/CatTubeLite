@@ -195,8 +195,8 @@ impl Msg {
     }
 }
 
-fn parse_array(text: &str) -> Vec<Msg> {
-    let Some(Json::Arr(items)) = parse_json(text) else {
+fn parse_array_json(v: &Json) -> Vec<Msg> {
+    let Json::Arr(items) = v else {
         return Vec::new();
     };
     items
@@ -230,18 +230,19 @@ impl Chunks {
                 return Vec::new();
             }
         }
+        if self.buf.len() + line.len() + 1 > 1 << 20 {
+            self.buf.clear();
+            return Vec::new();
+        }
         self.buf.push_str(line);
         self.buf.push('\n');
         if !self.buf.trim_end().ends_with(']') {
             return Vec::new();
         }
-        if parse_json(&self.buf).is_some() {
-            let out = parse_array(&self.buf);
+        if let Some(parsed) = parse_json(&self.buf) {
+            let out = parse_array_json(&parsed);
             self.buf.clear();
             return out;
-        }
-        if self.buf.len() > 1 << 20 {
-            self.buf.clear();
         }
         Vec::new()
     }
@@ -784,6 +785,13 @@ mod tests {
         assert!(
             command(&parse_reply("[[1,[\"setPlaylist\",{\"videoId\":\"bad\"}]]]")[0]).is_none()
         );
+        // Oversized malformed input without `]` must stay bounded and recover.
+        let mut c = Chunks::default();
+        let big = "x".repeat(600_000);
+        assert!(c.push_line(&big).is_empty());
+        assert!(c.push_line(&big).is_empty());
+        assert!(c.buf.is_empty());
+        assert_eq!(c.push_line("[[1,[\"pause\"]]]").len(), 1);
     }
 
     #[test]

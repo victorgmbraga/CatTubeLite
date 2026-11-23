@@ -130,6 +130,7 @@ pub fn tr(text: &str) -> &str {
         "Waiting for you to enter it…" => "في انتظار إدخال الرمز…",
         "Back to cancel" => "رجوع للإلغاء",
         "On your phone or computer, go to" => "على هاتفك أو حاسوبك، افتح",
+        "and enter this code" => "وأدخل هذا الرمز",
         "Link your phone" => "ربط هاتفك",
         "Link with TV code" => "الربط برمز التلفزيون",
         "In the YouTube app on your phone, open Settings → Watch on TV" => {

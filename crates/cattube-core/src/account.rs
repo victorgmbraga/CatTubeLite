@@ -248,8 +248,9 @@ impl Accounts {
 
     /// Add (or replace the same account) and make it the one in use.
     pub fn add(&mut self, a: Account) {
+        let has_real_name = !a.name.is_empty() && a.name != "YouTube account";
         if let Some(i) = self.list.iter().position(|x| {
-            x.refresh_token == a.refresh_token || (!a.name.is_empty() && x.name == a.name)
+            x.refresh_token == a.refresh_token || (has_real_name && x.name == a.name)
         }) {
             self.list[i] = a;
             self.active = i;
@@ -257,6 +258,37 @@ impl Accounts {
             self.list.push(a);
             self.active = self.list.len() - 1;
         }
+    }
+
+    /// Update the resolved display name and avatar for `refresh_token`, merging
+    /// an earlier entry for the same account if one already exists.
+    pub fn set_profile(&mut self, refresh_token: &str, name: String, photo: String) -> bool {
+        let Some(idx) = self
+            .list
+            .iter()
+            .position(|a| a.refresh_token == refresh_token)
+        else {
+            return false;
+        };
+        self.list[idx].name = name.clone();
+        self.list[idx].photo = photo;
+        if !name.is_empty()
+            && name != "YouTube account"
+            && let Some(dup) = self
+                .list
+                .iter()
+                .enumerate()
+                .position(|(i, a)| i != idx && a.name == name)
+        {
+            self.list.remove(dup);
+            if self.active == dup {
+                self.active = if dup < idx { idx - 1 } else { idx };
+            } else if dup < self.active {
+                self.active -= 1;
+            }
+            self.active = self.active.min(self.list.len().saturating_sub(1));
+        }
+        true
     }
 
     pub fn remove(&mut self, i: usize) {
@@ -496,5 +528,28 @@ mod tests {
             device_uuid("0123456789abcdef0123456789abcdef"),
             "01234567-89ab-4def-a123-456789abcdef"
         );
+    }
+
+    #[test]
+    fn adding_unnamed_or_placeholder_accounts_does_not_overwrite_existing() {
+        let mut accounts = Accounts::default();
+        accounts.add(Account {
+            name: "YouTube account".into(),
+            refresh_token: "1//first".into(),
+            ..Account::default()
+        });
+        accounts.add(Account {
+            name: String::new(),
+            refresh_token: "1//second".into(),
+            ..Account::default()
+        });
+        assert_eq!(accounts.list.len(), 2);
+        assert_eq!(accounts.active, 1);
+        assert!(accounts.set_profile("1//first", "Kat".into(), String::new()));
+        assert!(accounts.set_profile("1//second", "Kat".into(), "https://p".into()));
+        // Same resolved real account merges cleanly, keeping the newest token.
+        assert_eq!(accounts.list.len(), 1);
+        assert_eq!(accounts.list[0].refresh_token, "1//second");
+        assert_eq!(accounts.active, 0);
     }
 }

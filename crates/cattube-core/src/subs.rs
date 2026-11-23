@@ -209,10 +209,15 @@ fn ago(secs: i64) -> String {
 
 fn views_text(v: u64) -> String {
     let short = |n: f64, unit: &str| {
-        if n < 10.0 && (n * 10.0).round() % 10.0 != 0.0 {
-            format!("{:.1}{unit}", n)
+        if n >= 10.0 {
+            format!("{}{unit}", n.floor() as u64)
         } else {
-            format!("{:.0}{unit}", n.floor())
+            let tenths = (n * 10.0).floor() as u64;
+            if tenths.is_multiple_of(10) {
+                format!("{}{unit}", tenths / 10)
+            } else {
+                format!("{}.{}{unit}", tenths / 10, tenths % 10)
+            }
         }
     };
     let n = match v {
@@ -326,7 +331,9 @@ mod tests {
     #[test]
     fn counts_and_ages_read_like_youtube() {
         assert_eq!(views_text(999), "999 views");
+        assert_eq!(views_text(1_960), "1.9K views");
         assert_eq!(views_text(5_700), "5.7K views");
+        assert_eq!(views_text(9_990), "9.9K views");
         assert_eq!(views_text(113_000), "113K views");
         assert_eq!(views_text(2_000_000), "2M views");
         assert_eq!(ago(90), "1 minute ago");

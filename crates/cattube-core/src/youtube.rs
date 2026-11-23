@@ -793,8 +793,18 @@ pub fn subscribe(ctx: &str, channel_id: &str, on: bool) -> Option<(String, Strin
 
 /// Search suggestions while typing.
 pub fn suggest_url(query: &str) -> String {
+    suggest_url_for(query, "en")
+}
+
+/// Search suggestions while typing, localised to `hl`.
+pub fn suggest_url_for(query: &str, hl: &str) -> String {
+    let hl = if hl.is_empty() || !hl.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        "en"
+    } else {
+        hl
+    };
     format!(
-        "https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&ds=yt&hl=en&q={}",
+        "https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&ds=yt&hl={hl}&q={}",
         crate::util::percent_encode(query)
     )
 }
@@ -1298,6 +1308,8 @@ mod tests {
         );
         assert_eq!(parse_suggestions(r#"["x",["a","b"]]"#), ["a", "b"]);
         assert!(parse_suggestions("<html>").is_empty());
+        assert!(suggest_url_for("cat", "ar").contains("hl=ar&q=cat"));
+        assert!(suggest_url_for("cat", "bad&hl").contains("hl=en&q=cat"));
     }
 
     #[test]

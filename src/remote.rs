@@ -54,8 +54,21 @@ fn casting_enabled() -> bool {
     })
 }
 
+fn fallback_hex(n: usize) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let mut state = now_ms()
+        ^ (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut out = String::with_capacity(n * 2);
+    for _ in 0..n {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.push_str(&format!("{:02x}", (state >> 56) as u8));
+    }
+    out
+}
+
 fn random(n: usize) -> String {
-    cattube_core::util::random_hex(n).unwrap_or_else(|_| format!("{:x}", now_ms()))
+    cattube_core::util::random_hex(n).unwrap_or_else(|_| fallback_hex(n))
 }
 
 // ------------------------------------------------------------ requests
@@ -314,7 +327,7 @@ fn listen(url: String, round: u64, tx: Sender<Event>) -> Option<Child> {
 struct Player {
     seq: u64,
     video: String,
-    child: Child,
+    child: yt::PlayerHandle,
     conn: Option<IpcConn>,
     started: Instant,
     /// The phone's volume was given to this player.
@@ -521,14 +534,14 @@ impl Remote {
     }
 
     fn close_player(&mut self) {
-        if let Some(mut p) = self.player.take() {
+        if let Some(mut p) = self.player.take()
+            && !p.child.exited()
+        {
             yt::checkpoint_player(&player::data_home());
             if let Some(c) = p.conn.as_mut() {
                 let _ = c.command(&[Arg::Str("quit")]);
             }
-            std::thread::sleep(Duration::from_millis(300));
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+            p.child.reap_or_kill(Duration::from_millis(300));
         }
     }
 
@@ -586,7 +599,7 @@ impl Remote {
         let accounts = account::load(&self.config);
         let s = yt::Session {
             low_power,
-            ctx: ytc::context("en", &p.region),
+            ctx: ytc::context(p.language.key(), &p.region),
             refresh: accounts.active().map(|a| a.refresh_token.clone()),
             cache: self.cache.clone(),
             // The phone's queue decides what comes next.
@@ -605,7 +618,7 @@ impl Remote {
             ..ytc::Tile::default()
         };
         let tx = self.tx.clone();
-        yt::spawn_watcher(tile, s, move |ended| {
+        yt::spawn_watcher(tile, child.clone(), s, move |ended| {
             let _ = tx.send(Event::Ended(seq, ended));
         });
         self.player = Some(Player {
@@ -652,9 +665,11 @@ impl Remote {
         if self.player.as_ref().is_none_or(|p| p.seq != seq) {
             return; // an older player that was replaced
         }
-        if let Some(mut p) = self.player.take() {
+        if let Some(p) = self.player.take()
+            && !p.child.exited()
+        {
             yt::checkpoint_player(&player::data_home());
-            let _ = p.child.wait();
+            p.child.reap_or_kill(Duration::from_millis(200));
         }
         if finished && self.queue.has_next() {
             self.queue.index += 1;
@@ -840,6 +855,7 @@ pub fn run() -> i32 {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Event::Msgs(round, msgs)) if round == r.round => r.handle(&msgs),
             Ok(Event::Closed(round, status)) if round == r.round => {
+                r.stop_listening();
                 match (status, lounge::lost(status)) {
                     // A listen YouTube ended on its own: listen again.
                     (200, _) => r.relisten(),
@@ -883,5 +899,13 @@ mod tests {
             curl_config("https://x/?a=\"b\"", Some("c\\d\ne")),
             "url = \"https://x/?a=\\\"b\\\"\"\ndata-binary = \"c\\\\de\"\n"
         );
+    }
+
+    #[test]
+    fn fallback_hex_produces_requested_byte_length() {
+        let h = fallback_hex(16);
+        assert_eq!(h.len(), 32);
+        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(fallback_hex(16), fallback_hex(16));
     }
 }

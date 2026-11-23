@@ -519,9 +519,11 @@ fn follow_chat(first: String, region: String, on: std::sync::Arc<std::sync::atom
                         .filter(|m| m.id.is_empty() || !seen.contains(&m.id))
                         .collect();
                     for m in &fresh {
-                        seen.push_back(m.id.clone());
-                        if seen.len() > 500 {
-                            seen.pop_front();
+                        if !m.id.is_empty() {
+                            seen.push_back(m.id.clone());
+                            if seen.len() > 500 {
+                                seen.pop_front();
+                            }
                         }
                     }
                     if !fresh.is_empty() && on.load(Ordering::SeqCst) {
@@ -682,8 +684,8 @@ pub fn search(ctx: &str, q: &str, refresh: Option<&str>) -> Result<Page, String>
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
-pub fn suggestions(q: &str) -> Vec<String> {
-    curl(&yt::suggest_url(q), None, None)
+pub fn suggestions(q: &str, hl: &str) -> Vec<String> {
+    curl(&yt::suggest_url_for(q, hl), None, None)
         .map(|b| yt::parse_suggestions(&b))
         .unwrap_or_default()
 }
@@ -916,8 +918,67 @@ pub fn checkpoint_player(data: &Path) {
     }
 }
 
+/// Shared handle to a running `mpv` child so both the UI/remote and the
+/// watcher can check exit status and reap it without hanging.
+#[derive(Clone)]
+pub struct PlayerHandle {
+    child: std::sync::Arc<Mutex<Option<std::process::Child>>>,
+}
+
+impl PlayerHandle {
+    pub fn new(child: std::process::Child) -> Self {
+        Self {
+            child: std::sync::Arc::new(Mutex::new(Some(child))),
+        }
+    }
+
+    /// True once the process has exited (reaping it immediately if so).
+    pub fn exited(&self) -> bool {
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(child) = slot.as_mut() else {
+            return true;
+        };
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *slot = None;
+                true
+            }
+            Ok(None) => false,
+            Err(_) => {
+                *slot = None;
+                true
+            }
+        }
+    }
+
+    /// Terminate the player if it is still running and reap it.
+    pub fn stop_and_reap(&self) {
+        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut child) = slot.take() else {
+            return;
+        };
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Wait briefly for an already-closing player, then kill and reap so the
+    /// caller can never deadlock on a wedged `mpv`.
+    pub fn reap_or_kill(&self, grace: Duration) {
+        let deadline = Instant::now() + grace;
+        while !self.exited() {
+            if Instant::now() >= deadline {
+                self.stop_and_reap();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 /// Start mpv for a video (its own process group, stdin closed).
-pub fn start_player(o: &PlayOptions, data: &Path) -> Result<std::process::Child, String> {
+pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String> {
     std::fs::create_dir_all(data.join("positions"))
         .map_err(|e| format!("Could not save playback positions ({e})"))?;
     let find = |n: &str| cattube_core::process::find_executable(n);
@@ -936,6 +997,7 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<std::process::Child,
         // In CatTube's own process group: a TV shell that closes CatTube
         // (signalling the group) closes the player with it.
         .spawn()
+        .map(PlayerHandle::new)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => "mpv is not installed".to_string(),
             _ => format!("Could not start the player ({e})"),
@@ -999,6 +1061,14 @@ fn card(conn: &mut mpv::IpcConn, args: &[&str]) {
     let _ = conn.command(&v);
 }
 
+fn thumbnail_size(osd_width: f64, width: f64) -> (u32, u32) {
+    let scale = (osd_width / 1920.0).clamp(0.5, 4.0);
+    (
+        (width * scale) as u32,
+        (width * 9.0 / 16.0 * scale) as u32,
+    )
+}
+
 /// Raw thumbnail pixels for a player overlay.
 fn bgra_thumbnail(
     cache: &Path,
@@ -1007,8 +1077,7 @@ fn bgra_thumbnail(
     width: f64,
     name: &str,
 ) -> Option<(String, u32, u32)> {
-    let scale = (osd_width / 1920.0).clamp(0.5, 4.0);
-    let (w, h) = ((width * scale) as u32, (width * 9.0 / 16.0 * scale) as u32);
+    let (w, h) = thumbnail_size(osd_width, width);
     let pic = fetch_image(cache, &yt::video_thumb(id))?;
     let img = image::load_from_memory(&std::fs::read(pic).ok()?).ok()?;
     let mut px = img
@@ -1227,6 +1296,9 @@ impl Drop for CardThumbnail {
     }
 }
 
+/// Design-canvas width of the Up Next card thumbnail (`TW` in `cattube-osd.lua`).
+const CARD_THUMB_W: f64 = 256.0;
+
 fn fetch_card_thumbnail(
     cache: PathBuf,
     id: String,
@@ -1241,7 +1313,7 @@ fn fetch_card_thumbnail(
                 &cache,
                 &id,
                 width,
-                512.0,
+                CARD_THUMB_W,
                 &format!("cattube-next-{}-{serial}.bgra", std::process::id()),
             )
             .map(CardThumbnail)
@@ -1253,11 +1325,44 @@ fn fetch_card_thumbnail(
     rx
 }
 
+/// Replace the active file with per-file options; falls back to the 3-argument
+/// `loadfile` signature used by mpv < 0.38 if mpv rejects the 4-argument form.
+fn loadfile_replace(conn: &mut mpv::IpcConn, url: &str, opts: &str) {
+    let r = conn.command(&[
+        Arg::Str("loadfile"),
+        Arg::Str(url),
+        Arg::Str("replace"),
+        Arg::Num(-1.0),
+        Arg::Str(opts),
+    ]);
+    if r.is_err() && !conn.closed() {
+        let _ = conn.command(&[
+            Arg::Str("loadfile"),
+            Arg::Str(url),
+            Arg::Str("replace"),
+            Arg::Str(opts),
+        ]);
+    }
+}
+
+fn safe_media_title(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect()
+}
+
 /// Watch the player until it goes away: SponsorBlock skips, the speed the
 /// viewer picked, quality changes from the control bar, and what plays
 /// next (an "Up next" card counting down, a loop, or nothing). Runs on
 /// its own thread; `done` is called when the player has gone.
-pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Send + 'static) {
+pub fn spawn_watcher(
+    first: yt::Tile,
+    player: PlayerHandle,
+    s: Session,
+    done: impl FnOnce(Ended) + Send + 'static,
+) {
     let _ = std::thread::Builder::new()
         .name("cattube-player".into())
         .spawn(move || {
@@ -1265,22 +1370,30 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
             let mut ended = Ended::default();
             let started = Instant::now();
             let mut conn = loop {
+                if player.exited() {
+                    done(ended);
+                    return;
+                }
                 if let Ok(mut c) = mpv::IpcConn::connect(&socket)
                     && c.get_f64("time-pos").is_some()
                 {
                     break c;
                 }
                 if started.elapsed() > Duration::from_secs(60) {
+                    player.stop_and_reap();
                     done(ended);
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(400));
+                std::thread::sleep(Duration::from_millis(250));
             };
             let mut queue = s.queue.clone();
             let mut history: Vec<yt::Tile> = Vec::new();
             let mut cur = first;
             let related_requests = std::sync::Arc::new(RelatedRequests::default());
+            let video_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             'videos: loop {
+                let current_gen =
+                    video_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 cattube_core::watched::record(&player::data_home(), &cur);
                 if let Some(on_video) = &s.on_video {
                     on_video(cur.clone());
@@ -1351,9 +1464,16 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     .and_then(|j| j.as_str().map(|s| s == "true"))
                     .unwrap_or(false);
                 if is_live || cur.kind == yt::Kind::Live {
-                    let (id, region, slot) = (cur.id.clone(), s.region.clone(), chat_token.clone());
+                    let (id, region, slot, vg) = (
+                        cur.id.clone(),
+                        s.region.clone(),
+                        chat_token.clone(),
+                        video_gen.clone(),
+                    );
                     std::thread::spawn(move || {
-                        if let Some(t) = live_chat_token(&id, &region) {
+                        if let Some(t) = live_chat_token(&id, &region)
+                            && vg.load(std::sync::atomic::Ordering::SeqCst) == current_gen
+                        {
                             *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
                             let _ = mpv::ipc_request(
                                 &player::player_socket(),
@@ -1391,6 +1511,8 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                 let mut skipped: Vec<f64> = Vec::new();
                 let mut last = (0.0f64, None::<f64>);
                 let mut card_until: Option<Instant> = None;
+                let mut last_count: Option<u64> = None;
+                let mut quit_sent = false;
                 // A skip that runs to the end (end cards, outros) ends the
                 // video here: seeking past the real end can leave mpv
                 // paused without reporting it.
@@ -1435,7 +1557,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                         }
                     }
                     let msgs = conn.messages(Duration::from_millis(400));
-                    if conn.closed() {
+                    if conn.closed() || player.exited() {
                         ended.positions.push((cur.id.clone(), last.0, last.1));
                         stop_chat();
                         break 'videos;
@@ -1501,6 +1623,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                                 f(cur.clone());
                             }
                         } else {
+                            quit_sent = true;
                             let _ = conn.command(&[Arg::Str("quit")]);
                         }
                     }
@@ -1512,14 +1635,17 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                             Arg::Str("ytdl-format"),
                             Arg::Str(&fmt),
                         ]);
-                        let opts = format!("start={:.3}", last.0);
-                        let _ = conn.command(&[
-                            Arg::Str("loadfile"),
-                            Arg::Str(&cur.watch_url()),
-                            Arg::Str("replace"),
-                            Arg::Num(-1.0),
-                            Arg::Str(&opts),
-                        ]);
+                        let title = safe_media_title(&cur.title);
+                        let opts = if title.trim().is_empty() {
+                            format!("start={:.3}", last.0)
+                        } else {
+                            format!(
+                                "start={:.3},force-media-title={}",
+                                last.0,
+                                mpv::option_value(&title)
+                            )
+                        };
+                        loadfile_replace(&mut conn, &cur.watch_url(), &opts);
                         osd(
                             &mut conn,
                             &format!("Quality: {}", player::resolution_label(h)),
@@ -1541,18 +1667,25 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     // so skipping and the bar stay on time.
                     if let Some(arg) = want("cattube-comments") {
                         let token_ = if arg == "first" { String::new() } else { arg };
-                        let (ctx, refresh, id) = (s.ctx.clone(), s.refresh.clone(), cur.id.clone());
+                        let (ctx, refresh, id, vg) = (
+                            s.ctx.clone(),
+                            s.refresh.clone(),
+                            cur.id.clone(),
+                            video_gen.clone(),
+                        );
                         std::thread::spawn(move || {
                             let json =
                                 comments_json(comments(&ctx, &id, &token_, refresh.as_deref()));
-                            let _ = mpv::ipc_request(
-                                &player::player_socket(),
-                                &[
-                                    Arg::Str("script-message"),
-                                    Arg::Str("cattube-comments-data"),
-                                    Arg::Str(&json),
-                                ],
-                            );
+                            if vg.load(std::sync::atomic::Ordering::SeqCst) == current_gen {
+                                let _ = mpv::ipc_request(
+                                    &player::player_socket(),
+                                    &[
+                                        Arg::Str("script-message"),
+                                        Arg::Str("cattube-comments-data"),
+                                        Arg::Str(&json),
+                                    ],
+                                );
+                            }
                         });
                     }
                     // A new request supersedes prior work, including replies from
@@ -1612,7 +1745,8 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     .or(picked);
                     let eof = conn.get_bool("eof-reached").unwrap_or(false) || skipped_to_end;
                     // The end: "Up next" counts down five seconds.
-                    if eof && !next_pending && card_until.is_none() && jump.is_none() {
+                    if eof && !quit_sent && !next_pending && card_until.is_none() && jump.is_none()
+                    {
                         match &next_id {
                             Some(n) => {
                                 let mut args: Vec<String> =
@@ -1624,21 +1758,29 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                                 let a: Vec<&str> = args.iter().map(String::as_str).collect();
                                 card(&mut conn, &a);
                                 card_until = Some(Instant::now() + Duration::from_secs(5));
+                                last_count = Some(5);
                             }
                             None => {
+                                quit_sent = true;
                                 let _ = conn.command(&[Arg::Str("quit")]);
                             }
                         }
                     }
                     let result = want("cattube-card-result");
                     if let Some(until) = card_until {
-                        let left = until.saturating_duration_since(Instant::now()).as_secs();
-                        card(&mut conn, &["count", &left.to_string()]);
+                        let ms = until.saturating_duration_since(Instant::now()).as_millis();
+                        let left = (ms as u64).div_ceil(1000);
+                        if last_count != Some(left) {
+                            card(&mut conn, &["count", &left.to_string()]);
+                            last_count = Some(left);
+                        }
                         if result.as_deref() == Some("cancel") || result.as_deref() == Some("stop")
                         {
                             card(&mut conn, &["hide"]);
+                            quit_sent = true;
                             let _ = conn.command(&[Arg::Str("quit")]);
                             card_until = None;
+                            last_count = None;
                         }
                     }
                     let go_next = jump.clone().or_else(|| {
@@ -1657,20 +1799,9 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                                 queue.remove(0);
                             }
                         }
-                        let title: String = n
-                            .title
-                            .chars()
-                            .filter(|c| !c.is_control())
-                            .take(120)
-                            .collect();
+                        let title = safe_media_title(&n.title);
                         let opts = format!("force-media-title={}", mpv::option_value(&title));
-                        let _ = conn.command(&[
-                            Arg::Str("loadfile"),
-                            Arg::Str(&n.watch_url()),
-                            Arg::Str("replace"),
-                            Arg::Num(-1.0),
-                            Arg::Str(&opts),
-                        ]);
+                        loadfile_replace(&mut conn, &n.watch_url(), &opts);
                         // The end left it paused on the last frame (for the card).
                         let _ = conn.command(&[
                             Arg::Str("set_property"),
@@ -1678,15 +1809,23 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                             Arg::Str("no"),
                         ]);
                         cur = n;
-                        // Wait for it to load before watching it.
+                        // Wait for the replacement video itself to load (not the previous
+                        // video's leftover `time-pos` or `eof-reached`).
                         let t0 = Instant::now();
-                        while conn.get_f64("time-pos").is_none()
-                            && t0.elapsed() < Duration::from_secs(45)
-                        {
-                            if conn.closed() {
+                        while t0.elapsed() < Duration::from_secs(45) {
+                            if conn.closed() || player.exited() {
                                 break 'videos;
                             }
-                            std::thread::sleep(Duration::from_millis(300));
+                            let switched = conn
+                                .get_str("path")
+                                .is_some_and(|p| p.contains(&cur.id));
+                            let ready = switched
+                                && conn.get_f64("time-pos").is_some()
+                                && !conn.get_bool("eof-reached").unwrap_or(false);
+                            if ready {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(250));
                         }
                         continue 'videos;
                     }
@@ -1695,4 +1834,67 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
             related_requests.begin();
             done(ended);
         });
+}
+
+#[cfg(test)]
+mod player_tests {
+    use super::*;
+
+    #[test]
+    fn card_thumbnail_matches_osd_slot_dimensions() {
+        assert_eq!(thumbnail_size(1920.0, CARD_THUMB_W), (256, 144));
+        assert_eq!(thumbnail_size(1280.0, CARD_THUMB_W), (170, 96));
+        assert_eq!(thumbnail_size(3840.0, CARD_THUMB_W), (512, 288));
+    }
+
+    #[test]
+    fn player_handle_detects_early_exit_and_kills_stuck_child() {
+        let fast = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let handle = PlayerHandle::new(fast);
+        let t0 = Instant::now();
+        while !handle.exited() && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(handle.exited());
+
+        let stuck = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let stuck_handle = PlayerHandle::new(stuck);
+        assert!(!stuck_handle.exited());
+        let at = Instant::now();
+        stuck_handle.reap_or_kill(Duration::from_millis(40));
+        assert!(stuck_handle.exited());
+        assert!(at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn loadfile_replace_falls_back_to_three_arg_signature_for_older_mpv() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(b.try_clone().unwrap());
+            let mut seen = Vec::new();
+            for reply_err in ["invalid parameter", "success"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req = mpv::parse_json(line.trim()).unwrap();
+                let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+                let cmd = req.get("command").unwrap().as_arr().unwrap().len();
+                seen.push(cmd);
+                writeln!(b, r#"{{"error":"{reply_err}","data":null,"request_id":{id}}}"#).unwrap();
+            }
+            seen
+        });
+        let mut conn = mpv::IpcConn::from_stream(a).unwrap();
+        loadfile_replace(&mut conn, "https://www.youtube.com/watch?v=WhWc3b3KhnY", "start=1.000");
+        drop(conn);
+        // 5 elements: ["loadfile", url, "replace", -1, opts] -> fallback to 4 elements without -1.
+        assert_eq!(server.join().unwrap(), vec![5, 4]);
+    }
 }

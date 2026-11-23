@@ -32,7 +32,6 @@ use eframe::egui;
 use jobs::Jobs;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -83,11 +82,13 @@ struct App {
     toast: Option<(String, Instant)>,
     /// Bumped to stop waiting for a sign-in code.
     sign_in_wait: Arc<AtomicU64>,
-    player: Option<Child>,
+    player: Option<yt::PlayerHandle>,
     /// Counts the players started; only the newest one's end counts.
     player_seq: u64,
     /// The current video, retained while browsing and returning to playback.
     now_playing: Option<Tile>,
+    /// Video queued by `--play` while waiting for first-run tool downloads.
+    pending_play: Option<Tile>,
     positions: Vec<(String, f64)>,
     votes: HashMap<String, (u64, u64)>,
     tools: Scan<String>,
@@ -153,6 +154,7 @@ impl App {
             player: None,
             player_seq: 0,
             now_playing: None,
+            pending_play: None,
             positions,
             votes: HashMap::new(),
             tools: Scan::Busy,
@@ -175,7 +177,11 @@ impl App {
                     title,
                     ..Tile::default()
                 };
-                app.play(&cc.egui_ctx, tile, false, Vec::new());
+                if player::yt_dlp_path(&app.data).is_file() {
+                    app.play(&cc.egui_ctx, tile, false, Vec::new());
+                } else {
+                    app.pending_play = Some(tile);
+                }
             }
             Start::Section(s) => {
                 tube.header = true;
@@ -266,22 +272,26 @@ impl App {
                     .replace_page(&id, Ok(cattube_core::watched::page(&list)));
             }
             Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
-                if !self.page_requests.insert((id.clone(), String::new())) {
+                let key = (id.clone(), String::new());
+                if !self.page_requests.insert(key.clone()) {
                     return;
                 }
-                self.jobs.spawn(move || {
+                if !self.jobs.try_spawn(move || {
                     let r = yt::subscriptions(&yctx, refresh.as_deref());
                     Msg::Page(generation, id, r)
-                })
+                }) {
+                    self.page_requests.remove(&key);
+                }
             }
             Effect::Load(id) => {
-                if !self.page_requests.insert((id.clone(), String::new())) {
+                let key = (id.clone(), String::new());
+                if !self.page_requests.insert(key.clone()) {
                     return;
                 }
                 if id == ytc::feeds::HOME {
                     self.home_prefetches = 0;
                 }
-                self.jobs.spawn(move || {
+                if !self.jobs.try_spawn(move || {
                     let mut r = yt::page(&yctx, &id, refresh.as_deref());
                     if id == ytc::feeds::HOME
                         && let Ok(p) = r.as_mut()
@@ -289,16 +299,16 @@ impl App {
                         ytc::tidy_home(p);
                     }
                     Msg::Page(generation, id, r)
-                })
+                }) {
+                    self.page_requests.remove(&key);
+                }
             }
             Effect::LoadMore { browse_id, token } => {
-                if !self
-                    .page_requests
-                    .insert((browse_id.clone(), token.clone()))
-                {
+                let key = (browse_id.clone(), token.clone());
+                if !self.page_requests.insert(key.clone()) {
                     return;
                 }
-                self.jobs.spawn(move || {
+                if !self.jobs.try_spawn(move || {
                     let mut r = yt::more(&yctx, &token, refresh.as_deref());
                     if browse_id == ytc::feeds::HOME
                         && let Ok(p) = r.as_mut()
@@ -306,7 +316,9 @@ impl App {
                         ytc::tidy_home(p);
                     }
                     Msg::More(generation, browse_id, token, r)
-                })
+                }) {
+                    self.page_requests.remove(&key);
+                }
             }
             Effect::Search(q) => {
                 // Kept on this TV for next time (Search shows them first).
@@ -333,11 +345,14 @@ impl App {
                     Msg::SearchMore(generation, yt::search_more(&yctx, &t, refresh.as_deref()))
                 })
             }
-            Effect::Suggest(q) => self.jobs.spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                let s = yt::suggestions(&q);
-                Msg::Suggestions(q, s)
-            }),
+            Effect::Suggest(q) => {
+                let hl = self.prefs.language.key().to_string();
+                self.jobs.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let s = yt::suggestions(&q, &hl);
+                    Msg::Suggestions(q, s)
+                });
+            }
             Effect::Details(id) => {
                 let id2 = id.clone();
                 self.jobs
@@ -469,10 +484,11 @@ impl App {
                     // The window is behind the TV's own screen now, where it
                     // draws nothing and so would never act on a close
                     // request: end here (the player goes with it).
-                    if let Some(mut p) = self.player.take() {
-                        yt::checkpoint_player(&self.data);
-                        let _ = p.kill();
-                        let _ = p.wait();
+                    if let Some(p) = self.player.take() {
+                        if !p.exited() {
+                            yt::checkpoint_player(&self.data);
+                        }
+                        p.stop_and_reap();
                     }
                     std::process::exit(0);
                 }
@@ -613,10 +629,11 @@ impl App {
             return;
         }
         self.positions = player::load_positions(&self.data);
-        if let Some(mut old) = self.player.take() {
-            yt::checkpoint_player(&self.data);
-            let _ = old.kill();
-            let _ = old.wait();
+        if let Some(old) = self.player.take() {
+            if !old.exited() {
+                yt::checkpoint_player(&self.data);
+            }
+            old.stop_and_reap();
         }
         let (r, g, b) = theme::accent_rgb();
         let start = if from_start {
@@ -644,6 +661,7 @@ impl App {
         }
         match yt::start_player(&o, &self.data) {
             Ok(child) => {
+                let watcher_player = child.clone();
                 self.player = Some(child);
                 self.player_seq += 1;
                 let seq = self.player_seq;
@@ -675,14 +693,23 @@ impl App {
                         hctx.request_repaint();
                     })),
                 };
-                let (data, quit) = (self.data.clone(), self.quit_after_play);
-                yt::spawn_watcher(tile, s, move |ended| {
+                let (data, config, quit) =
+                    (self.data.clone(), self.config.clone(), self.quit_after_play);
+                let mut prefs_for_quit = self.prefs.clone();
+                yt::spawn_watcher(tile, watcher_player, s, move |ended| {
                     // Where it stopped is saved right here: CatTube's window
                     // may be hidden (behind the TV's own screen), and a hidden
                     // window handles nothing until it shows again.
                     save_positions(&data, &ended.positions);
                     // Opened to play this one video: done, close now.
                     if quit {
+                        if let Some(sp) = ended.speed
+                            && SPEEDS.iter().any(|x| (x - sp).abs() < 1e-6)
+                            && (sp - prefs_for_quit.speed).abs() > 1e-6
+                        {
+                            prefs_for_quit.speed = sp;
+                            let _ = prefs::save(&config, &prefs_for_quit);
+                        }
                         let _ = hand_back_screen();
                         std::process::exit(0);
                     }
@@ -748,7 +775,7 @@ impl App {
                 Ok((refresh, access, expires_at)) => {
                     yt::remember_token(&refresh, &access, expires_at);
                     self.accounts.add(account::Account {
-                        name: "YouTube account".into(),
+                        name: String::new(),
                         refresh_token: refresh.clone(),
                         ..account::Account::default()
                     });
@@ -773,14 +800,8 @@ impl App {
             },
             Msg::AccountName(refresh, n) => {
                 if let Some((name, photo)) = n
-                    && let Some(a) = self
-                        .accounts
-                        .list
-                        .iter_mut()
-                        .find(|a| a.refresh_token == refresh)
+                    && self.accounts.set_profile(&refresh, name, photo)
                 {
-                    a.name = name;
-                    a.photo = photo;
                     self.save_accounts(ctx);
                 }
             }
@@ -791,6 +812,7 @@ impl App {
                 self.images.complete(url, image, ctx.cumulative_frame_nr());
             }
             Msg::Tools(r) => {
+                let ok = r.is_ok();
                 self.tools = match r {
                     Ok(v) => Scan::Done(vec![v]),
                     Err(e) => {
@@ -798,6 +820,13 @@ impl App {
                         Scan::Failed(e)
                     }
                 };
+                if let Some(tile) = self.pending_play.take() {
+                    if ok && player::yt_dlp_path(&self.data).is_file() {
+                        self.play(ctx, tile, false, Vec::new());
+                    } else if self.quit_after_play {
+                        self.effect(ctx, Effect::Close);
+                    }
+                }
             }
             Msg::PlayerChanged(seq, tile) => {
                 if seq == self.player_seq && self.player.is_some() {
@@ -824,8 +853,8 @@ impl App {
                 // stopped counts. Its end must not bring CatTube over the
                 // video playing now, or wait for that one to end.
                 let current = seq == self.player_seq;
-                if current && let Some(mut p) = self.player.take() {
-                    let _ = p.wait();
+                if current && let Some(p) = self.player.take() {
+                    p.reap_or_kill(Duration::from_millis(200));
                     self.now_playing = None;
                     self.tube.now_playing = false;
                 }
@@ -907,12 +936,16 @@ impl App {
             let cache = self.cache.clone();
             let requested = url.clone();
             if !self.jobs.try_spawn(move || {
-                let image = yt::fetch_image(&cache, &requested)
-                    .and_then(|path| images::decode(&path, max_side));
+                let image = yt::fetch_image(&cache, &requested).and_then(|path| {
+                    let decoded = images::decode(&path, max_side);
+                    if decoded.is_none() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    decoded
+                });
                 Msg::Image(requested, image)
             }) {
                 self.fetching.remove(&url);
-                self.images.complete(url, None, 0);
             }
         }
     }
@@ -1043,13 +1076,14 @@ impl eframe::App for App {
         if let Some((text, until)) = &self.toast {
             let left = until.saturating_duration_since(at).as_secs_f32();
             const FADE: f32 = 0.3;
-            let opacity = if self.low_power {
+            let flat_toast = self.low_power || theme::FLAT;
+            let opacity = if flat_toast {
                 1.0
             } else {
                 (left / FADE).min(1.0)
             };
             widgets::toast(&canvas, text, opacity);
-            let next = if self.low_power {
+            let next = if flat_toast {
                 left
             } else if left > FADE {
                 left - FADE
@@ -1083,10 +1117,11 @@ impl eframe::App for App {
 impl Drop for App {
     fn drop(&mut self) {
         self.sign_in_wait.fetch_add(1, Ordering::SeqCst);
-        if let Some(mut p) = self.player.take() {
-            yt::checkpoint_player(&self.data);
-            let _ = p.kill();
-            let _ = p.wait();
+        if let Some(p) = self.player.take() {
+            if !p.exited() {
+                yt::checkpoint_player(&self.data);
+            }
+            p.stop_and_reap();
         }
     }
 }

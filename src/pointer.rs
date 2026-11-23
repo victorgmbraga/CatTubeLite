@@ -84,14 +84,17 @@ impl Pointer {
         if f.key {
             self.last_move = None;
         }
-        let visible = self.last_move.is_some_and(|t| t.elapsed() < HIDE_AFTER);
+        let remaining = self
+            .last_move
+            .and_then(|t| HIDE_AFTER.checked_sub(t.elapsed()));
+        let visible = remaining.is_some();
         ctx.set_cursor_icon(if visible {
             egui::CursorIcon::Default
         } else {
             egui::CursorIcon::None
         });
-        if visible {
-            ctx.request_repaint_after(HIDE_AFTER);
+        if let Some(wait) = remaining {
+            ctx.request_repaint_after(wait);
         }
         f
     }

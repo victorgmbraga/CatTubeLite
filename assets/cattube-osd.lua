@@ -225,12 +225,37 @@ mp.register_script_message("cattube-segments", function(list)
     end
 end)
 
+local function clean(t)
+    t = (t or ""):gsub("[{}\\]", "")
+    return t
+end
+
+-- UTF-8 safe truncation working on both LuaJIT/5.1 and Lua 5.3+.
+local function utf8_truncate(t, max_chars)
+    if max_chars <= 0 then return "" end
+    local count, i, len = 0, 1, #t
+    local cut_at = nil
+    while i <= len do
+        local b = t:byte(i)
+        if b < 0x80 or b >= 0xC0 then
+            count = count + 1
+            if count == max_chars then
+                cut_at = i
+            elseif count > max_chars then
+                return t:sub(1, (cut_at or i) - 1) .. "…"
+            end
+        end
+        i = i + 1
+    end
+    return t
+end
+
 local function chapter_title()
     local i = mp.get_property_number("chapter", -1)
     local list = mp.get_property_native("chapter-list", {})
     local c = list[i + 1]
     if c and c.title and c.title ~= "" then
-        return c.title:gsub("[{}]", "")
+        return clean(c.title)
     end
     return nil
 end
@@ -278,15 +303,15 @@ local function render()
     a:draw_stop()
     -- Title: "Series · S1:E3 · Name" becomes a small "Series · S1:E3"
     -- over the episode's name.
-    local clean = title:gsub("[{}]", "")
-    local series, ep, name = clean:match("^(.-) · (S%d+:E%d+) · (.+)$")
+    local title_clean = clean(title)
+    local series, ep, name = title_clean:match("^(.-) · (S%d+:E%d+) · (.+)$")
     if series then
         a:new_event()
         a:append("{\\an1\\pos(120,792)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H50&}" .. series .. " · " .. ep)
-        clean = name
+        title_clean = name
     end
     a:new_event()
-    a:append("{\\an1\\pos(120,846)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. clean)
+    a:append("{\\an1\\pos(120,846)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. title_clean)
     -- When it ends, like a TV guide (a stream: that it is live).
     if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then
         a:new_event()
@@ -768,8 +793,7 @@ render_menu = function(a)
             a:round_rect_cw(px + 38, y + (rh - 8) / 2 - 7, px + 52, y + (rh - 8) / 2 + 7, 7)
             a:draw_stop()
         end
-        local label = it.label:gsub("[{}]", "")
-        if #label > 34 then label = label:sub(1, 33) .. "…" end
+        local label = utf8_truncate(clean(it.label), 34)
         a:new_event()
         a:append(string.format("{\\an4\\pos(%d,%d)\\bord0\\shad0\\fs28\\b%d\\1c&H%s&\\1a&H00&}%s",
             px + 70, math.floor(y + (rh - 8) / 2), focused and 1 or 0,
@@ -795,20 +819,10 @@ local function card_box()
     return x, y
 end
 
-local function clean(t)
-    t = (t or ""):gsub("[{}\\]", "")
-    return t
-end
-
 -- Characters, not bytes ("·" is two bytes); cut at a character boundary.
 local function fit(t, size, width)
-    local max = math.floor(width / (size * 0.45))
-    local n = utf8 and utf8.len(t) or #t
-    if n and n > max then
-        local cut = utf8 and utf8.offset(t, max) or max
-        t = t:sub(1, cut - 1) .. "…"
-    end
-    return t
+    local max = math.max(1, math.floor(width / (size * 0.45)))
+    return utf8_truncate(t, max)
 end
 
 render_volume = function(a)
@@ -1200,8 +1214,17 @@ local function related_overlays(atlas)
     local offset = offset_y * atlas.w * 4
     local key = table.concat({atlas.p, atlas.v or 0, x, y, offset, height, dw, dh}, " ")
     if key ~= related_placed then
-        mp.commandv("overlay-add", RELATED_OVERLAY, x, y, atlas.p, offset,
-            "bgra", atlas.w, height, atlas.w * 4, dw, dh)
+        local ok = true
+        if dw ~= atlas.w or dh ~= height then
+            ok = mp.commandv("overlay-add", RELATED_OVERLAY, x, y, atlas.p, offset,
+                "bgra", atlas.w, height, atlas.w * 4, dw, dh)
+        else
+            ok = false
+        end
+        if not ok then
+            mp.commandv("overlay-add", RELATED_OVERLAY, x, y, atlas.p, offset,
+                "bgra", atlas.w, height, atlas.w * 4)
+        end
         related_placed = key
     end
 end

@@ -183,6 +183,7 @@ impl Osk {
     /// are clamped, so a stale hit-test can never panic.
     pub fn set_focus(&mut self, row: usize, col: usize) {
         let rows = self.rows();
+        self.in_field = false;
         self.row = row.min(rows.len() - 1);
         self.col = col.min(rows[self.row].len() - 1);
     }
@@ -542,5 +543,15 @@ mod tests {
         assert_eq!(k.cursor(), 3);
         k.set_text("ab");
         assert_eq!(k.cursor(), 2);
+        // Clicking a key with the mouse leaves the text field immediately.
+        k.handle(Action::Up);
+        for _ in 0..5 {
+            k.handle(Action::Up);
+        }
+        assert!(k.in_field());
+        k.set_focus(1, 0); // 'q'
+        assert!(!k.in_field());
+        assert_eq!(k.handle(Action::Ok), OskEvent::Edited);
+        assert_eq!(k.text(), "abq");
     }
 }

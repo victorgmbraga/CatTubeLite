@@ -670,13 +670,21 @@ impl Tube {
                         Action::Up if i == 0 => *suggestion = None,
                         Action::Up => *suggestion = Some(i - 1),
                         Action::Down if i + 1 < suggestions.len() => *suggestion = Some(i + 1),
-                        Action::Down if !results.items().is_empty() => {
+                        Action::Down
+                            if results
+                                .items()
+                                .first()
+                                .is_some_and(|p| !p.shelves.is_empty()) =>
+                        {
                             *suggestion = None;
                             *in_results = true;
                         }
                         Action::Left | Action::Back => *suggestion = None,
                         Action::Ok | Action::OkLong => {
-                            let q = suggestions[i].clone();
+                            let Some(q) = suggestions.get(i).cloned() else {
+                                *suggestion = None;
+                                return vec![];
+                            };
                             osk.set_text(&q);
                             *suggestion = None;
                             *results = Scan::Busy;
@@ -704,7 +712,12 @@ impl Tube {
                         *suggestion = Some(0);
                         return vec![];
                     }
-                    OskEvent::Edge(Edge::Down) if !results.items().is_empty() => {
+                    OskEvent::Edge(Edge::Down)
+                        if results
+                            .items()
+                            .first()
+                            .is_some_and(|p| !p.shelves.is_empty()) =>
+                    {
                         *in_results = true;
                         return vec![];
                     }
@@ -879,7 +892,20 @@ impl Tube {
                         self.stack.push(Screen::TvCode { code: Scan::Busy });
                         vec![Effect::TvCode]
                     }
-                    (Action::Ok | Action::Right, Some(r)) => vec![Effect::Setting(r, 1)],
+                    (Action::Ok, Some(r)) => vec![Effect::Setting(r, 1)],
+                    (
+                        Action::Right,
+                        Some(
+                            r @ (SettingRow::Quality
+                            | SettingRow::Codec
+                            | SettingRow::Speed
+                            | SettingRow::SubtitleLanguage
+                            | SettingRow::Language
+                            | SettingRow::Autoplay
+                            | SettingRow::Buffer
+                            | SettingRow::Region),
+                        ),
+                    ) => vec![Effect::Setting(r, 1)],
                     (Action::Left, Some(r)) => vec![Effect::Setting(r, -1)],
                     _ => vec![],
                 }
@@ -1195,11 +1221,21 @@ impl Tube {
 
     pub fn on_suggestions(&mut self, query: &str, list: Vec<String>) {
         if let Some(Screen::Search {
-            osk, suggestions, ..
+            osk,
+            suggestions,
+            suggestion,
+            ..
         }) = self.stack.last_mut()
             && osk.text() == query
         {
             *suggestions = list;
+            if let Some(i) = *suggestion {
+                *suggestion = if suggestions.is_empty() {
+                    None
+                } else {
+                    Some(i.min(suggestions.len() - 1))
+                };
+            }
         }
     }
 
@@ -1981,5 +2017,68 @@ mod tests {
         assert!(idx(&t).1);
         t.handle(Back, IN, &no);
         assert!(!matches!(t.screen(), Some(Screen::Settings { .. })));
+    }
+
+    #[test]
+    fn shrinking_suggestions_clamps_focus_and_empty_search_stays_on_keyboard() {
+        let (mut t, _) = Tube::open(IN);
+        t.stack.push(search_screen());
+        if let Some(Screen::Search {
+            osk,
+            suggestions,
+            suggestion,
+            ..
+        }) = t.stack.last_mut()
+        {
+            osk.set_text("abc");
+            *suggestions = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+            *suggestion = Some(3);
+        }
+        // Fewer suggestions arrive while focused on index 3: must clamp instead of panicking.
+        t.on_suggestions("abc", vec!["abc one".into()]);
+        assert_eq!(
+            t.handle(Action::Ok, IN, &no),
+            vec![Effect::Search("abc one".into())]
+        );
+        // Empty search results must not enter `in_results`.
+        t.on_search(ok(Page::default()));
+        for _ in 0..8 {
+            t.handle(Action::Down, IN, &no);
+        }
+        assert!(matches!(
+            t.screen(),
+            Some(Screen::Search {
+                in_results: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn right_arrow_in_settings_does_not_toggle_or_trigger_actions() {
+        let (mut t, _) = Tube::open(IN);
+        let rows = setting_rows(IN.accounts, IN.sponsorblock);
+        let hdr = rows.iter().position(|r| *r == SettingRow::Hdr).unwrap();
+        let update = rows
+            .iter()
+            .position(|r| *r == SettingRow::UpdateYtDlp)
+            .unwrap();
+        t.stack.push(Screen::Settings {
+            index: hdr,
+            groups: false,
+        });
+        assert!(t.handle(Action::Right, IN, &no).is_empty());
+        assert_eq!(
+            t.handle(Action::Ok, IN, &no),
+            vec![Effect::Setting(SettingRow::Hdr, 1)]
+        );
+        if let Some(Screen::Settings { index, .. }) = t.stack.last_mut() {
+            *index = update;
+        }
+        assert!(t.handle(Action::Right, IN, &no).is_empty());
+        assert_eq!(
+            t.handle(Action::Ok, IN, &no),
+            vec![Effect::Setting(SettingRow::UpdateYtDlp, 1)]
+        );
     }
 }
