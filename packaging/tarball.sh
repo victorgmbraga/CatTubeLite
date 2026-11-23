@@ -6,7 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 NAME="cattube-$VERSION-$(uname -m)"
-cargo build --release --locked
+# TV boxes draw with OpenGL: their build leaves the wgpu renderer out.
+FEATURES=()
+if [[ "$(uname -m)" == aarch64 ]]; then FEATURES=(--no-default-features); fi
+cargo build --release --locked "${FEATURES[@]}"
 rm -rf "dist/$NAME" && mkdir -p "dist/$NAME"
 D="dist/$NAME"
 install -Dm755 "${CARGO_TARGET_DIR:-target}/release/cattube" "$D/bin/cattube"

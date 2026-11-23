@@ -1382,12 +1382,15 @@ fn feed(which: &str) -> i32 {
     0
 }
 
+#[cfg_attr(not(feature = "wgpu"), allow(unused_variables))]
 fn renderer_for(choice: Option<&str>, low_power: bool) -> (eframe::Renderer, bool) {
     match choice {
         Some("glow") => (eframe::Renderer::Glow, true),
+        #[cfg(feature = "wgpu")]
         Some("wgpu") => (eframe::Renderer::Wgpu, true),
-        _ if low_power => (eframe::Renderer::Glow, false),
-        _ => (eframe::Renderer::Wgpu, false),
+        #[cfg(feature = "wgpu")]
+        _ if !low_power => (eframe::Renderer::Wgpu, false),
+        _ => (eframe::Renderer::Glow, false),
     }
 }
 
@@ -1511,6 +1514,9 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| Ok(Box::new(App::new(cc, start.take().unwrap_or(Start::Home))))),
     );
+    #[cfg(not(feature = "wgpu"))]
+    let _ = explicit; // built with OpenGL only: nothing to fall back to
+    #[cfg(feature = "wgpu")]
     if let Err(e) = &result
         && !explicit
     {
@@ -1558,11 +1564,22 @@ mod tests {
     #[test]
     fn renderer_defaults_to_glow_on_low_power_and_honors_override() {
         assert_eq!(renderer_for(None, true), (eframe::Renderer::Glow, false));
-        assert_eq!(renderer_for(None, false), (eframe::Renderer::Wgpu, false));
-        assert_eq!(
-            renderer_for(Some("wgpu"), true),
-            (eframe::Renderer::Wgpu, true)
-        );
+        #[cfg(feature = "wgpu")]
+        {
+            assert_eq!(renderer_for(None, false), (eframe::Renderer::Wgpu, false));
+            assert_eq!(
+                renderer_for(Some("wgpu"), true),
+                (eframe::Renderer::Wgpu, true)
+            );
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            assert_eq!(renderer_for(None, false), (eframe::Renderer::Glow, false));
+            assert_eq!(
+                renderer_for(Some("wgpu"), false),
+                (eframe::Renderer::Glow, false)
+            );
+        }
         assert_eq!(
             renderer_for(Some("glow"), false),
             (eframe::Renderer::Glow, true)

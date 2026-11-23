@@ -84,6 +84,8 @@ tar -xzf dist/cattube-*-"$(uname -m)".tar.gz -C dist
 dist/cattube-*-"$(uname -m)"/install.sh
 ```
 
+Em `aarch64`, o pacote é compilado sem o renderizador `wgpu` (`--no-default-features`), o que deixa o binário cerca de 31% menor. Nesse caso, ele sempre desenha com OpenGL.
+
 O pacote não inclui `mpv`, `curl` nem Python 3, que precisam estar instalados no aparelho.
 
 Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](https://github.com/yt-dlp/yt-dlp) e do [Deno](https://deno.com) (usando o binário nativo ARM64 em `aarch64`) em `~/.local/share/cattube`, verifica os arquivos e os mantém atualizados automaticamente.
