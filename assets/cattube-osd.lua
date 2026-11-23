@@ -1528,6 +1528,7 @@ mp.add_forced_key_binding("UP", "cattube-up", on_up, { repeatable = true })
 mp.add_forced_key_binding("DOWN", "cattube-down", on_down, { repeatable = true })
 mp.add_forced_key_binding("ESC", "cattube-back", on_back)
 mp.add_forced_key_binding("BS", "cattube-back-bs", on_back)
+mp.add_forced_key_binding("GO_BACK", "cattube-back-go", on_back) -- BTV9: tecla Voltar do controle remoto
 -- Media keys keep working through the input conf; the bar follows pause.
 mp.observe_property("pause", "native", function(_, paused)
     if not related then
