@@ -448,20 +448,26 @@ impl App {
                         let _ = tx.send(m);
                         rctx.request_repaint();
                     };
-                    let code = match yt::sign_in_code(&device) {
-                        Ok(c) => c,
-                        Err(e) => return send(Msg::SignInCode(Err(e))),
-                    };
-                    let url = code
-                        .url
-                        .trim_start_matches("https://")
-                        .trim_start_matches("www.")
-                        .to_string();
-                    send(Msg::SignInCode(Ok((code.user_code.clone(), url))));
                     let keep = || wait.load(Ordering::SeqCst) == generation;
-                    let r = yt::sign_in_wait(&code, &keep);
-                    if keep() {
-                        send(Msg::SignedIn(r));
+                    let flow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let code = match yt::sign_in_code(&device) {
+                            Ok(c) => c,
+                            Err(e) => return send(Msg::SignInCode(Err(e))),
+                        };
+                        let url = code
+                            .url
+                            .trim_start_matches("https://")
+                            .trim_start_matches("www.")
+                            .to_string();
+                        send(Msg::SignInCode(Ok((code.user_code.clone(), url))));
+                        let r = yt::sign_in_wait(&code, &keep);
+                        if keep() {
+                            send(Msg::SignedIn(r));
+                        }
+                    }));
+                    // The sign-in screen must not keep waiting for a dead thread.
+                    if flow.is_err() && keep() {
+                        send(Msg::SignInCode(Err(JOB_FAILED.into())));
                     }
                 });
             }
