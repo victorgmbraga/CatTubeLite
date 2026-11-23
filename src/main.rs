@@ -387,7 +387,9 @@ impl App {
                 let _ = std::fs::create_dir_all(&self.data);
                 let searches_path = self.data.join("searches.txt");
                 let tmp = cattube_core::util::unique_tmp_path(&searches_path, "tmp");
-                if std::fs::write(&tmp, list).is_err() || std::fs::rename(&tmp, &searches_path).is_err() {
+                if std::fs::write(&tmp, list).is_err()
+                    || std::fs::rename(&tmp, &searches_path).is_err()
+                {
                     let _ = std::fs::remove_file(&tmp);
                 }
                 self.pending_suggest = None;

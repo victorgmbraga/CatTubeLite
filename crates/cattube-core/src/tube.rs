@@ -982,10 +982,7 @@ impl Tube {
             }
             return vec![];
         }
-        let has_page = self
-            .current()
-            .and_then(|p| p.items().first())
-            .is_some();
+        let has_page = self.current().and_then(|p| p.items().first()).is_some();
         if !has_page {
             match action {
                 Action::Up | Action::Back => self.header = true,

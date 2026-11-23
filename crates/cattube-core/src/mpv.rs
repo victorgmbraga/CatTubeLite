@@ -866,7 +866,10 @@ mod tests {
             vec![vec!["cattube-hide".to_string()]]
         );
         // Oversized line (> 64 KiB) is skipped cleanly without corrupting the next event.
-        let huge = format!("{{\"event\":\"big\",\"data\":\"{}\"}}\n", "x".repeat(70_000));
+        let huge = format!(
+            "{{\"event\":\"big\",\"data\":\"{}\"}}\n",
+            "x".repeat(70_000)
+        );
         peer.write_all(huge.as_bytes()).unwrap();
         writeln!(
             peer,
@@ -880,7 +883,10 @@ mod tests {
         // Closing the peer immediately marks the connection closed without waiting out IPC_TIMEOUT.
         drop(peer);
         let at = Instant::now();
-        assert!(conn.command(&[Arg::Str("get_property"), Arg::Str("time-pos")]).is_err());
+        assert!(
+            conn.command(&[Arg::Str("get_property"), Arg::Str("time-pos")])
+                .is_err()
+        );
         assert!(conn.closed());
         assert!(at.elapsed() < Duration::from_millis(250));
     }

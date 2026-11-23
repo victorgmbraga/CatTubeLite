@@ -573,8 +573,7 @@ pub fn load_positions_and_checkpoints(
         let _ = std::fs::remove_file(path);
     }
     // Track newest order index per video id in O(N) instead of O(N^2) Vec::retain.
-    let mut order: HashMap<String, (usize, f64)> =
-        HashMap::with_capacity(base.len() + files.len());
+    let mut order: HashMap<String, (usize, f64)> = HashMap::with_capacity(base.len() + files.len());
     let mut seq = 0usize;
     for (id, pos) in base {
         order.insert(id, (seq, pos));
@@ -856,10 +855,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             load_positions(&root),
-            vec![
-                ("B4EPW7JUMTM".into(), 10.0),
-                ("WhWc3b3KhnY".into(), 88.0),
-            ]
+            vec![("B4EPW7JUMTM".into(), 10.0), ("WhWc3b3KhnY".into(), 88.0),]
         );
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()

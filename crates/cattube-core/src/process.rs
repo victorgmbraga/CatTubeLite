@@ -229,11 +229,15 @@ pub fn run_with_timeout(cmd: &Cmd) -> Result<Output> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     thread::spawn(move || {
-        let buf = stdout.map(|s| read_capped(s, MAX_STDOUT)).unwrap_or_default();
+        let buf = stdout
+            .map(|s| read_capped(s, MAX_STDOUT))
+            .unwrap_or_default();
         let _ = out_tx.send(buf);
     });
     thread::spawn(move || {
-        let buf = stderr.map(|s| read_capped(s, MAX_STDERR)).unwrap_or_default();
+        let buf = stderr
+            .map(|s| read_capped(s, MAX_STDERR))
+            .unwrap_or_default();
         let _ = err_tx.send(buf);
     });
 
@@ -346,7 +350,9 @@ pub fn run_with_lines(cmd: &Cmd, on_line: &mut dyn FnMut(&str)) -> Result<Output
     });
     let stderr = child.stderr.take();
     thread::spawn(move || {
-        let buf = stderr.map(|s| read_capped(s, MAX_STDERR)).unwrap_or_default();
+        let buf = stderr
+            .map(|s| read_capped(s, MAX_STDERR))
+            .unwrap_or_default();
         let _ = err_tx.send(buf);
     });
     let deadline = Instant::now() + cmd.timeout;
