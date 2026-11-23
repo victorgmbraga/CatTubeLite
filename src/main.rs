@@ -1393,7 +1393,7 @@ fn renderer() -> (eframe::Renderer, bool) {
 }
 
 const HELP: &str = "cattube {VERSION}: a native Linux YouTube app for TV screens
-and remotes. https://github.com/coderastic/CatTube
+and remotes. https://github.com/victorgmbraga/CatTubeLite
 
 Usage: cattube [--windowed] [--section NAME | --play VIDEO_ID]
        cattube --feed subscriptions|home
