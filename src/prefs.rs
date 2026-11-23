@@ -57,6 +57,8 @@ pub struct Prefs {
     pub buffer: u32,
     /// Region for YouTube's lists ("IN", "US").
     pub region: String,
+    /// Show decoder, dropped frames and memory over the video.
+    pub player_stats: bool,
 }
 
 impl Default for Prefs {
@@ -75,6 +77,7 @@ impl Default for Prefs {
             sb_categories: community::default_categories(),
             buffer: 256,
             region: "US".into(),
+            player_stats: false,
         }
     }
 }
@@ -141,6 +144,7 @@ impl Prefs {
                     }
                 }
                 "sponsorblock" => p.sponsorblock = v != "false",
+                "player_stats" => p.player_stats = v == "true",
                 "buffer" => {
                     if let Ok(n) = v.parse::<u32>()
                         && cattube_core::player::BUFFERS.contains(&n)
@@ -171,7 +175,7 @@ impl Prefs {
 
     pub fn to_conf(&self) -> String {
         format!(
-            "# CatTube settings\nlanguage = {}\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\n",
+            "# CatTube settings\nlanguage = {}\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\nplayer_stats = {}\n",
             self.language.key(),
             self.accent,
             self.max_height,
@@ -184,7 +188,8 @@ impl Prefs {
             self.sponsorblock,
             self.sb_categories.join(","),
             self.buffer,
-            self.region
+            self.region,
+            self.player_stats
         )
     }
 
@@ -236,6 +241,7 @@ mod tests {
             sb_categories: vec!["sponsor".into(), "intro".into()],
             buffer: 768,
             region: "DE".into(),
+            player_stats: true,
         };
         assert_eq!(Prefs::parse(&p.to_conf(), false), p);
         assert_eq!(Prefs::parse(&p.to_conf(), true), p);

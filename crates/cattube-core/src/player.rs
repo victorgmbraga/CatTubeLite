@@ -275,6 +275,8 @@ pub struct PlayOptions {
     /// Back hides the video (it plays on behind CatTube's list) instead
     /// of stopping it: on CatosTV, which can bring it back.
     pub hide_on_back: bool,
+    /// Show the performance readout over the video.
+    pub stats: bool,
 }
 
 /// mpv's command line for a video. `data` holds yt-dlp, `ui` the control
@@ -356,6 +358,9 @@ pub fn mpv_argv(
     }
     if o.low_power {
         opts.push("cattube_osd-low_power=yes".into());
+    }
+    if o.stats {
+        opts.push("cattube_osd-stats=yes".into());
     }
     opts.push(format!(
         "cattube_osd-position_dir={}",
@@ -658,6 +663,7 @@ mod tests {
             subs_on: false,
             accent: "7c6cf0".into(),
             hide_on_back: false,
+            stats: false,
         };
         let v = mpv_argv(
             &o,
@@ -700,6 +706,7 @@ mod tests {
             start: 0.0,
             sub_langs: String::new(),
             low_power: true,
+            stats: true,
             ..o
         };
         let v2 = mpv_argv(
@@ -716,6 +723,8 @@ mod tests {
         assert!(v2.iter().any(|a| a == "--scale=bilinear"));
         assert!(v2.iter().any(|a| a == "--dither-depth=no"));
         assert!(v2.iter().any(|a| a.contains("cattube_osd-low_power=yes")));
+        assert!(v2.iter().any(|a| a.contains("cattube_osd-stats=yes")));
+        assert!(!v.iter().any(|a| a.contains("cattube_osd-stats")));
         assert!(
             v2.iter()
                 .any(|a| a.starts_with("--ytdl-format=") && a.contains("[fps<=30]"))

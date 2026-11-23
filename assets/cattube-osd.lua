@@ -42,7 +42,7 @@ local options = require "mp.options"
 local assdraw = require "mp.assdraw"
 local utils = require "mp.utils"
 
-local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "", low_power = false }
+local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "", low_power = false, stats = false }
 options.read_options(opts, "cattube_osd")
 
 -- The player owns its last position. Watcher/network delays cannot lose it.
@@ -1666,3 +1666,47 @@ mp.register_event("playback-restart", function() checkpoint(true, false) end)
 mp.observe_property("paused-for-cache", "bool", function(_, waiting)
     if waiting then loading(true) elseif mp.get_property("time-pos") then loading(false) end
 end)
+
+-- Settings -> About -> Player statistics: what a TV box is really doing, once
+-- a second, in plain ASS (no blur) so that measuring costs next to nothing.
+if opts.stats then
+    local msg = require "mp.msg"
+    local stats_overlay = mp.create_osd_overlay("ass-events")
+    stats_overlay.res_x, stats_overlay.res_y = 1920, 1080
+    stats_overlay.z = 900
+
+    local function mib_field(path, key)
+        local f = io.open(path, "r")
+        if not f then return "?" end
+        local text = f:read("*a")
+        f:close()
+        local kib = text:match(key .. ":%s*(%d+)")
+        return kib and tostring(math.floor(tonumber(kib) / 1024)) or "?"
+    end
+
+    local function plain(value)
+        return (tostring(value or "?"):gsub("[{}\\]", ""))
+    end
+
+    local function draw_stats()
+        local hw = mp.get_property("hwdec-current", "no")
+        local lines = {
+            string.format("Video: %sx%s %s", plain(mp.get_property("width")),
+                plain(mp.get_property("height")), plain(mp.get_property("video-format"))),
+            "Decoder: " .. ((hw == "no" or hw == "") and "software" or "hardware (" .. plain(hw) .. ")"),
+            string.format("Dropped: %s decoder, %s output",
+                plain(mp.get_property("decoder-frame-drop-count", "0")),
+                plain(mp.get_property("frame-drop-count", "0"))),
+            string.format("Buffer: %.0f s", mp.get_property_number("demuxer-cache-duration", 0)),
+            string.format("Memory: player %s MiB, free %s MiB",
+                mib_field("/proc/self/status", "VmRSS"), mib_field("/proc/meminfo", "MemAvailable")),
+        }
+        stats_overlay.data = "{\\an7\\pos(24,24)\\fs26\\bord2\\shad0\\1c&HFFFFFF&\\3c&H000000&}"
+            .. table.concat(lines, "\\N")
+        stats_overlay:update()
+        msg.debug("stats: " .. table.concat(lines, " | "))
+    end
+
+    mp.add_periodic_timer(1, draw_stats)
+    draw_stats()
+end

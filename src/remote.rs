@@ -691,6 +691,7 @@ impl Remote {
             buffer_mib: p.buffer,
             // Played from the phone: nothing of CatTube's to go back to.
             hide_on_back: false,
+            stats: p.player_stats,
         };
         let child = match yt::start_player(&o, &self.data) {
             Ok(c) => c,

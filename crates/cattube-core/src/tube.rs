@@ -137,6 +137,8 @@ pub enum SettingRow {
     Category(usize),
     /// The phone remote: shows the "Link with TV code" code.
     LinkPhone,
+    /// Decoder, dropped frames and memory over the video.
+    PlayerStats,
     UpdateYtDlp,
 }
 
@@ -189,7 +191,7 @@ pub fn group_of(row: SettingRow) -> SettingGroup {
         | SettingRow::Region => SettingGroup::Playback,
         SettingRow::SponsorBlock | SettingRow::Category(_) => SettingGroup::SponsorBlock,
         SettingRow::LinkPhone => SettingGroup::Phone,
-        SettingRow::UpdateYtDlp => SettingGroup::About,
+        SettingRow::PlayerStats | SettingRow::UpdateYtDlp => SettingGroup::About,
     }
 }
 
@@ -226,6 +228,7 @@ pub fn setting_rows(accounts: usize, sponsorblock: bool) -> Vec<SettingRow> {
         v.extend((0..crate::community::CATEGORIES.len()).map(SettingRow::Category));
     }
     v.push(SettingRow::LinkPhone);
+    v.push(SettingRow::PlayerStats);
     v.push(SettingRow::UpdateYtDlp);
     v
 }
@@ -853,6 +856,7 @@ impl Tube {
                             Some(SettingRow::Account(_))
                                 | Some(SettingRow::AddAccount)
                                 | Some(SettingRow::LinkPhone)
+                                | Some(SettingRow::PlayerStats)
                                 | Some(SettingRow::UpdateYtDlp)
                                 | Some(SettingRow::Hdr)
                                 | Some(SettingRow::Subtitles)

@@ -100,7 +100,7 @@ On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.co
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Forces UI renderer (defaults to `glow` in `low_power`, `wgpu` otherwise, with automatic fallback when unset) |
 | `CATTUBE_CAST_ENABLED_FILE` | path | Optional preference file containing `cast_enabled = true` or `false` to toggle phone casting live |
 
-To verify hardware decoding and dropped frames on a TV box while a video is playing, query `mpv`'s IPC socket at `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` without it) for `hwdec-current` and `frame-drop-count`.
+To see hardware decoding, dropped frames and memory over the video, turn on **Settings → About → Player statistics**. You can also query `mpv`'s IPC socket at `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` without it) for `hwdec-current` and `frame-drop-count`.
 
 ## Keys
 

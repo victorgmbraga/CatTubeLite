@@ -680,6 +680,7 @@ impl App {
             }
             // Opens its own screen (the tube handles it).
             SettingRow::LinkPhone => {}
+            SettingRow::PlayerStats => self.prefs.player_stats = !self.prefs.player_stats,
             SettingRow::UpdateYtDlp => {
                 self.tools = Scan::Busy;
                 let data = self.data.clone();
@@ -735,6 +736,7 @@ impl App {
             accent: format!("{r:02x}{g:02x}{b:02x}"),
             buffer_mib: self.prefs.buffer,
             hide_on_back: on_catostv() && !self.quit_after_play,
+            stats: self.prefs.player_stats,
         };
         if !self.yt_dlp_ready && !player::yt_dlp_path(&self.data).is_file() {
             return self.toast(ctx, "Getting the player ready, try again in a moment");

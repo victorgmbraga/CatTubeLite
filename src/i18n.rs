@@ -101,6 +101,10 @@ pub fn tr(text: &str) -> &str {
         "Pick and control videos from the YouTube app" => {
             "اختيار الفيديوهات والتحكم بها من تطبيق YouTube"
         }
+        "Player statistics" => "إحصاءات المشغل",
+        "Decoder, dropped frames and memory over the video" => {
+            "عرض وحدة فك الترميز والإطارات المفقودة والذاكرة"
+        }
         "Update the player" => "تحديث المشغل",
         "Updating…" => "جارٍ التحديث…",
         "Now playing" => "قيد التشغيل الآن",
