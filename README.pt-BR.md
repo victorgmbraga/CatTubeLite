@@ -98,7 +98,7 @@ Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](http
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface (padrão `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido) |
 | `CATTUBE_CAST_ENABLED_FILE` | caminho | Arquivo opcional contendo `cast_enabled = true` ou `false` para ativar/desativar casting em tempo real |
 
-Para conferir decodificação por hardware e quadros descartados na TV box durante a reprodução, consulte as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `${XDG_RUNTIME_DIR:-/tmp}/cattube-mpv.sock`.
+Para conferir decodificação por hardware e quadros descartados na TV box durante a reprodução, consulte as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` sem essa variável).
 
 ## Controles
 
