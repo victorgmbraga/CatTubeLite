@@ -61,7 +61,9 @@ fn fallback_hex(n: usize) -> String {
         ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut out = String::with_capacity(n * 2);
     for _ in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push_str(&format!("{:02x}", (state >> 56) as u8));
     }
     out

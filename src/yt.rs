@@ -662,11 +662,10 @@ pub fn subscription_feeds(
         .iter()
         .filter_map(|c| subs::feed_url(&c.id))
         .collect();
-    let uploads: Vec<Vec<subs::Upload>> =
-        fetch_many(&urls, cattube_core::env::low_power())
-            .iter()
-            .map(|xml| subs::parse_feed(xml, now))
-            .collect();
+    let uploads: Vec<Vec<subs::Upload>> = fetch_many(&urls, cattube_core::env::low_power())
+        .iter()
+        .map(|xml| subs::parse_feed(xml, now))
+        .collect();
     if !channels.is_empty() && uploads.iter().all(Vec::is_empty) {
         return Err("YouTube didn't answer".into());
     }
@@ -1398,10 +1397,7 @@ fn card(conn: &mut mpv::IpcConn, args: &[&str]) {
 
 fn thumbnail_size(osd_width: f64, width: f64) -> (u32, u32) {
     let scale = (osd_width / 1920.0).clamp(0.5, 4.0);
-    (
-        (width * scale) as u32,
-        (width * 9.0 / 16.0 * scale) as u32,
-    )
+    ((width * scale) as u32, (width * 9.0 / 16.0 * scale) as u32)
 }
 
 /// Decode and scale a thumbnail directly into BGRA bytes in memory.
@@ -1750,8 +1746,7 @@ pub fn spawn_watcher(
             let related_requests = std::sync::Arc::new(RelatedRequests::default());
             let video_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             'videos: loop {
-                let current_gen =
-                    video_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let current_gen = video_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 cattube_core::watched::record(&player::data_home(), &cur);
                 if let Some(on_video) = &s.on_video {
                     on_video(cur.clone());
@@ -2174,9 +2169,8 @@ pub fn spawn_watcher(
                             if conn.closed() || player.exited() {
                                 break 'videos;
                             }
-                            let switched = conn
-                                .get_str("path")
-                                .is_some_and(|p| p.contains(&cur.id));
+                            let switched =
+                                conn.get_str("path").is_some_and(|p| p.contains(&cur.id));
                             let ready = switched
                                 && conn.get_f64("time-pos").is_some()
                                 && !conn.get_bool("eof-reached").unwrap_or(false);
@@ -2268,12 +2262,20 @@ mod player_tests {
                 let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
                 let cmd = req.get("command").unwrap().as_arr().unwrap().len();
                 seen.push(cmd);
-                writeln!(b, r#"{{"error":"{reply_err}","data":null,"request_id":{id}}}"#).unwrap();
+                writeln!(
+                    b,
+                    r#"{{"error":"{reply_err}","data":null,"request_id":{id}}}"#
+                )
+                .unwrap();
             }
             seen
         });
         let mut conn = mpv::IpcConn::from_stream(a).unwrap();
-        loadfile_replace(&mut conn, "https://www.youtube.com/watch?v=WhWc3b3KhnY", "start=1.000");
+        loadfile_replace(
+            &mut conn,
+            "https://www.youtube.com/watch?v=WhWc3b3KhnY",
+            "start=1.000",
+        );
         drop(conn);
         // 5 elements: ["loadfile", url, "replace", -1, opts] -> fallback to 4 elements without -1.
         assert_eq!(server.join().unwrap(), vec![5, 4]);

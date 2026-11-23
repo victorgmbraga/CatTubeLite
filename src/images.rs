@@ -276,7 +276,11 @@ mod tests {
             1,
             Instant::now() + Duration::from_secs(60),
         );
-        assert!(images.get(&ctx, "https://i.ytimg.com/vi/a/hqdefault.jpg", false).is_none());
+        assert!(
+            images
+                .get(&ctx, "https://i.ytimg.com/vi/a/hqdefault.jpg", false)
+                .is_none()
+        );
         assert_eq!(images.take_wanted().count(), 0);
         // Expired cooldown re-queues the URL on the next draw.
         images.complete_at(
@@ -285,7 +289,11 @@ mod tests {
             1,
             Instant::now() - Duration::from_secs(1),
         );
-        assert!(images.get(&ctx, "https://i.ytimg.com/vi/a/hqdefault.jpg", true).is_none());
+        assert!(
+            images
+                .get(&ctx, "https://i.ytimg.com/vi/a/hqdefault.jpg", true)
+                .is_none()
+        );
         assert_eq!(
             images.take_wanted().collect::<Vec<_>>(),
             ["https://i.ytimg.com/vi/a/hqdefault.jpg"]

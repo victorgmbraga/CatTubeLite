@@ -260,7 +260,10 @@ mod tests {
             assert!(marked.rows.iter().all(|r| !r.glyphs.is_empty()));
             assert!(!is_rtl("YouTube 2026"));
             assert!(is_rtl("بحث YouTube 2026"));
-            assert!(matches!(display("YouTube 2026"), Cow::Borrowed("YouTube 2026")));
+            assert!(matches!(
+                display("YouTube 2026"),
+                Cow::Borrowed("YouTube 2026")
+            ));
         })
         .drop_without_applying_deltas();
     }

@@ -249,9 +249,11 @@ impl Accounts {
     /// Add (or replace the same account) and make it the one in use.
     pub fn add(&mut self, a: Account) {
         let has_real_name = !a.name.is_empty() && a.name != "YouTube account";
-        if let Some(i) = self.list.iter().position(|x| {
-            x.refresh_token == a.refresh_token || (has_real_name && x.name == a.name)
-        }) {
+        if let Some(i) = self
+            .list
+            .iter()
+            .position(|x| x.refresh_token == a.refresh_token || (has_real_name && x.name == a.name))
+        {
             self.list[i] = a;
             self.active = i;
         } else {

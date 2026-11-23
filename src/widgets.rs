@@ -200,7 +200,12 @@ pub fn button<H: Copy>(c: &Canvas<H>, rect: Rect, label: &str, style: ButtonStyl
         }
         _ if t > 0.01 => {
             if theme::FLAT {
-                c.outline(rect, radius, 2.0, theme::rgba(theme::WHITE, (255.0 * t) as u8));
+                c.outline(
+                    rect,
+                    radius,
+                    2.0,
+                    theme::rgba(theme::WHITE, (255.0 * t) as u8),
+                );
             }
             c.rounded_gradient(rect, radius, theme::WHITE, (34.0 * t) as u8, 0);
             c.top_highlight(rect, radius, theme::rgba(theme::WHITE, (150.0 * t) as u8));
@@ -394,11 +399,7 @@ fn list_row_focus<H: Copy>(c: &Canvas<H>, rect: Rect, row: &ListRow, t: f32, own
     } else {
         c.text_width(row.value, 15.0, Weight::Medium)
     };
-    let value_w = if row.value.is_empty() {
-        0.0
-    } else {
-        vw + 24.0
-    };
+    let value_w = if row.value.is_empty() { 0.0 } else { vw + 24.0 };
     let right_w = match row.kind {
         Some(RowKind::Toggle(_)) => 64.0,
         Some(RowKind::Choice) => value_w + 40.0,

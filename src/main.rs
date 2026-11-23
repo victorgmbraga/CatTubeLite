@@ -387,7 +387,9 @@ impl App {
                 let _ = std::fs::create_dir_all(&self.data);
                 let searches_path = self.data.join("searches.txt");
                 let tmp = cattube_core::util::unique_tmp_path(&searches_path, "tmp");
-                if std::fs::write(&tmp, list).is_err() || std::fs::rename(&tmp, &searches_path).is_err() {
+                if std::fs::write(&tmp, list).is_err()
+                    || std::fs::rename(&tmp, &searches_path).is_err()
+                {
                     let _ = std::fs::remove_file(&tmp);
                 }
                 self.pending_suggest = None;
@@ -1391,7 +1393,7 @@ fn renderer() -> (eframe::Renderer, bool) {
 }
 
 const HELP: &str = "cattube {VERSION}: a native Linux YouTube app for TV screens
-and remotes. https://github.com/coderastic/CatTube
+and remotes. https://github.com/victorgmbraga/CatTubeLite
 
 Usage: cattube [--windowed] [--section NAME | --play VIDEO_ID]
        cattube --feed subscriptions|home

@@ -24,8 +24,8 @@
     <p>CatTube is not made by or connected to YouTube or Google.</p>
   </description>
   <launchable type="desktop-id">io.github.coderastic.CatTube.desktop</launchable>
-  <url type="homepage">https://github.com/coderastic/CatTube</url>
-  <url type="bugtracker">https://github.com/coderastic/CatTube/issues</url>
+  <url type="homepage">https://github.com/victorgmbraga/CatTubeLite</url>
+  <url type="bugtracker">https://github.com/victorgmbraga/CatTubeLite/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="1.0.4" date="2026-10-27"/>
