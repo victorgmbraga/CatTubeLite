@@ -57,7 +57,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces four main sets o
 
 ## Languages
 
-Choose **Settings → Playback → Interface language → العربية** for Arabic. Arabic titles and search text also display properly in the English interface, and the on-screen keyboard includes an Arabic layout (**ABC → العربية**). Subtitle language is configured separately.
+Choose **Settings → Playback → Interface language** for **Português (Brasil)** or **العربية** (Arabic). The player's on-screen controls stay in English. Arabic titles and search text also display properly in the English interface, and the on-screen keyboard includes an Arabic layout (**ABC → العربية**). Subtitle language is configured separately.
 
 ## Build & install
 

@@ -2,51 +2,62 @@
 
 use eframe::egui;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 use unicode_bidi::BidiInfo;
 use unicode_segmentation::UnicodeSegmentation;
 
-static ARABIC: AtomicBool = AtomicBool::new(false);
+static LANGUAGE: AtomicU8 = AtomicU8::new(Language::English as u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Language {
     #[default]
     English,
     Arabic,
+    Portuguese,
 }
 
 impl Language {
-    pub const ALL: [Self; 2] = [Self::English, Self::Arabic];
+    pub const ALL: [Self; 3] = [Self::English, Self::Portuguese, Self::Arabic];
     pub fn key(self) -> &'static str {
         match self {
             Self::English => "en",
             Self::Arabic => "ar",
+            // YouTube's language code for Brazilian Portuguese.
+            Self::Portuguese => "pt",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::English => "English",
             Self::Arabic => "العربية",
+            Self::Portuguese => "Português (Brasil)",
         }
     }
     pub fn from_key(key: &str) -> Self {
-        if key == "ar" {
-            Self::Arabic
-        } else {
-            Self::English
+        match key {
+            "ar" => Self::Arabic,
+            "pt" => Self::Portuguese,
+            _ => Self::English,
         }
     }
 }
 
 pub fn set_language(language: Language) {
-    ARABIC.store(language == Language::Arabic, Ordering::Relaxed);
+    LANGUAGE.store(language as u8, Ordering::Relaxed);
 }
 
 pub fn tr(text: &str) -> &str {
-    if !ARABIC.load(Ordering::Relaxed) {
-        return text;
+    const ARABIC: u8 = Language::Arabic as u8;
+    const PORTUGUESE: u8 = Language::Portuguese as u8;
+    match LANGUAGE.load(Ordering::Relaxed) {
+        ARABIC => arabic(text),
+        PORTUGUESE => crate::i18n_pt::translate(text),
+        _ => text,
     }
+}
+
+fn arabic(text: &str) -> &str {
     match text {
         "Home" => "الرئيسية",
         "Subscriptions" => "الاشتراكات",
@@ -236,6 +247,34 @@ pub fn layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portuguese_covers_every_interface_text() {
+        let source = include_str!("i18n.rs");
+        let start = source.find("fn arabic(text").unwrap();
+        let end = start + source[start..].find("_ => text,").unwrap();
+        let keys: Vec<&str> = source[start..end]
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix('"')?.split_once("\" =>"))
+            .map(|(key, _)| key)
+            .collect();
+        assert!(keys.len() > 100);
+        let same_in_both = ["Playlists", "Buffer", "Shorts", "Short"];
+        for key in keys {
+            assert!(
+                crate::i18n_pt::translate(key) != key || same_in_both.contains(&key),
+                "no Portuguese for {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn language_keys_round_trip() {
+        for language in Language::ALL {
+            assert_eq!(Language::from_key(language.key()), language);
+        }
+        assert_eq!(Language::from_key("xx"), Language::English);
+    }
 
     #[test]
     fn rendered_arabic_and_mixed_text_follow_visual_order() {

@@ -57,7 +57,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne quatro frentes de mudanças volt
 
 ## Idiomas
 
-Em **Settings → Playback → Interface language → العربية** é possível usar a interface em árabe. Títulos e buscas em árabe também funcionam corretamente com a interface em inglês, e o teclado virtual inclui layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
+Em **Settings → Playback → Interface language** é possível escolher **Português (Brasil)** ou **العربية** (árabe). Os controles sobre o vídeo continuam em inglês. Títulos e buscas em árabe também funcionam corretamente com a interface em inglês, e o teclado virtual inclui layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
 
 ## Compilação e instalação
 

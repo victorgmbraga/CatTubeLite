@@ -7,6 +7,7 @@
 
 mod canvas;
 mod i18n;
+mod i18n_pt;
 mod icons;
 mod images;
 mod jobs;
