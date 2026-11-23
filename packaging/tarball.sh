@@ -17,6 +17,7 @@ install -Dm644 packaging/io.github.coderastic.CatTube.svg "$D/share/icons/hicolo
 install -Dm644 packaging/io.github.coderastic.CatTube.metainfo.xml "$D/share/metainfo/io.github.coderastic.CatTube.metainfo.xml"
 install -Dm755 packaging/install.sh "$D/install.sh"
 install -Dm644 README.md "$D/README.md"
+install -Dm644 README.pt-BR.md "$D/README.pt-BR.md"
 install -Dm644 LICENSE "$D/LICENSE"
 install -Dm644 assets/fonts/LICENSE-Inter.txt "$D/LICENSE-Inter.txt"
 install -Dm644 assets/fonts/LICENSE-NotoSansArabic.txt "$D/LICENSE-NotoSansArabic.txt"
