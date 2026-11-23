@@ -732,6 +732,9 @@ pub fn keyboard<H: Copy>(
 /// whole thing rotates, drawn as a gentle wave around the circle.
 pub fn spinner<H: Copy>(c: &Canvas<H>, x: f32, y: f32, r: f32, now: f64) {
     use std::f32::consts::TAU;
+    use std::time::Duration;
+    let interval = if c.reduce_motion { 100 } else { 33 };
+    c.ctx.request_repaint_after(Duration::from_millis(interval));
     let period = 1.6_f64;
     let cycle = (now / period).floor() as f32;
     let p = ((now % period) / period) as f32;
@@ -747,7 +750,7 @@ pub fn spinner<H: Copy>(c: &Canvas<H>, x: f32, y: f32, r: f32, now: f64) {
     let stroke = (r * 0.2).max(2.5);
     let amp = r * 0.07;
     let waves = 9.0;
-    let steps = 48;
+    let steps = if c.reduce_motion { 16 } else { 48 };
     let pts: Vec<(f32, f32)> = (0..=steps)
         .map(|i| {
             let a = a0 + (a1 - a0) * i as f32 / steps as f32;

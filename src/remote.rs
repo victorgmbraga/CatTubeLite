@@ -552,8 +552,10 @@ impl Remote {
         // A player the app started is told to close too (one screen).
         let _ = mpv::ipc_request(&player::player_socket(), &[Arg::Str("quit")]);
         let p = prefs::load(&self.config);
+        let low_power = cattube_core::env::low_power();
         let (r, g, b) = theme::accent_rgb_of(&p.accent);
         let o = PlayOptions {
+            low_power,
             video_id: id.clone(),
             title: String::new(),
             start,
@@ -583,6 +585,7 @@ impl Remote {
         let seq = self.seq;
         let accounts = account::load(&self.config);
         let s = yt::Session {
+            low_power,
             ctx: ytc::context("en", &p.region),
             refresh: accounts.active().map(|a| a.refresh_token.clone()),
             cache: self.cache.clone(),

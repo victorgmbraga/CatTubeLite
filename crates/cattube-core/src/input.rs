@@ -155,7 +155,7 @@ impl InputMapper {
                 self.long_fired = false;
             } else if !pressed {
                 if self.ok_down_at.is_some() && !self.long_fired {
-                    out.push(Action::Ok);
+                    out.push(self.tick(now).unwrap_or(Action::Ok));
                 }
                 self.ok_down_at = None;
                 self.long_fired = false;
@@ -186,7 +186,7 @@ impl InputMapper {
 
     fn tick(&mut self, now: f64) -> Option<Action> {
         match self.ok_down_at {
-            Some(t) if !self.long_fired && now - t >= LONG_PRESS_SECS => {
+            Some(t) if !self.long_fired && now >= t + LONG_PRESS_SECS => {
                 self.long_fired = true;
                 Some(Action::OkLong)
             }
@@ -194,10 +194,11 @@ impl InputMapper {
         }
     }
 
-    /// True while OK is held and a long press could still fire; the GUI
-    /// should keep repainting so [`InputMapper::map`] is called again.
-    pub fn needs_tick(&self) -> bool {
-        self.ok_down_at.is_some() && !self.long_fired
+    /// Time to call [`InputMapper::map`] again if OK is still held.
+    pub fn long_press_deadline(&self) -> Option<f64> {
+        self.ok_down_at
+            .filter(|_| !self.long_fired)
+            .map(|at| at + LONG_PRESS_SECS)
     }
 
     /// Forget any held key. Call when the window loses focus (for example
@@ -226,12 +227,12 @@ mod tests {
     fn tap_enter_is_ok_on_release() {
         let mut m = InputMapper::new();
         assert_eq!(m.map(&[InputEvent::press(Enter)], 0.0, false), vec![]);
-        assert!(m.needs_tick());
+        assert!(m.long_press_deadline().is_some());
         assert_eq!(
             m.map(&[InputEvent::release(Enter)], 0.1, false),
             vec![Action::Ok]
         );
-        assert!(!m.needs_tick());
+        assert!(m.long_press_deadline().is_none());
     }
 
     #[test]
@@ -252,6 +253,18 @@ mod tests {
         );
         assert_eq!(m.map(&[InputEvent::repeat(Enter)], 1.5, false), vec![]);
         assert_eq!(m.map(&[InputEvent::release(Enter)], 1.6, false), vec![]);
+    }
+
+    #[test]
+    fn release_at_deadline_fires_long_press_even_without_a_timer_frame() {
+        let mut m = InputMapper::new();
+        m.map(&[InputEvent::press(Enter)], 1.0, false);
+        let deadline = m.long_press_deadline().unwrap();
+        assert_eq!(
+            m.map(&[InputEvent::release(Enter)], deadline, false),
+            vec![Action::OkLong]
+        );
+        assert!(m.long_press_deadline().is_none());
     }
 
     #[test]

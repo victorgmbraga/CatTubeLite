@@ -1,6 +1,6 @@
 //! Drawing for CatTube's screens: pure presentation of
 //! `cattube_core::tube::Tube`. Pictures come from YouTube through the app's
-//! image cache ([`Pics`]).
+//! image cache ([`Images`]).
 //!
 //! The look follows CatosTV rather than YouTube's own TV app: the focused
 //! video large over its own picture, a frosted pill tab bar whose accent
@@ -22,19 +22,10 @@ use cattube_core::player;
 use cattube_core::scan::Scan;
 use cattube_core::tube::{self, MenuItem, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{Kind, Page, Tile};
-use eframe::egui::{self, Align2, Color32, Rect, TextureId};
-use std::cell::RefCell;
+use eframe::egui::{self, Align2, Color32, Rect};
 use std::collections::HashMap;
 
 type C = Canvas<Target>;
-
-/// Pictures: URL → cached file (`None` = failed), and the URLs the frame
-/// wanted but did not have (the app downloads them).
-pub struct Pics<'a> {
-    pub images: &'a Images,
-    pub cache: &'a HashMap<String, Option<String>>,
-    pub wanted: &'a RefCell<Vec<String>>,
-}
 
 /// The part of a video's picture to show in a 16:9 card: YouTube's 4:3
 /// pictures (hqdefault, sddefault) carry the video letterboxed, with black
@@ -56,39 +47,12 @@ pub fn crop_16_9(size: Option<[usize; 2]>) -> Rect {
     }
 }
 
-impl Pics<'_> {
-    /// How big a picture is, once loaded.
-    pub fn size(&self, url: &str) -> Option<[usize; 2]> {
-        match self.cache.get(url) {
-            Some(Some(path)) => self.images.size(path),
-            _ => None,
-        }
-    }
-
-    pub fn get(&self, c: &C, url: &str) -> Option<TextureId> {
-        if url.is_empty() {
-            return None;
-        }
-        match self.cache.get(url) {
-            Some(Some(path)) => self.images.get(&c.ctx, path),
-            Some(None) => None,
-            None => {
-                let mut w = self.wanted.borrow_mut();
-                if !w.iter().any(|u| u == url) {
-                    w.push(url.to_string());
-                }
-                None
-            }
-        }
-    }
-}
-
 /// Everything the screens draw from.
 pub struct View<'a> {
     pub tube: &'a Tube,
     pub accounts: &'a Accounts,
     pub prefs: &'a Prefs,
-    pub pics: &'a Pics<'a>,
+    pub pics: &'a Images,
     pub positions: &'a [(String, f64)],
     pub votes: &'a HashMap<String, (u64, u64)>,
     pub tools: &'a Scan<String>,
@@ -274,7 +238,7 @@ fn backdrop(c: &C, v: &View, tile: Option<&Tile>) {
         .map(|t| t.thumb.clone())
         .filter(|u| !u.is_empty())
         .map(|u| format!("{u}#blur"));
-    let tex = url.as_deref().and_then(|u| v.pics.get(c, u));
+    let tex = url.as_deref().and_then(|u| v.pics.get(&c.ctx, u, false));
     let now = c.ctx.input(|i| i.time);
     let shown: (Option<String>, Option<String>, f64) = c.remember("tube-bd", |old| {
         let (cur, prev, since) = old.unwrap_or((None, None, now));
@@ -294,11 +258,15 @@ fn backdrop(c: &C, v: &View, tile: Option<&Tile>) {
         .1
         .as_deref()
         .filter(|_| k < 1.0)
-        .and_then(|p| v.pics.get(c, p))
+        .and_then(|p| v.pics.get(&c.ctx, p, false))
     {
         c.image(full, t, Color32::from_white_alpha(150));
     }
-    if let Some(t) = shown.0.as_deref().and_then(|p| v.pics.get(c, p)) {
+    if let Some(t) = shown
+        .0
+        .as_deref()
+        .and_then(|p| v.pics.get(&c.ctx, p, false))
+    {
         let drift = ((now * 0.08).sin() * 6.0) as f32;
         c.image(
             c.r(-20.0 + drift, -12.0, 1320.0, 744.0),
@@ -405,7 +373,7 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         .active()
         .map(|a| a.photo.clone())
         .unwrap_or_default();
-    match v.pics.get(c, &photo) {
+    match v.pics.get(&c.ctx, &photo, false) {
         Some(tex) => c.image_rounded(
             c.r(x + 11.0, cy - 15.0, 30.0, 30.0),
             15.0,
@@ -466,14 +434,13 @@ fn resumed(v: &View, t: &Tile) -> Option<f32> {
 
 /// A 16:9 card with its picture, the badge (length, LIVE), the watched
 /// line, and the title and channel under it.
-#[allow(clippy::too_many_arguments)]
-fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
-    let rect = widgets::lifted(c, c.r(x, y, w, h), focus);
+fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
+    let rect = widgets::lifted(c, c.r(x, y, CARD_W, CARD_H), focus);
     widgets::focus_lift(c, rect, RADIUS, focus);
     c.fill(rect, RADIUS, theme::rgba(theme::BG_TOP, 220));
     let (rx, ry) = c.to_design(rect.min);
     let (rw, rh) = c.dsize(rect);
-    match (t.kind, v.pics.get(c, &t.thumb)) {
+    match (t.kind, v.pics.get(&c.ctx, &t.thumb, focused)) {
         // Channels: their round picture on a soft card.
         (Kind::Channel, tex) => {
             c.fill(rect, RADIUS, theme::glass());
@@ -495,7 +462,7 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
             let k = c.appear(("tube-pic", &t.thumb), 0.3);
             let tint = Color32::from_gray((255.0 * k) as u8);
             let soft = (!theme::FLAT)
-                .then(|| v.pics.get(c, &format!("{}#blur", t.thumb)))
+                .then(|| v.pics.get(&c.ctx, &format!("{}#blur", t.thumb), false))
                 .flatten();
             match soft {
                 Some(soft) => c.image_rounded(rect, RADIUS, soft, tint),
@@ -604,8 +571,8 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
     }
     // Title (two lines at most) and channel under the card.
     let ink = widgets::mix(theme::text2(), theme::text(), focus);
-    let (l1, l2) = two_lines(c, &t.title, w, 15.0);
-    let ty = y + h + 20.0;
+    let (l1, l2) = two_lines(c, &t.title, CARD_W, 15.0);
+    let ty = y + CARD_H + 20.0;
     c.text(x, ty, Align2::LEFT_TOP, &l1, 15.0, ink, Weight::Semibold);
     if !l2.is_empty() {
         c.text(
@@ -627,7 +594,7 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
         x,
         ty + if l2.is_empty() { 20.0 } else { 39.0 },
         Align2::LEFT_TOP,
-        &c.fit(&sub, w, 13.0, Weight::Regular),
+        &c.fit(&sub, CARD_W, 13.0, Weight::Regular),
         13.0,
         theme::text3(),
         Weight::Regular,
@@ -770,8 +737,9 @@ fn rows(
             if x > 1280.0 || x + CARD_W < 0.0 {
                 continue;
             }
-            let f = focus_t(&list, (id, "card", ri, ci), row_focus && col == ci);
-            card(&list, v, t, x, y + 36.0, CARD_W, CARD_H, f);
+            let focused = row_focus && col == ci;
+            let f = focus_t(&list, (id, "card", ri, ci), focused);
+            card(&list, v, t, x, y + 36.0, f, focused);
             if hit && y + 36.0 > clip_top && y + 36.0 + CARD_H < bottom {
                 list.hit(list.r(x, y + 36.0, CARD_W, CARD_H), Target::Tube(ri, ci));
             }
@@ -1121,7 +1089,7 @@ fn draw_menu(
     let m = widgets::modal(c, 620.0, h.min(660.0));
     let (mx, my) = c.to_design(m.min);
     // The video: its picture, title, channel, counts.
-    if let Some(tex) = v.pics.get(c, &tile.thumb) {
+    if let Some(tex) = v.pics.get(&c.ctx, &tile.thumb, true) {
         c.image_rounded_uv(
             c.r(mx + 32.0, my + 32.0, 192.0, 108.0),
             12.0,

@@ -30,7 +30,6 @@ use cattube_core::tube::{Ctx, Effect, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{self as ytc, Details, Page, Tile};
 use eframe::egui;
 use jobs::Jobs;
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Child;
@@ -54,7 +53,7 @@ enum Msg {
     Done(String),
     /// A background job with nothing to show.
     Quiet,
-    Image(String, Option<String>),
+    Image(String, Option<egui::ColorImage>),
     Tools(Result<String, String>),
     /// A player ended: its number (see `App::player_seq`) and what it saw.
     PlaybackDone(u64, yt::Ended),
@@ -79,9 +78,8 @@ struct App {
     closing: Option<Instant>,
     hits: Vec<(egui::Rect, Target)>,
     images: images::Images,
-    pictures: HashMap<String, Option<String>>,
-    wanted: RefCell<Vec<String>>,
     fetching: HashSet<String>,
+    low_power: bool,
     toast: Option<(String, Instant)>,
     /// Bumped to stop waiting for a sign-in code.
     sign_in_wait: Arc<AtomicU64>,
@@ -112,6 +110,7 @@ impl App {
         let cache = cattube_core::env::cache_dir();
         let data = player::data_home();
         let prefs = prefs::load(&config);
+        let low_power = cattube_core::env::low_power();
         theme::set_accent(&prefs.accent);
         i18n::set_language(prefs.language);
         let accounts = account::load(&config);
@@ -146,10 +145,9 @@ impl App {
             pointer_at: None,
             closing: None,
             hits: Vec::new(),
-            images: images::Images::new(),
-            pictures: HashMap::new(),
-            wanted: RefCell::new(Vec::new()),
+            images: images::Images::new(low_power),
             fetching: HashSet::new(),
+            low_power,
             toast: None,
             sign_in_wait: Arc::new(AtomicU64::new(0)),
             player: None,
@@ -627,6 +625,7 @@ impl App {
             self.resume_at(&tile.id).unwrap_or(0.0)
         };
         let o = PlayOptions {
+            low_power: self.low_power,
             video_id: tile.id.clone(),
             title: tile.title.clone(),
             start,
@@ -654,6 +653,7 @@ impl App {
                 let (htx, hctx) = self.jobs.sender();
                 let (vtx, vctx) = self.jobs.sender();
                 let s = yt::Session {
+                    low_power: self.low_power,
                     ctx: self.yt_ctx(),
                     refresh: self.refresh(),
                     cache: self.cache.clone(),
@@ -786,9 +786,9 @@ impl App {
             }
             Msg::Done(t) => self.toast(ctx, &t),
             Msg::Quiet => {}
-            Msg::Image(url, path) => {
+            Msg::Image(url, image) => {
                 self.fetching.remove(&url);
-                self.pictures.insert(url, path);
+                self.images.complete(url, image, ctx.cumulative_frame_nr());
             }
             Msg::Tools(r) => {
                 self.tools = match r {
@@ -895,42 +895,26 @@ impl App {
     }
 
     fn fetch_pictures(&mut self) {
-        let wanted = std::mem::take(&mut *self.wanted.borrow_mut());
-        for url in wanted {
-            if self.pictures.contains_key(&url)
-                || self.fetching.contains(&url)
-                || self.fetching.len() >= 8
-            {
+        let parallel = if self.low_power { 2 } else { 4 };
+        let max_side = if self.low_power { 320 } else { 640 };
+        for url in self.images.take_wanted() {
+            if self.fetching.len() >= parallel {
+                break;
+            }
+            if !self.fetching.insert(url.clone()) {
                 continue;
             }
-            self.fetching.insert(url.clone());
             let cache = self.cache.clone();
-            self.jobs.spawn(move || {
-                let path = yt::fetch_image(&cache, &url);
-                Msg::Image(url, path)
-            });
+            let requested = url.clone();
+            if !self.jobs.try_spawn(move || {
+                let image = yt::fetch_image(&cache, &requested)
+                    .and_then(|path| images::decode(&path, max_side));
+                Msg::Image(requested, image)
+            }) {
+                self.fetching.remove(&url);
+                self.images.complete(url, None, 0);
+            }
         }
-    }
-
-    fn loading(&self) -> bool {
-        matches!(self.tube.current(), Some(Scan::Busy))
-            || matches!(self.tools, Scan::Busy)
-            || matches!(
-                self.tube.screen(),
-                Some(
-                    Screen::Page {
-                        page: Scan::Busy,
-                        ..
-                    } | Screen::Search {
-                        results: Scan::Busy,
-                        ..
-                    } | Screen::SignIn { .. }
-                        | Screen::Menu {
-                            details: Scan::Busy,
-                            ..
-                        }
-                )
-            )
     }
 }
 
@@ -972,18 +956,16 @@ impl eframe::App for App {
             self.mapper.reset();
         }
         self.was_focused = focused;
+        let now = keys::now(&ctx);
         let events = keys::collect(&ctx);
-        let mut actions = self
-            .mapper
-            .map(&events, keys::now(&ctx), self.tube.text_mode());
+        let mut actions = self.mapper.map(&events, now, self.tube.text_mode());
         let mut p = self.pointer.collect(&ctx);
         if self.closing.is_some() {
             actions.clear();
             p = Default::default();
         }
         let c = self.ctx();
-        let positions = self.positions.clone();
-        let resumable = move |id: &str| positions.iter().any(|(x, _)| x == id);
+        let resumable = |id: &str| self.positions.iter().any(|(x, _)| x == id);
         let mut effects = Vec::new();
         for action in actions {
             effects.extend(self.tube.handle(action, c, &resumable));
@@ -1035,23 +1017,18 @@ impl eframe::App for App {
         for e in effects {
             self.effect(&ctx, e);
         }
-        if self.mapper.needs_tick() {
-            ctx.request_repaint();
+        if let Some(deadline) = self.mapper.long_press_deadline() {
+            ctx.request_repaint_after(Duration::from_secs_f64((deadline - now).max(0.0)));
         }
 
-        let canvas: Canvas<Target> = Canvas::new(ui, 0);
-        let now = keys::now(&ctx);
+        let mut canvas: Canvas<Target> = Canvas::new(ui, 0);
+        canvas.reduce_motion = self.low_power;
         canvas.background_at(None, false, now);
-        let pics = ui::tube::Pics {
-            images: &self.images,
-            cache: &self.pictures,
-            wanted: &self.wanted,
-        };
         let view = ui::tube::View {
             tube: &self.tube,
             accounts: &self.accounts,
             prefs: &self.prefs,
-            pics: &pics,
+            pics: &self.images,
             positions: &self.positions,
             votes: &self.votes,
             tools: &self.tools,
@@ -1065,13 +1042,25 @@ impl eframe::App for App {
         }
         if let Some((text, until)) = &self.toast {
             let left = until.saturating_duration_since(at).as_secs_f32();
-            widgets::toast(&canvas, text, (left / 0.3).clamp(0.0, 1.0));
+            const FADE: f32 = 0.3;
+            let opacity = if self.low_power {
+                1.0
+            } else {
+                (left / FADE).min(1.0)
+            };
+            widgets::toast(&canvas, text, opacity);
+            let next = if self.low_power {
+                left
+            } else if left > FADE {
+                left - FADE
+            } else {
+                left.min(0.016)
+            };
+            ctx.request_repaint_after(Duration::from_secs_f32(next));
         }
         self.hits = canvas.take_hits();
+        self.images.trim();
         self.fetch_pictures();
-        if self.toast.is_some() || self.loading() || !self.fetching.is_empty() {
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
         if let Some(since) = self.closing {
             const FADE: f32 = 0.22;
             let t = (since.elapsed().as_secs_f32() / FADE).min(1.0);

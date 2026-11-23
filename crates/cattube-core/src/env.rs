@@ -55,3 +55,12 @@ pub fn data_dir() -> PathBuf {
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// Use the TV-box defaults on ARM64, with an override for any machine.
+pub fn low_power() -> bool {
+    match std::env::var("CATTUBE_LOW_POWER").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(target_arch = "aarch64"),
+    }
+}
