@@ -52,7 +52,8 @@ local saved_at = -10
 local function checkpoint(force, finished)
     if opts.position_dir == "" then return end
     local at = mp.get_time()
-    if not force and at - saved_at < 2 then return end
+    local min_gap = opts.low_power and 10 or 5
+    if not force and at - saved_at < min_gap then return end
     local path = mp.get_property("path", "")
     local id = path:match("[?&]v=([%w_-]+)") or path:match("youtu%.be/([%w_-]+)") or current_video
     if #id ~= 11 or id:find("[^%w_-]") then return end
@@ -290,17 +291,26 @@ local function render()
 
     local a = assdraw.ass_new()
     -- The picture darkens towards the bottom so the controls read on
-    -- anything: a wide soft fade, then a deeper band behind the buttons.
-    a:new_event()
-    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur140\\1c&H000000&\\1a&H60&}")
-    a:draw_start()
-    a:rect_cw(-200, 700, W + 200, H + 200)
-    a:draw_stop()
-    a:new_event()
-    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur70\\1c&H000000&\\1a&H50&}")
-    a:draw_start()
-    a:rect_cw(-200, 880, W + 200, H + 200)
-    a:draw_stop()
+    -- anything: a wide soft fade on desktop, or flat scrim bands on low-power
+    -- boxes to avoid expensive CPU libass Gaussian blurs on every tick.
+    if opts.low_power then
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H40&}")
+        a:draw_start()
+        a:rect_cw(0, 720, W, H)
+        a:draw_stop()
+    else
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur140\\1c&H000000&\\1a&H60&}")
+        a:draw_start()
+        a:rect_cw(-200, 700, W + 200, H + 200)
+        a:draw_stop()
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur70\\1c&H000000&\\1a&H50&}")
+        a:draw_start()
+        a:rect_cw(-200, 880, W + 200, H + 200)
+        a:draw_stop()
+    end
     -- Title: "Series · S1:E3 · Name" becomes a small "Series · S1:E3"
     -- over the episode's name.
     local title_clean = clean(title)
@@ -1110,9 +1120,9 @@ local function card_move(dir)
     render()
 end
 
--- Every key counts as "someone is watching".
+-- Keep input handling local to the OSD without waking the Rust IPC loop on
+-- every arrow press.
 local function notify()
-    mp.commandv("script-message", "cattube-input")
 end
 
 local function stop_timers()
@@ -1533,16 +1543,17 @@ end
 local function on_back()
     if vol then vol_key("back"); return end
     notify()
-    checkpoint(true, false)
     if card then card_result("cancel"); return end
     if related_key("back") then return end
     if menu then menu = nil; render(); return end
     if shown then
         hide()
     elseif opts.hide == "yes" then
+        checkpoint(true, false)
         -- CatTube puts its list over the video, which plays on.
         mp.commandv("script-message", "cattube-hide")
     else
+        checkpoint(true, false)
         mp.commandv("quit")
     end
 end
@@ -1583,7 +1594,7 @@ local loading_timer = nil
 local loading_since = mp.get_time()
 
 local function arc_ring(a, cx, cy, r_out, r_in, from, to)
-    local steps = 40
+    local steps = opts.low_power and 16 or 40
     a:move_to(cx + r_out * math.cos(from), cy + r_out * math.sin(from))
     for i = 1, steps do
         local t = from + (to - from) * i / steps
@@ -1647,7 +1658,9 @@ end)
 mp.register_event("seek", function()
     if last_point then last_point.finished = false end
 end)
-mp.observe_property("time-pos", "number", function() checkpoint(false, false) end)
+mp.add_periodic_timer(opts.low_power and 10 or 5, function()
+    if not mp.get_property_bool("pause", false) then checkpoint(false, false) end
+end)
 mp.observe_property("pause", "bool", function() checkpoint(true, false) end)
 mp.register_event("playback-restart", function() checkpoint(true, false) end)
 mp.observe_property("paused-for-cache", "bool", function(_, waiting)

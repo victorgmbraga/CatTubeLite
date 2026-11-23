@@ -78,6 +78,11 @@ pub fn bar_pill<H: Copy>(c: &Canvas<H>, rect: Rect, radius: f32, t: f32) {
     if t > 0.01 {
         c.soft_shadow(rect, radius, 18.0, 2.0, theme::accent_a((130.0 * t) as u8));
     }
+    if theme::FLAT {
+        let fill = mix(theme::rgba(theme::WHITE, 40), theme::accent(), t);
+        c.fill(rect, radius, fill);
+        return;
+    }
     c.fill(
         rect,
         radius,
@@ -217,13 +222,14 @@ pub fn tab_width<H: Copy>(c: &Canvas<H>, label: &str) -> f32 {
 /// otherwise on `selected` (the page you are on). Returns each tab's
 /// rect, for hit areas.
 #[allow(clippy::too_many_arguments)]
-pub fn tab_bar<H: Copy>(
+pub fn tab_bar_with_widths<H: Copy>(
     c: &Canvas<H>,
     id: impl std::hash::Hash + std::fmt::Debug + Copy,
     cx: f32,
     y: f32,
     h: f32,
     labels: &[&str],
+    widths: &[f32],
     selected: Option<usize>,
     focus: Option<usize>,
     // Focus is on another control of the same bar (the account button):
@@ -231,7 +237,6 @@ pub fn tab_bar<H: Copy>(
     // is still there.
     elsewhere: bool,
 ) -> Vec<Rect> {
-    let widths: Vec<f32> = labels.iter().map(|l| tab_width(c, l)).collect();
     let pad = 6.0;
     let total: f32 = widths.iter().sum::<f32>() + pad * (widths.len() as f32 + 1.0);
     let nav = c.r(cx - total / 2.0, y, total, h);
@@ -242,7 +247,7 @@ pub fn tab_bar<H: Copy>(
     }
     let mut rects = Vec::with_capacity(labels.len());
     let mut x = cx - total / 2.0 + pad;
-    for w in &widths {
+    for w in widths {
         rects.push(c.r(x, y + pad, *w, h - 2.0 * pad));
         x += w + pad;
     }
@@ -350,10 +355,15 @@ fn list_row_focus<H: Copy>(c: &Canvas<H>, rect: Rect, row: &ListRow, t: f32, own
     let radius = ROW_RADIUS;
     // Resting glass: a faint pane and hairline (no outer glow, no
     // lift; the focus stays inside the row and the panel).
-    c.fill(rect, radius, theme::rgba(theme::WHITE, 12));
-    c.outline(rect, radius, 1.0, theme::rgba(theme::WHITE, 14));
-    if own_focus {
+    if theme::FLAT && own_focus && t > 0.01 {
         focus_pill(c, rect, radius, t);
+        c.outline(rect, radius, 1.0, theme::rgba(theme::WHITE, 14));
+    } else {
+        c.fill(rect, radius, theme::rgba(theme::WHITE, 12));
+        c.outline(rect, radius, 1.0, theme::rgba(theme::WHITE, 14));
+        if own_focus {
+            focus_pill(c, rect, radius, t);
+        }
     }
     let (x, y) = c.to_design(rect.min);
     let (w, h) = c.dsize(rect);
@@ -379,10 +389,15 @@ fn list_row_focus<H: Copy>(c: &Canvas<H>, rect: Rect, row: &ListRow, t: f32, own
         );
         tx = x + 36.0 + 2.0 * r;
     }
+    let vw = if row.value.is_empty() {
+        0.0
+    } else {
+        c.text_width(row.value, 15.0, Weight::Medium)
+    };
     let value_w = if row.value.is_empty() {
         0.0
     } else {
-        c.text_width(row.value, 15.0, Weight::Medium) + 24.0
+        vw + 24.0
     };
     let right_w = match row.kind {
         Some(RowKind::Toggle(_)) => 64.0,
@@ -439,7 +454,6 @@ fn list_row_focus<H: Copy>(c: &Canvas<H>, rect: Rect, row: &ListRow, t: f32, own
             };
             icons::draw(c, "chevron", rx - 6.0, cy, 13.0, col);
             value_text(c, rx - 22.0, col);
-            let vw = c.text_width(row.value, 15.0, Weight::Medium);
             icons::draw(c, "back", rx - 36.0 - vw, cy, 13.0, col);
         }
         Some(RowKind::Action) => {
@@ -461,7 +475,9 @@ fn list_row_focus<H: Copy>(c: &Canvas<H>, rect: Rect, row: &ListRow, t: f32, own
 fn primary_row<H: Copy>(c: &Canvas<H>, rect: Rect, row: &ListRow, t: f32) {
     let radius = ROW_RADIUS;
     let accent = theme::accent_rgb();
-    c.fill(rect, radius, theme::rgba(theme::BG_TOP, 120));
+    if !theme::FLAT {
+        c.fill(rect, radius, theme::rgba(theme::BG_TOP, 120));
+    }
     c.fill(rect, radius, theme::rgba(accent, lerp(46, 92, t)));
     c.frost_edge(rect, radius, 1.0 + t);
     c.outline(
@@ -547,7 +563,9 @@ pub fn text_field<H: Copy>(
     if focused {
         c.shadow(rect, radius, 0.0, 30.0, theme::accent_a(55));
     }
-    c.fill(rect, radius, theme::rgba(theme::BLACK, 70));
+    if !theme::FLAT {
+        c.fill(rect, radius, theme::rgba(theme::BLACK, 70));
+    }
     c.fill(
         rect,
         radius,

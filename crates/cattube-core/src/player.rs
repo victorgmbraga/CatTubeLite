@@ -11,6 +11,7 @@
 //! yt-dlp falls back to the next best format when that one is missing.
 
 use crate::process::Cmd;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -254,7 +255,19 @@ pub fn mpv_argv(
     .map(|s| s.to_string())
     .collect();
     if o.low_power {
-        v.push("--hwdec=auto-safe".into());
+        v.extend(
+            [
+                "--hwdec=auto-safe",
+                "--profile=fast",
+                "--scale=bilinear",
+                "--cscale=bilinear",
+                "--dscale=bilinear",
+                "--dither-depth=no",
+                "--deband=no",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
     }
     v.push(format!(
         "--demuxer-max-bytes={}MiB",
@@ -446,8 +459,12 @@ pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
 }
 
 /// Player checkpoints take precedence over the older watcher snapshots.
-pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
-    let mut list = std::fs::read_to_string(data.join("positions.conf"))
+/// Returns both the ordered resume list (newest last) and the raw checkpoints
+/// read from `positions/` in a single pass.
+pub fn load_positions_and_checkpoints(
+    data: &Path,
+) -> (Vec<(String, f64)>, HashMap<String, Checkpoint>) {
+    let base = std::fs::read_to_string(data.join("positions.conf"))
         .map(|s| parse_positions(&s))
         .unwrap_or_default();
     let mut files: Vec<_> = std::fs::read_dir(data.join("positions"))
@@ -471,19 +488,43 @@ pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
     for (_, _, path) in files.drain(..stale) {
         let _ = std::fs::remove_file(path);
     }
+    // Track newest order index per video id in O(N) instead of O(N^2) Vec::retain.
+    let mut order: HashMap<String, (usize, f64)> =
+        HashMap::with_capacity(base.len() + files.len());
+    let mut seq = 0usize;
+    for (id, pos) in base {
+        order.insert(id, (seq, pos));
+        seq += 1;
+    }
+    let mut checkpoints = HashMap::with_capacity(files.len());
     for (_, id, _) in files {
         if let Some(point) = checkpoint(data, &id) {
+            checkpoints.insert(id.clone(), point);
             if point.finished {
-                list.retain(|(video, _)| *video != id);
+                order.remove(&id);
+            } else if point.position.is_finite() && point.position > 0.0 {
+                order.insert(id, (seq, point.position));
+                seq += 1;
             } else {
-                remember(&mut list, &id, point.position, point.duration);
+                order.remove(&id);
             }
         }
     }
-    if list.len() > MAX_POSITIONS {
-        list.drain(..list.len() - MAX_POSITIONS);
+    let mut entries: Vec<(usize, String, f64)> = order
+        .into_iter()
+        .map(|(id, (idx, pos))| (idx, id, pos))
+        .collect();
+    entries.sort_unstable_by_key(|(idx, _, _)| *idx);
+    if entries.len() > MAX_POSITIONS {
+        entries.drain(..entries.len() - MAX_POSITIONS);
     }
-    list
+    let list = entries.into_iter().map(|(_, id, p)| (id, p)).collect();
+    (list, checkpoints)
+}
+
+/// Player checkpoints take precedence over the older watcher snapshots.
+pub fn load_positions(data: &Path) -> Vec<(String, f64)> {
+    load_positions_and_checkpoints(data).0
 }
 
 #[cfg(test)]
@@ -588,6 +629,9 @@ mod tests {
         assert!(!v2.iter().any(|a| a.starts_with("--start")));
         assert!(!v2.iter().any(|a| a.starts_with("--ytdl-raw-options")));
         assert!(v2.iter().any(|a| a == "--hwdec=auto-safe"));
+        assert!(v2.iter().any(|a| a == "--profile=fast"));
+        assert!(v2.iter().any(|a| a == "--scale=bilinear"));
+        assert!(v2.iter().any(|a| a == "--dither-depth=no"));
         assert!(v2.iter().any(|a| a.contains("cattube_osd-low_power=yes")));
         assert!(
             v2.iter()
@@ -651,8 +695,11 @@ mod tests {
             "1000.000 1000.000 1\n",
         )
         .unwrap();
-        let loaded = load_positions(&root);
+        let (loaded, checkpoints) = load_positions_and_checkpoints(&root);
         assert_eq!(loaded, vec![("WhWc3b3KhnY".into(), 123.456)]);
+        assert_eq!(checkpoints.len(), 2);
+        assert!(checkpoints["B4EPW7JUMTM"].finished);
+        assert_eq!(checkpoints["WhWc3b3KhnY"].duration, Some(130.0));
         assert_eq!(parse_positions(&positions_text(&loaded)), loaded);
         std::fs::write(root.join("positions/WhWc3b3KhnY.pos"), "0.500 20.000 0\n").unwrap();
         assert_eq!(load_positions(&root), vec![("WhWc3b3KhnY".into(), 0.5)]);

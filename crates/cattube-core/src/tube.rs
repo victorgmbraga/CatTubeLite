@@ -586,7 +586,6 @@ impl Tube {
         if self.header && matches!(self.stack.last(), Some(Screen::Search { .. })) {
             return self.handle_search_header(action, ctx);
         }
-        let recent = self.recent.clone();
         let Some(screen) = self.stack.last_mut() else {
             return vec![Effect::Close];
         };
@@ -598,7 +597,6 @@ impl Tube {
                 cols,
                 browse_id,
             } => {
-                let pg = page.items().first().cloned();
                 let id = browse_id.clone();
                 match action {
                     Action::Back => self.back(),
@@ -607,8 +605,10 @@ impl Tube {
                         vec![Effect::Load(id)]
                     }
                     a => {
-                        let Some(p) = pg else { return vec![] };
-                        match rows_move(&p, row, cols, a) {
+                        let Some(p) = page.items().first() else {
+                            return vec![];
+                        };
+                        match rows_move(p, row, cols, a) {
                             RowMove::Open(t) => self.open_tile(t),
                             RowMove::Menu(t) => self.open_menu(t),
                             RowMove::More(tok) => vec![Effect::LoadMore {
@@ -632,7 +632,7 @@ impl Tube {
                 ..
             } => {
                 if *in_results {
-                    let Some(p) = results.items().first().cloned() else {
+                    let Some(p) = results.items().first() else {
                         *in_results = false;
                         return vec![];
                     };
@@ -642,7 +642,7 @@ impl Tube {
                     }
                     // Up and down the grid of videos, the column stays.
                     let from = (*row, cols.get(*row).copied().unwrap_or(0));
-                    let mv = rows_move(&p, row, cols, action);
+                    let mv = rows_move(p, row, cols, action);
                     let grid =
                         |r: usize| p.shelves.get(r).is_some_and(|sh| sh.title != CHANNELS_ROW);
                     if *row != from.0 && grid(*row) && grid(from.0) {
@@ -742,7 +742,7 @@ impl Tube {
                             vec![Effect::Suggest(now)]
                         } else {
                             if now.trim().is_empty() {
-                                *suggestions = recent;
+                                *suggestions = self.recent.clone();
                             } else if now.trim().len() < 2 {
                                 suggestions.clear();
                             }
@@ -982,7 +982,11 @@ impl Tube {
             }
             return vec![];
         }
-        let Some(page) = self.current().and_then(|p| p.items().first()).cloned() else {
+        let has_page = self
+            .current()
+            .and_then(|p| p.items().first())
+            .is_some();
+        if !has_page {
             match action {
                 Action::Up | Action::Back => self.header = true,
                 Action::Ok if matches!(self.current(), Some(Scan::Failed(_))) => {
@@ -991,13 +995,20 @@ impl Tube {
                 _ => {}
             }
             return vec![];
-        };
+        }
         if action == Action::Back {
             return self.back();
         }
         let id = self.section.browse_id().unwrap_or_default().to_string();
         let (mut row, mut cols) = (self.row, std::mem::take(&mut self.cols));
-        let m = rows_move(&page, &mut row, &mut cols, action);
+        let m = {
+            let page = self
+                .pages
+                .get(&id)
+                .and_then(|p| p.items().first())
+                .expect("checked above");
+            rows_move(page, &mut row, &mut cols, action)
+        };
         self.row = row;
         self.cols = cols;
         match m {

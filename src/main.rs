@@ -59,6 +59,9 @@ enum Msg {
     /// That player's current video was hidden behind the browser.
     PlayerHidden(u64, Tile),
     PlayerChanged(u64, Tile),
+    /// Local history and resume checkpoints loaded off the UI thread.
+    History(Page, Vec<(String, f64)>),
+    Positions(Vec<(String, f64)>),
 }
 
 struct App {
@@ -92,6 +95,7 @@ struct App {
     positions: Vec<(String, f64)>,
     votes: HashMap<String, (u64, u64)>,
     tools: Scan<String>,
+    yt_dlp_ready: bool,
     /// Started with `--play`: close when the video ends.
     quit_after_play: bool,
     /// When the phone code on screen was asked for (a new one every 4 min).
@@ -115,7 +119,7 @@ impl App {
         theme::set_accent(&prefs.accent);
         i18n::set_language(prefs.language);
         let accounts = account::load(&config);
-        let positions = player::load_positions(&data);
+        let yt_dlp_ready = player::yt_dlp_path(&data).is_file();
         let ctx = Ctx {
             signed_in: accounts.active().is_some(),
             accounts: accounts.list.len(),
@@ -155,9 +159,10 @@ impl App {
             player_seq: 0,
             now_playing: None,
             pending_play: None,
-            positions,
+            positions: Vec::new(),
             votes: HashMap::new(),
             tools: Scan::Busy,
+            yt_dlp_ready,
             quit_after_play: false,
             was_focused: true,
             search_generation: 0,
@@ -167,6 +172,9 @@ impl App {
             page_requests: HashSet::new(),
             home_prefetches: 0,
         };
+        let pos_data = data.clone();
+        app.jobs
+            .spawn(move || Msg::Positions(player::load_positions(&pos_data)));
         app.jobs.spawn(move || Msg::Tools(yt::ensure_tools(&data)));
         match start {
             Start::Play(id, title) => {
@@ -177,7 +185,7 @@ impl App {
                     title,
                     ..Tile::default()
                 };
-                if player::yt_dlp_path(&app.data).is_file() {
+                if app.yt_dlp_ready {
                     app.play(&cc.egui_ctx, tile, false, Vec::new());
                 } else {
                     app.pending_play = Some(tile);
@@ -243,33 +251,37 @@ impl App {
         let refresh = self.refresh();
         let generation = self.account_generation;
         match e {
-            // History is what was watched here.
+            // History is what was watched here (read off the UI thread).
             Effect::Load(id) if id == ytc::feeds::HISTORY => {
-                self.positions = player::load_positions(&self.data);
-                let mut list = self.watched();
-                for tile in &mut list {
-                    if let Some(point) = player::checkpoint(&self.data, &tile.id) {
-                        tile.progress = if point.finished {
-                            Some(1.0)
-                        } else {
-                            point
-                                .duration
-                                .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
-                        };
-                        tile.meta = if point.finished {
-                            "Watched".into()
-                        } else {
-                            format!("Resume at {}", player::position_clock(point.position))
-                        };
-                        if tile.badge.is_empty()
-                            && let Some(d) = point.duration
-                        {
-                            tile.badge = player::position_clock(d);
+                let data = self.data.clone();
+                self.jobs.spawn(move || {
+                    let (positions, checkpoints) = player::load_positions_and_checkpoints(&data);
+                    let mut list = std::fs::read_to_string(data.join("watched.conf"))
+                        .map(|t| cattube_core::watched::parse(&t))
+                        .unwrap_or_default();
+                    for tile in &mut list {
+                        if let Some(point) = checkpoints.get(&tile.id) {
+                            tile.progress = if point.finished {
+                                Some(1.0)
+                            } else {
+                                point
+                                    .duration
+                                    .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
+                            };
+                            tile.meta = if point.finished {
+                                "Watched".into()
+                            } else {
+                                format!("Resume at {}", player::position_clock(point.position))
+                            };
+                            if tile.badge.is_empty()
+                                && let Some(d) = point.duration
+                            {
+                                tile.badge = player::position_clock(d);
+                            }
                         }
                     }
-                }
-                self.tube
-                    .replace_page(&id, Ok(cattube_core::watched::page(&list)));
+                    Msg::History(cattube_core::watched::page(&list), positions)
+                });
             }
             Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
                 let key = (id.clone(), String::new());
@@ -611,12 +623,6 @@ impl App {
         self.save_prefs(ctx);
     }
 
-    fn watched(&self) -> Vec<Tile> {
-        std::fs::read_to_string(self.data.join("watched.conf"))
-            .map(|t| cattube_core::watched::parse(&t))
-            .unwrap_or_default()
-    }
-
     fn play(&mut self, ctx: &egui::Context, tile: Tile, from_start: bool, queue: Vec<Tile>) {
         if !from_start
             && self.player.is_some()
@@ -628,7 +634,6 @@ impl App {
             self.effect(ctx, Effect::ShowPlayer);
             return;
         }
-        self.positions = player::load_positions(&self.data);
         if let Some(old) = self.player.take() {
             if !old.exited() {
                 yt::checkpoint_player(&self.data);
@@ -636,8 +641,12 @@ impl App {
             old.stop_and_reap();
         }
         let (r, g, b) = theme::accent_rgb();
+        // Check only this video's single checkpoint file on demand instead of
+        // scanning all 500 files on the UI thread.
         let start = if from_start {
             0.0
+        } else if let Some(point) = player::checkpoint(&self.data, &tile.id) {
+            if point.finished { 0.0 } else { point.position }
         } else {
             self.resume_at(&tile.id).unwrap_or(0.0)
         };
@@ -656,9 +665,10 @@ impl App {
             buffer_mib: self.prefs.buffer,
             hide_on_back: on_catostv() && !self.quit_after_play,
         };
-        if !player::yt_dlp_path(&self.data).is_file() {
+        if !self.yt_dlp_ready && !player::yt_dlp_path(&self.data).is_file() {
             return self.toast(ctx, "Getting the player ready, try again in a moment");
         }
+        self.yt_dlp_ready = true;
         match yt::start_player(&o, &self.data) {
             Ok(child) => {
                 let watcher_player = child.clone();
@@ -813,6 +823,7 @@ impl App {
             }
             Msg::Tools(r) => {
                 let ok = r.is_ok();
+                self.yt_dlp_ready = ok || player::yt_dlp_path(&self.data).is_file();
                 self.tools = match r {
                     Ok(v) => Scan::Done(vec![v]),
                     Err(e) => {
@@ -821,12 +832,19 @@ impl App {
                     }
                 };
                 if let Some(tile) = self.pending_play.take() {
-                    if ok && player::yt_dlp_path(&self.data).is_file() {
+                    if ok && self.yt_dlp_ready {
                         self.play(ctx, tile, false, Vec::new());
                     } else if self.quit_after_play {
                         self.effect(ctx, Effect::Close);
                     }
                 }
+            }
+            Msg::History(page, positions) => {
+                self.positions = positions;
+                self.tube.replace_page(ytc::feeds::HISTORY, Ok(page));
+            }
+            Msg::Positions(positions) => {
+                self.positions = positions;
             }
             Msg::PlayerChanged(seq, tile) => {
                 if seq == self.player_seq && self.player.is_some() {
@@ -838,7 +856,9 @@ impl App {
             }
             Msg::PlayerHidden(seq, tile) => {
                 if seq == self.player_seq && self.player.is_some() {
-                    self.positions = player::load_positions(&self.data);
+                    let data = self.data.clone();
+                    self.jobs
+                        .spawn(move || Msg::Positions(player::load_positions(&data)));
                     self.now_playing = Some(tile);
                     // Focus on the bar: OK goes straight back.
                     self.tube.now_playing = true;
@@ -858,8 +878,10 @@ impl App {
                     self.now_playing = None;
                     self.tube.now_playing = false;
                 }
-                // Saved already when it ended (save_positions): read back.
-                self.positions = player::load_positions(&self.data);
+                // Saved already when it ended (save_positions): reload off the UI thread.
+                let data = self.data.clone();
+                self.jobs
+                    .spawn(move || Msg::Positions(player::load_positions(&data)));
                 // The speed picked in the player is kept for the next video.
                 if let Some(sp) = ended.speed
                     && SPEEDS.iter().any(|x| (x - sp).abs() < 1e-6)
@@ -1065,6 +1087,7 @@ impl eframe::App for App {
             positions: &self.positions,
             votes: &self.votes,
             tools: &self.tools,
+            yt_dlp_ready: self.yt_dlp_ready,
             now,
             now_playing: self.now_playing.as_ref().filter(|_| self.player.is_some()),
         };
@@ -1233,12 +1256,20 @@ fn feed(which: &str) -> i32 {
     0
 }
 
-fn renderer() -> (eframe::Renderer, bool) {
-    match std::env::var("CATTUBE_RENDERER").ok().as_deref() {
+fn renderer_for(choice: Option<&str>, low_power: bool) -> (eframe::Renderer, bool) {
+    match choice {
         Some("glow") => (eframe::Renderer::Glow, true),
         Some("wgpu") => (eframe::Renderer::Wgpu, true),
+        _ if low_power => (eframe::Renderer::Glow, false),
         _ => (eframe::Renderer::Wgpu, false),
     }
+}
+
+fn renderer() -> (eframe::Renderer, bool) {
+    renderer_for(
+        std::env::var("CATTUBE_RENDERER").ok().as_deref(),
+        cattube_core::env::low_power(),
+    )
 }
 
 const HELP: &str = "cattube {VERSION}: a native Linux YouTube app for TV screens
@@ -1357,12 +1388,17 @@ fn main() -> eframe::Result {
     if let Err(e) = &result
         && !explicit
     {
-        eprintln!("cattube: wgpu renderer failed ({e}); retrying with OpenGL");
+        let fallback = if renderer == eframe::Renderer::Wgpu {
+            "glow"
+        } else {
+            "wgpu"
+        };
+        eprintln!("cattube: {renderer:?} renderer failed ({e}); retrying with {fallback}");
         if let Ok(exe) = std::env::current_exe() {
             use std::os::unix::process::CommandExt;
             let err = std::process::Command::new(exe)
                 .args(std::env::args_os().skip(1))
-                .env("CATTUBE_RENDERER", "glow")
+                .env("CATTUBE_RENDERER", fallback)
                 .exec();
             eprintln!("cattube: could not restart: {err}");
         }
@@ -1391,5 +1427,19 @@ mod tests {
         assert!(!search_matches(&tube, 2, 2, "old query"));
         tube.stack.pop();
         assert!(!search_matches(&tube, 2, 2, "new query"));
+    }
+
+    #[test]
+    fn renderer_defaults_to_glow_on_low_power_and_honors_override() {
+        assert_eq!(renderer_for(None, true), (eframe::Renderer::Glow, false));
+        assert_eq!(renderer_for(None, false), (eframe::Renderer::Wgpu, false));
+        assert_eq!(
+            renderer_for(Some("wgpu"), true),
+            (eframe::Renderer::Wgpu, true)
+        );
+        assert_eq!(
+            renderer_for(Some("glow"), false),
+            (eframe::Renderer::Glow, true)
+        );
     }
 }

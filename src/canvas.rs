@@ -18,7 +18,48 @@ use eframe::egui::{
     Shape, Stroke, StrokeKind, Vec2, pos2, vec2,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
+
+const TEXT_CACHE_MAX: usize = 512;
+
+#[derive(Hash, PartialEq, Eq)]
+struct FitKey {
+    text: String,
+    max_w_tenth: i32,
+    size_tenth: i32,
+    weight: u8,
+}
+
+#[derive(Default)]
+struct TextCache {
+    scale_bits: u32,
+    fit: HashMap<FitKey, String>,
+    two: HashMap<FitKey, (String, String)>,
+}
+
+impl TextCache {
+    fn sync_scale(&mut self, s: f32) {
+        let bits = s.to_bits();
+        if self.scale_bits != bits {
+            self.scale_bits = bits;
+            self.fit.clear();
+            self.two.clear();
+        }
+    }
+}
+
+thread_local! {
+    static TEXT_CACHE: RefCell<TextCache> = RefCell::new(TextCache::default());
+}
+
+fn weight_tag(weight: Weight) -> u8 {
+    match weight {
+        Weight::Regular => 0,
+        Weight::Medium => 1,
+        Weight::Semibold => 2,
+    }
+}
 
 pub const DESIGN_W: f32 = 1280.0;
 pub const DESIGN_H: f32 = 720.0;
@@ -161,7 +202,9 @@ impl<H: Copy> Canvas<H> {
     /// that catches the light.
     pub fn glass(&self, rect: Rect, radius: f32) {
         self.shadow(rect, radius, 18.0, 52.0, theme::rgba(theme::BLACK, 80));
-        self.fill(rect, radius, theme::rgba(theme::BG_TOP, 96));
+        if !theme::FLAT {
+            self.fill(rect, radius, theme::rgba(theme::BG_TOP, 96));
+        }
         self.fill(rect, radius, theme::glass());
         self.frost_edge(rect, radius, 1.0);
     }
@@ -353,19 +396,125 @@ impl<H: Copy> Canvas<H> {
 
     /// Shorten `text` with an ellipsis so it fits in `max_w` design units.
     pub fn fit(&self, text: &str, max_w: f32, size: f32, weight: Weight) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let key = FitKey {
+            text: text.to_owned(),
+            max_w_tenth: (max_w * 10.0).round() as i32,
+            size_tenth: (size * 10.0).round() as i32,
+            weight: weight_tag(weight),
+        };
+        if let Some(cached) = TEXT_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.sync_scale(self.s);
+            c.fit.get(&key).cloned()
+        }) {
+            return cached;
+        }
+        let result = self.fit_uncached(text, max_w, size, weight);
+        TEXT_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.sync_scale(self.s);
+            if c.fit.len() >= TEXT_CACHE_MAX {
+                c.fit.clear();
+            }
+            c.fit.insert(key, result.clone());
+        });
+        result
+    }
+
+    fn fit_uncached(&self, text: &str, max_w: f32, size: f32, weight: Weight) -> String {
         if self.text_width(text, size, weight) <= max_w {
             return text.to_owned();
         }
         use unicode_segmentation::UnicodeSegmentation;
-        let mut chars: Vec<&str> = text.graphemes(true).collect();
-        while !chars.is_empty() {
-            chars.pop();
-            let candidate: String = chars.concat().trim_end().to_string() + "…";
+        let ends: Vec<usize> = text
+            .grapheme_indices(true)
+            .map(|(i, g)| i + g.len())
+            .collect();
+        let mut lo = 0usize;
+        let mut hi = ends.len();
+        let mut best = String::new();
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let prefix = text[..ends[mid - 1]].trim_end();
+            let mut candidate = String::with_capacity(prefix.len() + 3);
+            candidate.push_str(prefix);
+            candidate.push('…');
             if self.text_width(&candidate, size, weight) <= max_w {
-                return candidate;
+                best = candidate;
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
         }
-        "…".to_owned()
+        if best.is_empty() {
+            "…".to_owned()
+        } else {
+            best
+        }
+    }
+
+    /// Break `text` into at most two lines fitting `max_w` design units.
+    pub fn two_lines(&self, text: &str, max_w: f32, size: f32, weight: Weight) -> (String, String) {
+        if text.is_empty() {
+            return (String::new(), String::new());
+        }
+        let key = FitKey {
+            text: text.to_owned(),
+            max_w_tenth: (max_w * 10.0).round() as i32,
+            size_tenth: (size * 10.0).round() as i32,
+            weight: weight_tag(weight),
+        };
+        if let Some(cached) = TEXT_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.sync_scale(self.s);
+            c.two.get(&key).cloned()
+        }) {
+            return cached;
+        }
+        let result = self.two_lines_uncached(text, max_w, size, weight);
+        TEXT_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.sync_scale(self.s);
+            if c.two.len() >= TEXT_CACHE_MAX {
+                c.two.clear();
+            }
+            c.two.insert(key, result.clone());
+        });
+        result
+    }
+
+    fn two_lines_uncached(
+        &self,
+        text: &str,
+        max_w: f32,
+        size: f32,
+        weight: Weight,
+    ) -> (String, String) {
+        if self.text_width(text, size, weight) <= max_w {
+            return (text.to_owned(), String::new());
+        }
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut lo = 0usize;
+        let mut hi = words.len();
+        let mut first = String::new();
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let candidate = words[..mid].join(" ");
+            if self.text_width(&candidate, size, weight) <= max_w {
+                first = candidate;
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        if lo == 0 {
+            return (self.fit_uncached(text, max_w, size, weight), String::new());
+        }
+        let rest = words[lo..].join(" ");
+        (first, self.fit_uncached(&rest, max_w, size, weight))
     }
 
     // ---------------- animation ----------------
@@ -580,7 +729,7 @@ impl<H: Copy> Canvas<H> {
         let mut mesh = Mesh::default();
         let c = rect.center();
         mesh.colored_vertex(c, col(c.y));
-        let steps = 8;
+        let steps = if self.reduce_motion { 4 } else { 8 };
         for (o, a0) in corners {
             for k in 0..=steps {
                 let a = a0 + FRAC_PI_2 * k as f32 / steps as f32;
@@ -640,7 +789,7 @@ impl<H: Copy> Canvas<H> {
             uv: uv(c),
             color: tint,
         });
-        let steps = 8;
+        let steps = if self.reduce_motion { 4 } else { 8 };
         for (o, a0) in corners {
             for k in 0..=steps {
                 let a = a0 + FRAC_PI_2 * k as f32 / steps as f32;
@@ -874,6 +1023,49 @@ mod tests {
                 layer.passive().hit(layer.r(100.0, 120.0, 80.0, 40.0), 2);
                 let hits = c.take_hits();
                 assert_eq!(hits, vec![(c.r(124.0, 136.0, 80.0, 40.0), 1)]);
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn fit_and_two_lines_truncate_and_cache_consistently() {
+        let ctx = egui::Context::default();
+        theme::setup(&ctx);
+        ctx.run_ui(
+            egui::RawInput {
+                time: Some(0.0),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 720.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let c: Canvas<u8> = Canvas::new(ui, 0);
+                let short = "Short title";
+                assert_eq!(c.fit(short, 400.0, 15.0, Weight::Semibold), short);
+                assert_eq!(
+                    c.two_lines(short, 400.0, 15.0, Weight::Semibold),
+                    (short.to_string(), String::new())
+                );
+
+                let long =
+                    "A very long YouTube video title that definitely overflows a narrow card width";
+                let fitted = c.fit(long, 120.0, 15.0, Weight::Semibold);
+                assert!(fitted.ends_with('…'));
+                assert!(c.text_width(&fitted, 15.0, Weight::Semibold) <= 120.0);
+                // Cached second call matches identically.
+                assert_eq!(c.fit(long, 120.0, 15.0, Weight::Semibold), fitted);
+
+                let (l1, l2) = c.two_lines(long, 140.0, 15.0, Weight::Semibold);
+                assert!(!l1.is_empty() && !l2.is_empty());
+                assert!(c.text_width(&l1, 15.0, Weight::Semibold) <= 140.0);
+                assert!(c.text_width(&l2, 15.0, Weight::Semibold) <= 140.0);
+                assert_eq!(c.two_lines(long, 140.0, 15.0, Weight::Semibold), (l1, l2));
+
+                // Single oversized word falls back cleanly without panicking.
+                let unbreakable = "SupercalifragilisticexpialidociousWithoutSpaces";
+                let (u1, u2) = c.two_lines(unbreakable, 90.0, 15.0, Weight::Semibold);
+                assert!(u1.ends_with('…') && u2.is_empty());
+                assert!(c.text_width(&u1, 15.0, Weight::Semibold) <= 90.0);
             },
         )
         .drop_without_applying_deltas();

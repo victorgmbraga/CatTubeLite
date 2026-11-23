@@ -1069,14 +1069,13 @@ fn thumbnail_size(osd_width: f64, width: f64) -> (u32, u32) {
     )
 }
 
-/// Raw thumbnail pixels for a player overlay.
-fn bgra_thumbnail(
+/// Decode and scale a thumbnail directly into BGRA bytes in memory.
+fn bgra_thumbnail_pixels(
     cache: &Path,
     id: &str,
     osd_width: f64,
     width: f64,
-    name: &str,
-) -> Option<(String, u32, u32)> {
+) -> Option<(Vec<u8>, u32, u32)> {
     let (w, h) = thumbnail_size(osd_width, width);
     let pic = fetch_image(cache, &yt::video_thumb(id))?;
     let img = image::load_from_memory(&std::fs::read(pic).ok()?).ok()?;
@@ -1087,17 +1086,33 @@ fn bgra_thumbnail(
     for p in px.as_chunks_mut::<4>().0 {
         p.swap(0, 2);
     }
+    Some((px, w, h))
+}
+
+/// Raw thumbnail pixels written once for a player overlay.
+fn bgra_thumbnail(
+    cache: &Path,
+    id: &str,
+    osd_width: f64,
+    width: f64,
+    name: &str,
+) -> Option<(String, u32, u32)> {
+    let (px, w, h) = bgra_thumbnail_pixels(cache, id, osd_width, width)?;
     let path = player::player_socket().with_file_name(name);
     std::fs::write(&path, px).ok()?;
     Some((path.to_string_lossy().into_owned(), w, h))
 }
 
-/// The related browser shows up to six rows, loading pictures progressively.
+/// The related browser shows up to six rows (three on low-power devices),
+/// loading pictures in row batches without per-thumbnail temp files.
 const RELATED: usize = 24;
+const RELATED_LOW_POWER: usize = 12;
 const RELATED_THUMB_W: f64 = 390.0;
 const RELATED_STEP_X: usize = 430;
 const RELATED_STEP_Y: usize = 320;
 const RELATED_ATLAS_W: usize = 1680;
+const RELATED_FLUSH_BATCH: usize = 4;
+const RELATED_FLUSH_INTERVAL: Duration = Duration::from_millis(400);
 
 fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize)>) -> String {
     let list: Vec<_> = tiles
@@ -1191,11 +1206,16 @@ fn send_related(
             return;
         }
     };
+    let limit = if session.low_power {
+        RELATED_LOW_POWER
+    } else {
+        RELATED
+    };
     let tiles: Vec<_> = details
         .related
         .into_iter()
         .filter(|t| t.playable())
-        .take(RELATED)
+        .take(limit)
         .collect();
     if tiles.is_empty() {
         send("{\"error\":\"No related videos\"}");
@@ -1216,36 +1236,31 @@ fn send_related(
     let name = path.to_string_lossy().into_owned();
     let mut tracked = false;
     let mut revision = 0;
-    let mut changed = false;
+    let mut pending = 0usize;
     let mut sent_at = Instant::now();
     for (i, tile) in tiles.iter().enumerate() {
         if !current() {
             return;
         }
-        if let Some((pic, w, h)) = bgra_thumbnail(
-            &session.cache,
-            &tile.id,
-            1920.0,
-            RELATED_THUMB_W,
-            &format!("cattube-related-{safe_id}-{request}-thumb.bgra"),
-        ) {
-            let bytes = std::fs::read(&pic);
-            let _ = std::fs::remove_file(&pic);
-            if let Ok(bytes) = bytes
-                && bytes.len() == w as usize * h as usize * 4
-            {
-                for row in 0..h as usize {
-                    let dest = ((i / 4 * RELATED_STEP_Y + row) * RELATED_ATLAS_W
-                        + i % 4 * RELATED_STEP_X)
-                        * 4;
-                    let source = row * w as usize * 4;
-                    pixels[dest..dest + w as usize * 4]
-                        .copy_from_slice(&bytes[source..source + w as usize * 4]);
-                }
-                changed = true;
+        if let Some((bytes, w, h)) =
+            bgra_thumbnail_pixels(&session.cache, &tile.id, 1920.0, RELATED_THUMB_W)
+            && bytes.len() == w as usize * h as usize * 4
+        {
+            for row in 0..h as usize {
+                let dest = ((i / 4 * RELATED_STEP_Y + row) * RELATED_ATLAS_W
+                    + i % 4 * RELATED_STEP_X)
+                    * 4;
+                let source = row * w as usize * 4;
+                pixels[dest..dest + w as usize * 4]
+                    .copy_from_slice(&bytes[source..source + w as usize * 4]);
             }
+            pending += 1;
         }
-        if changed && (sent_at.elapsed() >= Duration::from_millis(80) || i + 1 == tiles.len()) {
+        let flush = pending > 0
+            && (pending >= RELATED_FLUSH_BATCH
+                || sent_at.elapsed() >= RELATED_FLUSH_INTERVAL
+                || i + 1 == tiles.len());
+        if flush {
             if !current() {
                 return;
             }
@@ -1266,7 +1281,7 @@ fn send_related(
                     Some((&name, RELATED_ATLAS_W, height, revision)),
                 ));
                 sent_at = Instant::now();
-                changed = false;
+                pending = 0;
             } else {
                 let _ = std::fs::remove_file(&tmp);
             }

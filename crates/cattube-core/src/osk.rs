@@ -265,7 +265,6 @@ impl Osk {
     }
 
     pub fn handle(&mut self, action: Action) -> OskEvent {
-        let rows = self.rows();
         if self.in_field {
             let n = self.cursor();
             return match action {
@@ -287,6 +286,7 @@ impl Osk {
                 _ => OskEvent::Unhandled,
             };
         }
+        let rows = self.rows();
         match action {
             Action::Left => {
                 if self.col == 0 {
