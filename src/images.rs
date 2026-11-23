@@ -1,113 +1,137 @@
-//! Pictures (posters, backdrops, episode stills) as GPU textures.
-//!
-//! Decoded lazily on first use and cached for the life of the process. A
-//! path that fails to load is remembered as missing so a bad file is not
-//! re-read every frame; the caller then draws a placeholder.
+//! Background image decoding and a bounded in-memory thumbnail cache.
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
-/// Largest side kept in memory; bigger pictures (backdrops) are scaled down by box averaging.
-const MAX_SIDE: u32 = 1600;
-/// Pictures bigger than this many bytes are decoded on a worker thread, so
-/// scrolling through posters never stalls a frame.
-const ASYNC_BYTES: u64 = 192 * 1024;
-/// Never decode anything larger than this (a broken or hostile file).
-const DECODE_LIMIT: u32 = 8192;
+const MAX_ENTRIES: usize = 512;
+const DECODE_LIMIT: u32 = 4096;
 
-type Decoded = Arc<Mutex<HashMap<String, Option<ColorImage>>>>;
+enum Picture {
+    Decoded(ColorImage),
+    Texture(TextureHandle),
+    Missing,
+}
 
-#[derive(Default)]
+struct Entry {
+    picture: Picture,
+    bytes: usize,
+    last_used: u64,
+}
+
 pub struct Images {
-    cache: RefCell<HashMap<String, Option<TextureHandle>>>,
-    /// Big PNGs being decoded right now (shared with the worker threads).
-    pending: Arc<Mutex<HashSet<String>>>,
-    /// Big PNGs decoded by worker threads, waiting to become textures.
-    decoded: Decoded,
+    entries: RefCell<HashMap<String, Entry>>,
+    wanted: RefCell<Vec<(String, bool)>>,
+    bytes: usize,
+    budget: usize,
 }
 
 impl Images {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(low_power: bool) -> Self {
+        Self {
+            entries: RefCell::new(HashMap::new()),
+            wanted: RefCell::new(Vec::new()),
+            bytes: 0,
+            budget: if low_power { 16 } else { 64 } * 1024 * 1024,
+        }
     }
 
-    /// Texture for a PNG (or SVG) file, loading it on first use. An SVG
-    /// returns `None` until its PNG has been rendered in the background.
-    pub fn get(&self, ctx: &egui::Context, path: &str) -> Option<egui::TextureId> {
-        if let Some(entry) = self.cache.borrow().get(path) {
-            return entry.as_ref().map(|t| t.id());
+    pub fn get(&self, ctx: &egui::Context, url: &str, priority: bool) -> Option<egui::TextureId> {
+        if url.is_empty() {
+            return None;
         }
-        let file = path.to_string();
-        // A big file: decode on a worker thread, upload when it is ready.
-        let ready = self
-            .decoded
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(path);
-        let img = match ready {
-            Some(img) => img,
-            None if std::fs::metadata(&file).is_ok_and(|m| m.len() > ASYNC_BYTES) => {
-                self.decode_later(ctx, path, file);
-                return None;
-            }
-            None => load_png(&file),
+        if let Some(entry) = self.entries.borrow_mut().get_mut(url) {
+            entry.last_used = ctx.cumulative_frame_nr();
+            return match &entry.picture {
+                Picture::Missing => None,
+                Picture::Texture(texture) => Some(texture.id()),
+                Picture::Decoded(_) => {
+                    let Picture::Decoded(image) =
+                        std::mem::replace(&mut entry.picture, Picture::Missing)
+                    else {
+                        unreachable!();
+                    };
+                    let texture = ctx.load_texture(url, image, TextureOptions::LINEAR);
+                    let id = texture.id();
+                    entry.picture = Picture::Texture(texture);
+                    Some(id)
+                }
+            };
+        }
+        let mut wanted = self.wanted.borrow_mut();
+        if let Some((_, requested_priority)) = wanted.iter_mut().find(|(key, _)| key == url) {
+            *requested_priority |= priority;
+        } else {
+            wanted.push((url.to_owned(), priority));
+        }
+        None
+    }
+
+    pub fn size(&self, url: &str) -> Option<[usize; 2]> {
+        match &self.entries.borrow().get(url)?.picture {
+            Picture::Texture(texture) => Some(texture.size()),
+            _ => None,
+        }
+    }
+
+    /// Only requests made while drawing the current frame. Focused cards go first.
+    pub fn take_wanted(&mut self) -> impl Iterator<Item = String> + use<> {
+        let mut wanted = std::mem::take(self.wanted.get_mut());
+        wanted.sort_by_key(|(_, priority)| !priority);
+        wanted.into_iter().map(|(url, _)| url)
+    }
+
+    pub fn complete(&mut self, url: String, image: Option<ColorImage>, frame: u64) {
+        let bytes = image.as_ref().map_or(0, |image| image.pixels.len() * 4);
+        let entry = Entry {
+            picture: image.map_or(Picture::Missing, Picture::Decoded),
+            bytes,
+            last_used: frame,
         };
-        let tex = img.map(|img| ctx.load_texture(path, img, TextureOptions::LINEAR));
-        let id = tex.as_ref().map(|t| t.id());
-        self.cache.borrow_mut().insert(path.to_string(), tex);
-        id
-    }
-
-    /// Width and height of a picture already loaded.
-    pub fn size(&self, path: &str) -> Option<[usize; 2]> {
-        self.cache
-            .borrow()
-            .get(path)
-            .and_then(|t| t.as_ref().map(|t| t.size()))
-    }
-
-    fn decode_later(&self, ctx: &egui::Context, path: &str, file: String) {
-        {
-            let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            if !p.insert(path.to_string()) {
-                return;
-            }
+        let previous = self.entries.get_mut().insert(url, entry);
+        self.bytes += bytes;
+        if let Some(previous) = previous {
+            self.bytes -= previous.bytes;
         }
-        let (pending, decoded) = (Arc::clone(&self.pending), Arc::clone(&self.decoded));
-        let ctx = ctx.clone();
-        let path = path.to_string();
-        std::thread::spawn(move || {
-            let img = load_png(&file);
-            decoded
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(path.clone(), img);
-            pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&path);
-            ctx.request_repaint();
-        });
+    }
+
+    /// Run after drawing so textures touched in this frame are newest.
+    pub fn trim(&mut self) {
+        let entries = self.entries.get_mut();
+        if self.bytes <= self.budget && entries.len() <= MAX_ENTRIES {
+            return;
+        }
+        let mut oldest: Vec<_> = entries
+            .iter()
+            .map(|(url, entry)| (entry.last_used, url.clone()))
+            .collect();
+        oldest.sort_unstable();
+        for (_, url) in oldest {
+            if self.bytes <= self.budget && entries.len() <= MAX_ENTRIES {
+                break;
+            }
+            self.bytes -= entries.remove(&url).expect("cached picture").bytes;
+        }
     }
 }
 
-/// A cached picture: PNG, JPEG (YouTube's thumbnails) or WebP.
-fn load_png(path: &str) -> Option<ColorImage> {
-    if ![".png", ".jpg", ".jpeg", ".webp"]
-        .iter()
-        .any(|e| path.ends_with(e))
-    {
-        return None;
-    }
-    let bytes = std::fs::read(path).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+/// Decode a downloaded PNG, JPEG or WebP away from the interface thread.
+pub fn decode(path: &str, max_side: u32) -> Option<ColorImage> {
+    let mut reader = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(DECODE_LIMIT);
+    limits.max_image_height = Some(DECODE_LIMIT);
+    limits.max_alloc = Some(32 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?.into_rgba8();
     let (w, h) = img.dimensions();
-    if w == 0 || h == 0 || w > DECODE_LIMIT || h > DECODE_LIMIT {
+    if w == 0 || h == 0 {
         return None;
     }
-    let (w, h, px) = shrink(w, h, img.as_raw().to_vec(), MAX_SIDE);
+    let (w, h, px) = shrink(w, h, img.into_raw(), max_side);
     Some(ColorImage::from_rgba_unmultiplied(
         [w as usize, h as usize],
         &px,
@@ -145,7 +169,7 @@ pub fn shrink(w: u32, h: u32, px: Vec<u8>, max: u32) -> (u32, u32, Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
-    use super::shrink;
+    use super::*;
 
     #[test]
     fn shrink_box_averages_and_keeps_small_pictures() {
@@ -163,5 +187,29 @@ mod tests {
         assert_eq!((w, h), (2, 1));
         assert_eq!(&out[0..4], &[255, 255, 255, 255]);
         assert_eq!(&out[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn focus_has_priority_and_least_recently_used_images_are_evicted() {
+        let ctx = egui::Context::default();
+        let mut images = Images::new(true);
+        images.budget = 8;
+        images.get(&ctx, "first", false);
+        images.get(&ctx, "focused", false);
+        images.get(&ctx, "focused", true);
+        assert_eq!(
+            images.take_wanted().collect::<Vec<_>>(),
+            ["focused", "first"]
+        );
+
+        for (frame, name) in ["older", "recent", "new"].into_iter().enumerate() {
+            let one_pixel = ColorImage::filled([1, 1], egui::Color32::WHITE);
+            images.complete(name.into(), Some(one_pixel), frame as u64);
+        }
+        images.trim();
+        assert!(!images.entries.borrow().contains_key("older"));
+        assert!(images.get(&ctx, "recent", false).is_some());
+        assert!(images.get(&ctx, "new", false).is_some());
+        assert_eq!(images.bytes, 8);
     }
 }

@@ -42,7 +42,7 @@ local options = require "mp.options"
 local assdraw = require "mp.assdraw"
 local utils = require "mp.utils"
 
-local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "" }
+local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "", low_power = false }
 options.read_options(opts, "cattube_osd")
 
 -- The player owns its last position. Watcher/network delays cannot lose it.
@@ -1229,6 +1229,11 @@ local function related_move()
     pan.target = first
     fx.target = (related.index - 1) % RCOLS * (RW + RGAP)
     fy.target = row * RSTEP
+    if opts.low_power then
+        related_scroll = first
+        pan.value, fx.value, fy.value = pan.target, fx.target, fy.target
+        return
+    end
     if related_timer then return end
     if math.abs(pan.value - pan.target) < 0.0004
         and math.abs(fx.value - fx.target) < 0.2 and math.abs(fy.value - fy.target) < 0.2 then return end
@@ -1594,7 +1599,7 @@ local function loading(on)
     if on then
         if not loading_timer then
             loading_since = mp.get_time()
-            loading_timer = mp.add_periodic_timer(1 / 30, draw_loading)
+            loading_timer = mp.add_periodic_timer(opts.low_power and 0.1 or 1 / 30, draw_loading)
         end
         draw_loading()
     else

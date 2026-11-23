@@ -80,8 +80,22 @@ impl Default for Prefs {
 }
 
 impl Prefs {
-    pub fn parse(text: &str) -> Self {
-        let mut p = Prefs::default();
+    fn defaults(low_power: bool) -> Self {
+        if low_power {
+            Self {
+                max_height: 720,
+                codec: Codec::Avc,
+                hdr: false,
+                buffer: 64,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    pub fn parse(text: &str, low_power: bool) -> Self {
+        let mut p = Prefs::defaults(low_power);
         let mut cats: Option<Vec<String>> = None;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else {
@@ -100,7 +114,11 @@ impl Prefs {
                         p.max_height = n;
                     }
                 }
-                "codec" => p.codec = Codec::from_key(v),
+                "codec" => {
+                    if let Some(codec) = Codec::ALL.into_iter().find(|codec| codec.key() == v) {
+                        p.codec = codec;
+                    }
+                }
                 "hdr" => p.hdr = v != "false",
                 "speed" => {
                     if let Ok(s) = v.parse::<f64>()
@@ -180,9 +198,10 @@ pub fn path(config: &Path) -> PathBuf {
 }
 
 pub fn load(config: &Path) -> Prefs {
+    let low_power = cattube_core::env::low_power();
     std::fs::read_to_string(path(config))
-        .map(|t| Prefs::parse(&t))
-        .unwrap_or_default()
+        .map(|t| Prefs::parse(&t, low_power))
+        .unwrap_or_else(|_| Prefs::defaults(low_power))
 }
 
 pub fn save(config: &Path, p: &Prefs) -> std::io::Result<()> {
@@ -218,9 +237,11 @@ mod tests {
             buffer: 768,
             region: "DE".into(),
         };
-        assert_eq!(Prefs::parse(&p.to_conf()), p);
+        assert_eq!(Prefs::parse(&p.to_conf(), false), p);
+        assert_eq!(Prefs::parse(&p.to_conf(), true), p);
         let junk = Prefs::parse(
             "max_height = 999\nspeed = 7\ncodec = xyz\nsponsorblock_categories = sponsor,evil\n",
+            false,
         );
         assert_eq!(
             (junk.max_height, junk.speed, junk.codec),
@@ -229,5 +250,16 @@ mod tests {
         assert_eq!(junk.sb_categories, vec!["sponsor".to_string()]);
         assert_eq!(cycle(&SPEEDS, 1.0, 1), 1.25);
         assert_eq!(cycle(&RESOLUTIONS, 480, 1), 0);
+    }
+
+    #[test]
+    fn low_power_defaults_fill_only_missing_settings() {
+        let p = Prefs::parse("accent = teal\nmax_height = 1080\n", true);
+        assert_eq!(p.accent, "teal");
+        assert_eq!(
+            (p.max_height, p.codec, p.hdr, p.buffer),
+            (1080, Codec::Avc, false, 64)
+        );
+        assert_eq!(Prefs::parse("", true).max_height, 720);
     }
 }

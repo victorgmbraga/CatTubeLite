@@ -32,6 +32,7 @@ pub struct Canvas<H: Copy = ()> {
     /// Screen points per design unit.
     pub s: f32,
     pub screen: Rect,
+    pub reduce_motion: bool,
     hits: Rc<RefCell<Vec<(Rect, H)>>>,
     interactive: bool,
 }
@@ -54,6 +55,7 @@ impl<H: Copy> Canvas<H> {
             origin,
             s,
             screen,
+            reduce_motion: false,
             hits: Rc::new(RefCell::new(Vec::new())),
             interactive: true,
         }
@@ -373,6 +375,9 @@ impl<H: Copy> Canvas<H> {
     /// focused app's name, a page's tiles). Unlike [`Self::anim`], whose
     /// first value is already the target.
     pub fn appear(&self, id: impl std::hash::Hash + std::fmt::Debug, secs: f32) -> f32 {
+        if self.reduce_motion {
+            return 1.0;
+        }
         let id = egui::Id::new(("appear", id));
         let now = self.ctx.input(|i| i.time);
         let frame = self.ctx.cumulative_frame_nr();
@@ -394,6 +399,9 @@ impl<H: Copy> Canvas<H> {
 
     /// Focus and scrolling retain their velocity during repeated input.
     pub fn anim(&self, id: impl std::hash::Hash + std::fmt::Debug, target: f32) -> f32 {
+        if self.reduce_motion {
+            return target;
+        }
         let id = egui::Id::new(("motion", id));
         let now = self.ctx.input(|i| i.time);
         let (value, _, moving) = self.ctx.data_mut(|d| {
@@ -412,6 +420,9 @@ impl<H: Copy> Canvas<H> {
         key: K,
         seconds: f32,
     ) -> f32 {
+        if self.reduce_motion {
+            return 1.0;
+        }
         let id = egui::Id::new(("entrance", id));
         let now = self.ctx.input(|i| i.time);
         let value = self.ctx.data_mut(|d| {

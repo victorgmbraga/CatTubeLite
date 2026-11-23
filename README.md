@@ -85,6 +85,20 @@ The first time it starts, CatTube downloads its own copy of
 | Hold OK, F2 | the video's menu | |
 | Back, Esc | back | hide the controls, then stop |
 
+## Low-power devices
+
+The low-power profile is enabled by default on ARM64. Set
+`CATTUBE_LOW_POWER=1` to enable it on any device, or `CATTUBE_LOW_POWER=0`
+to use the standard profile. New playback settings default to 720p SDR,
+H.264 and a 64 MiB forward buffer. The player tries formats up to 30 fps
+first and asks mpv to use supported hardware decoding. Saved playback
+settings take precedence over these defaults.
+
+To compare interface renderers on the same device, start CatTube once
+with `CATTUBE_RENDERER=glow` and again with `CATTUBE_RENDERER=wgpu`.
+For video playback, mpv exposes `hwdec-current` and `frame-drop-count`
+through its IPC socket at `${XDG_RUNTIME_DIR:-/tmp}/cattube-mpv.sock`.
+
 ## Shared casting switch
 
 On CatosTV, the Cast to this TV switch also controls CatTube's paired-phone
