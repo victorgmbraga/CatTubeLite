@@ -22,7 +22,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces four main sets o
 - **Faster text & list layout:** adds a bounded thread-local text measurement cache (`fit` / `two_lines` using binary search), an ASCII fast path that skips Unicode BiDi/shaping work, reduced corner tessellation in reduced-motion mode, vertical culling in Settings, and eliminates per-frame filesystem checks and input-driven `Page` clones.
 
 ### ARM64 & low-power playback
-- **Automatic low-power profile (`CATTUBE_LOW_POWER`):** enabled by default on `aarch64` (overrideable with `CATTUBE_LOW_POWER=1` or `0`). Fresh configurations default to **720p SDR**, **H.264**, and a **64 MiB** forward demuxer buffer without overwriting existing saved settings.
+- **Automatic low-power profile (`CATTUBE_LOW_POWER`):** enabled automatically with up to 3 GiB of RAM, on Mali-400/450 or VideoCore IV GPUs, and on ARM machines below 6 GiB (overrideable with `CATTUBE_LOW_POWER=1` or `0`). Fresh configurations default to **720p SDR**, **H.264**, and a **64 MiB** forward demuxer buffer without overwriting existing saved settings.
 - **ARM64 Deno & 30 fps priority:** downloads the native `aarch64-unknown-linux-gnu` Deno binary on ARM64 and prioritizes `<= 30 fps` streams before falling back to higher frame rates.
 - **Lightweight `mpv` & OSD pipeline:** passes `--hwdec=auto-safe`, `--profile=fast`, `--scale=bilinear`, `--cscale=bilinear`, `--dscale=bilinear`, `--dither-depth=no`, and `--deband=no` in `low_power`; replaces CPU-heavy libass Gaussian blurs (`\blur140` / `\blur70`) in the OSD with flat scrim bands; lowers spinner geometry; removes per-key `cattube-input` IPC wakes; replaces per-frame position writes with a periodic checkpoint timer (`10 s` in `low_power`, `5 s` standard); and maps the TV remote `GO_BACK` key in `mpv`.
 - **In-memory batched related-video atlas:** builds the in-player Related Videos overlay directly in memory (capped at 12 videos in `low_power`, 24 standard), prefetches rows in parallel, and flushes in batches of 4 instead of writing temporary files per thumbnail.
@@ -96,7 +96,7 @@ On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.co
 
 | Environment variable | Values | Effect |
 |---|---|---|
-| `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (defaults to `1` on `aarch64`, `0` elsewhere) |
+| `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (detected from RAM, GPU and architecture when unset) |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Forces UI renderer (defaults to `glow` in `low_power`, `wgpu` otherwise, with automatic fallback when unset) |
 | `CATTUBE_CAST_ENABLED_FILE` | path | Optional preference file containing `cast_enabled = true` or `false` to toggle phone casting live |
 
