@@ -10,22 +10,38 @@ pub fn random_hex(n: usize) -> io::Result<String> {
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Build a process- and thread-unique sibling temporary path next to `path`.
+pub fn unique_tmp_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.{}.{n}.{suffix}", std::process::id()))
+}
+
 /// Write a file only its owner can read (it holds a sign-in or a pairing),
 /// in one step: a reader never sees half a file.
 pub fn write_private(path: &std::path::Path, text: &str) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    {
+    let tmp = unique_tmp_path(path, "tmp");
+    let res = (|| -> io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
+        Ok(())
+    })()
+    .and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(tmp, path)
+    res
 }
 
 /// Make an existing file private (files written before
@@ -104,5 +120,10 @@ mod tests {
         assert_eq!(grid_move(2, Action::Down, 3, 5), Some(4));
         assert_eq!(grid_move(1, Action::Up, 3, 5), None);
         assert_eq!(random_hex(4).unwrap().len(), 8);
+        let p = std::path::Path::new("/tmp/accounts.conf");
+        let t1 = unique_tmp_path(p, "tmp");
+        let t2 = unique_tmp_path(p, "tmp");
+        assert_ne!(t1, t2);
+        assert_eq!(t1.parent(), p.parent());
     }
 }

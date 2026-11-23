@@ -42,7 +42,7 @@ enum Msg {
     More(u64, String, String, Result<Page, String>),
     Search(u64, String, Result<Page, String>),
     SearchMore(u64, Result<Page, String>),
-    Suggestions(String, Vec<String>),
+    Suggestions(u64, String, Vec<String>),
     Details(String, Result<Details, String>),
     Votes(String, Option<(u64, u64)>),
     SignInCode(Result<(String, String), String>),
@@ -52,7 +52,7 @@ enum Msg {
     Done(String),
     /// A background job with nothing to show.
     Quiet,
-    Image(String, Option<egui::ColorImage>),
+    Images(Vec<(String, Option<egui::ColorImage>)>),
     Tools(Result<String, String>),
     /// A player ended: its number (see `App::player_seq`) and what it saw.
     PlaybackDone(u64, yt::Ended),
@@ -62,6 +62,14 @@ enum Msg {
     /// Local history and resume checkpoints loaded off the UI thread.
     History(Page, Vec<(String, f64)>),
     Positions(Vec<(String, f64)>),
+}
+
+const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(200);
+
+enum PendingSuggest {
+    Ready(String),
+    Wait(Duration),
+    None,
 }
 
 struct App {
@@ -103,6 +111,8 @@ struct App {
     was_focused: bool,
     search_generation: u64,
     search_query: String,
+    suggest_generation: u64,
+    pending_suggest: Option<(String, Instant)>,
     account_generation: u64,
     page_requests: HashSet<(String, String)>,
     home_prefetches: u8,
@@ -142,9 +152,9 @@ impl App {
             accounts,
             prefs,
             config,
-            cache,
+            cache: cache.clone(),
             data: data.clone(),
-            jobs: Jobs::new(&cc.egui_ctx),
+            jobs: Jobs::new(&cc.egui_ctx, if low_power { 4 } else { 8 }),
             mapper: InputMapper::new(),
             pointer: pointer::Pointer::new(),
             pointer_at: None,
@@ -167,6 +177,8 @@ impl App {
             was_focused: true,
             search_generation: 0,
             search_query: String::new(),
+            suggest_generation: 0,
+            pending_suggest: None,
             tv_code_at: None,
             account_generation: 0,
             page_requests: HashSet::new(),
@@ -176,6 +188,15 @@ impl App {
         app.jobs
             .spawn(move || Msg::Positions(player::load_positions(&pos_data)));
         app.jobs.spawn(move || Msg::Tools(yt::ensure_tools(&data)));
+        let (cache_max_bytes, cache_max_files) = if low_power {
+            (64 * 1024 * 1024, 1500)
+        } else {
+            (256 * 1024 * 1024, 4000)
+        };
+        app.jobs.spawn(move || {
+            yt::prune_image_cache(&cache, cache_max_bytes, cache_max_files);
+            Msg::Quiet
+        });
         match start {
             Start::Play(id, title) => {
                 app.quit_after_play = true;
@@ -342,7 +363,13 @@ impl App {
                     .map(|r| r.chars().filter(|c| !c.is_control()).collect::<String>() + "\n")
                     .collect();
                 let _ = std::fs::create_dir_all(&self.data);
-                let _ = std::fs::write(self.data.join("searches.txt"), list);
+                let searches_path = self.data.join("searches.txt");
+                let tmp = cattube_core::util::unique_tmp_path(&searches_path, "tmp");
+                if std::fs::write(&tmp, list).is_err() || std::fs::rename(&tmp, &searches_path).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                self.pending_suggest = None;
+                self.suggest_generation += 1;
                 self.search_generation += 1;
                 self.search_query = q.clone();
                 let generation = self.search_generation;
@@ -358,12 +385,9 @@ impl App {
                 })
             }
             Effect::Suggest(q) => {
-                let hl = self.prefs.language.key().to_string();
-                self.jobs.spawn(move || {
-                    std::thread::sleep(Duration::from_millis(200));
-                    let s = yt::suggestions(&q, &hl);
-                    Msg::Suggestions(q, s)
-                });
+                self.suggest_generation += 1;
+                self.pending_suggest = Some((q, Instant::now() + SUGGEST_DEBOUNCE));
+                ctx.request_repaint_after(SUGGEST_DEBOUNCE);
             }
             Effect::Details(id) => {
                 let id2 = id.clone();
@@ -772,7 +796,11 @@ impl App {
                     self.tube.on_search_more(r);
                 }
             }
-            Msg::Suggestions(q, s) => self.tube.on_suggestions(&q, s),
+            Msg::Suggestions(generation, q, s) => {
+                if generation == self.suggest_generation {
+                    self.tube.on_suggestions(&q, s);
+                }
+            }
             Msg::Details(id, r) => self.tube.on_details(&id, r),
             Msg::Votes(id, v) => {
                 if let Some(v) = v {
@@ -817,9 +845,12 @@ impl App {
             }
             Msg::Done(t) => self.toast(ctx, &t),
             Msg::Quiet => {}
-            Msg::Image(url, image) => {
-                self.fetching.remove(&url);
-                self.images.complete(url, image, ctx.cumulative_frame_nr());
+            Msg::Images(batch) => {
+                let frame = ctx.cumulative_frame_nr();
+                for (url, image) in batch {
+                    self.fetching.remove(&url);
+                    self.images.complete(url, image, frame);
+                }
             }
             Msg::Tools(r) => {
                 let ok = r.is_ok();
@@ -912,6 +943,8 @@ impl App {
     fn reset_requests(&mut self) {
         self.account_generation += 1;
         self.search_generation += 1;
+        self.suggest_generation += 1;
+        self.pending_suggest = None;
         self.page_requests.clear();
         self.home_prefetches = 0;
     }
@@ -946,27 +979,43 @@ impl App {
     }
 
     fn fetch_pictures(&mut self) {
-        let parallel = if self.low_power { 2 } else { 4 };
+        let max_in_flight = if self.low_power { 6 } else { 12 };
+        let batch_size = if self.low_power { 4 } else { 8 };
         let max_side = if self.low_power { 320 } else { 640 };
+        let mut batch = Vec::new();
         for url in self.images.take_wanted() {
-            if self.fetching.len() >= parallel {
+            if self.fetching.len() >= max_in_flight || batch.len() >= batch_size {
                 break;
             }
             if !self.fetching.insert(url.clone()) {
                 continue;
             }
-            let cache = self.cache.clone();
-            let requested = url.clone();
-            if !self.jobs.try_spawn(move || {
-                let image = yt::fetch_image(&cache, &requested).and_then(|path| {
-                    let decoded = images::decode(&path, max_side);
-                    if decoded.is_none() {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    decoded
-                });
-                Msg::Image(requested, image)
-            }) {
+            batch.push(url);
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let cache = self.cache.clone();
+        let low_power = self.low_power;
+        let requested = batch.clone();
+        if !self.jobs.try_spawn(move || {
+            let fetched = yt::fetch_images_batch(&cache, &requested, low_power);
+            let decoded = fetched
+                .into_iter()
+                .map(|(url, path)| {
+                    let image = path.and_then(|p| {
+                        let d = images::decode(&p, max_side);
+                        if d.is_none() {
+                            let _ = std::fs::remove_file(&p);
+                        }
+                        d
+                    });
+                    (url, image)
+                })
+                .collect();
+            Msg::Images(decoded)
+        }) {
+            for url in batch {
                 self.fetching.remove(&url);
             }
         }
@@ -976,6 +1025,30 @@ impl App {
 fn search_matches(tube: &Tube, current: u64, received: u64, query: &str) -> bool {
     current == received
         && matches!(tube.screen(), Some(Screen::Search { osk, .. }) if osk.text().trim() == query.trim())
+}
+
+fn take_due_suggestion(
+    tube: &Tube,
+    pending: &mut Option<(String, Instant)>,
+    now: Instant,
+) -> PendingSuggest {
+    let Some((query, due)) = pending.as_ref() else {
+        return PendingSuggest::None;
+    };
+    let still_matching = matches!(
+        tube.screen(),
+        Some(Screen::Search { osk, .. }) if osk.text().trim() == query.trim() && osk.text().trim().len() >= 2
+    );
+    if !still_matching {
+        *pending = None;
+        return PendingSuggest::None;
+    }
+    if now >= *due {
+        let (query, _) = pending.take().expect("checked above");
+        PendingSuggest::Ready(query)
+    } else {
+        PendingSuggest::Wait(*due - now)
+    }
 }
 
 fn hit_test(hits: &[(egui::Rect, Target)], pos: egui::Pos2) -> Option<Target> {
@@ -992,6 +1065,19 @@ impl eframe::App for App {
         }
         for msg in self.jobs.drain() {
             self.message(ctx, msg);
+        }
+        match take_due_suggestion(&self.tube, &mut self.pending_suggest, Instant::now()) {
+            PendingSuggest::Ready(q) => {
+                self.suggest_generation += 1;
+                let generation = self.suggest_generation;
+                let hl = self.prefs.language.key().to_string();
+                self.jobs.spawn(move || {
+                    let s = yt::suggestions(&q, &hl);
+                    Msg::Suggestions(generation, q, s)
+                });
+            }
+            PendingSuggest::Wait(wait) => ctx.request_repaint_after(wait),
+            PendingSuggest::None => {}
         }
         if let Some(Screen::TvCode { code }) = self.tube.screen() {
             let stale = self
@@ -1186,21 +1272,10 @@ fn hand_back_screen() -> bool {
     asked
 }
 
-/// Add where videos stopped to `positions.conf` (read, merge, write: the
-/// phone-remote service writes it too).
+/// Add where videos stopped to `positions.conf` (read, merge, write atomically:
+/// the phone-remote service writes it too).
 fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) {
-    if ended.is_empty() {
-        return;
-    }
-    let path = data.join("positions.conf");
-    let mut list = std::fs::read_to_string(&path)
-        .map(|t| player::parse_positions(&t))
-        .unwrap_or_default();
-    for (id, pos, dur) in ended {
-        player::remember(&mut list, id, *pos, *dur);
-    }
-    let _ = std::fs::create_dir_all(data);
-    let _ = std::fs::write(&path, player::positions_text(&list));
+    let _ = player::save_positions_merged(data, ended);
 }
 
 /// `--feed`: the newest videos of a list, one per line, for a TV home
@@ -1441,5 +1516,50 @@ mod tests {
             renderer_for(Some("glow"), false),
             (eframe::Renderer::Glow, true)
         );
+    }
+
+    #[test]
+    fn suggest_debounce_cancels_stale_and_fires_once_when_due() {
+        let (mut tube, _) = Tube::open(Ctx::default());
+        tube.header = true;
+        tube.header_index = Section::ALL
+            .iter()
+            .position(|s| *s == Section::Search)
+            .unwrap();
+        tube.handle(Action::Ok, Ctx::default(), &|_| false);
+        if let Some(Screen::Search { osk, .. }) = tube.stack.last_mut() {
+            osk.set_text("cat");
+        }
+        let t0 = Instant::now();
+        let mut pending = Some(("cat".to_string(), t0 + SUGGEST_DEBOUNCE));
+        // Before deadline: waits without firing.
+        assert!(matches!(
+            take_due_suggestion(&tube, &mut pending, t0 + Duration::from_millis(50)),
+            PendingSuggest::Wait(_)
+        ));
+        // At deadline: fires once and clears pending.
+        assert!(matches!(
+            take_due_suggestion(&tube, &mut pending, t0 + SUGGEST_DEBOUNCE),
+            PendingSuggest::Ready(ref q) if q == "cat"
+        ));
+        assert!(pending.is_none());
+        // If user edited the query before deadline, stale pending is dropped.
+        let mut stale = Some(("cat".to_string(), t0 + SUGGEST_DEBOUNCE));
+        if let Some(Screen::Search { osk, .. }) = tube.stack.last_mut() {
+            osk.set_text("cats");
+        }
+        assert!(matches!(
+            take_due_suggestion(&tube, &mut stale, t0 + SUGGEST_DEBOUNCE),
+            PendingSuggest::None
+        ));
+        assert!(stale.is_none());
+        // If user left Search screen, pending is dropped.
+        let mut left = Some(("cats".to_string(), t0 + SUGGEST_DEBOUNCE));
+        tube.stack.pop();
+        assert!(matches!(
+            take_due_suggestion(&tube, &mut left, t0 + SUGGEST_DEBOUNCE),
+            PendingSuggest::None
+        ));
+        assert!(left.is_none());
     }
 }

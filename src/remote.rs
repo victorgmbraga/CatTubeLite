@@ -350,6 +350,7 @@ struct Remote {
     /// What was last reported, to report changes only.
     reported: Option<Playing>,
     reported_at: Instant,
+    last_poll: Option<Instant>,
     volume: (u32, bool),
     listener: Option<Child>,
 }
@@ -583,7 +584,17 @@ impl Remote {
             // Played from the phone: nothing of CatTube's to go back to.
             hide_on_back: false,
         };
-        if let Err(e) = yt::ensure_tools(&self.data) {
+        let find = |n: &str| cattube_core::process::find_executable(n);
+        if player::yt_dlp_path(&self.data).is_file()
+            && player::js_runtime(&self.data, &find).is_some()
+        {
+            if yt::tools_stale(&self.data) {
+                let data = self.data.clone();
+                std::thread::spawn(move || {
+                    let _ = yt::ensure_tools(&data);
+                });
+            }
+        } else if let Err(e) = yt::ensure_tools(&self.data) {
             log(&format!("player not ready: {e}"));
             return;
         }
@@ -649,19 +660,11 @@ impl Remote {
     /// The player closed: keep its place, play the next in the queue when
     /// the video ran to its end.
     fn ended(&mut self, seq: u64, ended: yt::Ended) {
-        let data = &self.data;
-        let mut positions = std::fs::read_to_string(data.join("positions.conf"))
-            .map(|t| player::parse_positions(&t))
-            .unwrap_or_default();
-        let mut finished = false;
-        for (id, pos, dur) in &ended.positions {
-            player::remember(&mut positions, id, *pos, *dur);
-            finished = dur.is_some_and(|d| *pos >= d - 5.0);
-        }
-        let _ = std::fs::write(
-            data.join("positions.conf"),
-            player::positions_text(&positions),
-        );
+        let _ = player::save_positions_merged(&self.data, &ended.positions);
+        let finished = ended
+            .positions
+            .last()
+            .is_some_and(|(_, pos, dur)| dur.is_some_and(|d| *pos >= d - 5.0));
         if self.player.as_ref().is_none_or(|p| p.seq != seq) {
             return; // an older player that was replaced
         }
@@ -697,6 +700,13 @@ impl Remote {
         }
         let (v, m) = self.volume;
         let set_volume = self.player.as_ref().is_some_and(|p| !p.volume_set);
+        if !set_volume
+            && self
+                .last_poll
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
         let Some(c) = self.conn() else { return };
         if set_volume {
             // A new player starts at full volume: keep the phone's.
@@ -723,6 +733,7 @@ impl Remote {
             .get_f64("volume")
             .map(|v| v.round().clamp(0.0, 100.0) as u32);
         let muted = c.get_bool("mute").unwrap_or(false);
+        self.last_poll = Some(Instant::now());
         let Some(p) = self.player.as_ref() else {
             return;
         };
@@ -791,7 +802,7 @@ pub fn run() -> i32 {
     let mut wait = Duration::from_secs(5);
     let screen = loop {
         if !casting_enabled() {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_secs(1));
             continue;
         }
         match screen(&config) {
@@ -819,6 +830,7 @@ pub fn run() -> i32 {
         cpn: String::new(),
         reported: None,
         reported_at: Instant::now(),
+        last_poll: None,
         volume: (100, false),
         listener: None,
     };
@@ -833,7 +845,7 @@ pub fn run() -> i32 {
                 wait = Duration::from_secs(5);
                 enabled = false;
             }
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_secs(1));
             continue;
         }
         enabled = true;

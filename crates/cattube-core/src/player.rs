@@ -422,17 +422,46 @@ pub fn store_checkpoint(data: &Path, id: &str, point: Checkpoint) -> std::io::Re
     let folder = data.join("positions");
     std::fs::create_dir_all(&folder)?;
     let path = folder.join(format!("{id}.pos"));
-    let tmp = folder.join(format!("{id}.{}.tmp", std::process::id()));
-    std::fs::write(
-        &tmp,
-        format!(
-            "{:.3} {:.3} {}\n",
-            point.position,
-            point.duration.unwrap_or(0.0),
-            u8::from(point.finished)
-        ),
-    )?;
-    std::fs::rename(tmp, path)
+    let tmp = crate::util::unique_tmp_path(&path, "tmp");
+    let body = format!(
+        "{:.3} {:.3} {}\n",
+        point.position,
+        point.duration.unwrap_or(0.0),
+        u8::from(point.finished)
+    );
+    let res = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, &path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// Merge finished/stopped playback positions into `positions.conf` atomically.
+pub fn save_positions_merged(
+    data: &Path,
+    ended: &[(String, f64, Option<f64>)],
+) -> std::io::Result<()> {
+    use std::sync::Mutex;
+    static LOCK: Mutex<()> = Mutex::new(());
+    if ended.is_empty() {
+        return Ok(());
+    }
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(data)?;
+    let path = data.join("positions.conf");
+    let mut list = std::fs::read_to_string(&path)
+        .map(|t| parse_positions(&t))
+        .unwrap_or_default();
+    for (id, pos, dur) in ended {
+        remember(&mut list, id, *pos, *dur);
+    }
+    let tmp = crate::util::unique_tmp_path(&path, "tmp");
+    let res =
+        std::fs::write(&tmp, positions_text(&list)).and_then(|()| std::fs::rename(&tmp, &path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
@@ -705,6 +734,41 @@ mod tests {
         assert_eq!(load_positions(&root), vec![("WhWc3b3KhnY".into(), 0.5)]);
         std::fs::write(root.join("positions/WhWc3b3KhnY.pos"), "NaN 20 0\n").unwrap();
         assert!(checkpoint(&root, "WhWc3b3KhnY").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn save_positions_merged_creates_dir_merges_and_leaves_no_tmp_files() {
+        let root = std::env::temp_dir().join(format!(
+            "cattube-pos-merge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        save_positions_merged(&root, &[("WhWc3b3KhnY".into(), 42.5, Some(200.0))]).unwrap();
+        save_positions_merged(
+            &root,
+            &[
+                ("B4EPW7JUMTM".into(), 10.0, Some(100.0)),
+                ("WhWc3b3KhnY".into(), 88.0, Some(200.0)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            load_positions(&root),
+            vec![
+                ("B4EPW7JUMTM".into(), 10.0),
+                ("WhWc3b3KhnY".into(), 88.0),
+            ]
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

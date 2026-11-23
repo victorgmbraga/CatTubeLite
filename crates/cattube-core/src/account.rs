@@ -368,21 +368,8 @@ pub fn load(config: &Path) -> Accounts {
 
 /// Save with mode 0600 (tokens), atomically.
 pub fn save(config: &Path, a: &Accounts) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     std::fs::create_dir_all(config)?;
-    let path = accounts_path(config);
-    let tmp = path.with_extension("conf.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(a.to_conf().as_bytes())?;
-    }
-    std::fs::rename(tmp, path)
+    crate::util::write_private(&accounts_path(config), &a.to_conf())
 }
 
 /// A UUID-shaped device id from 16 random hex bytes.
