@@ -959,6 +959,7 @@ pub fn raise_window(window: &str) -> bool {
 
 /// What the player loop needs from the app.
 pub struct Session {
+    pub low_power: bool,
     pub ctx: String,
     pub refresh: Option<String>,
     pub cache: PathBuf,
@@ -1505,7 +1506,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     }
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
-                        let fmt = player::format_string(h, s.codec, s.hdr);
+                        let fmt = player::format_string(h, s.codec, s.hdr, s.low_power);
                         let _ = conn.command(&[
                             Arg::Str("set_property"),
                             Arg::Str("ytdl-format"),
@@ -1569,6 +1570,7 @@ pub fn spawn_watcher(first: yt::Tile, s: Session, done: impl FnOnce(Ended) + Sen
                     {
                         let id = cur.id.clone();
                         let rs = Session {
+                            low_power: s.low_power,
                             ctx: s.ctx.clone(),
                             refresh: s.refresh.clone(),
                             cache: s.cache.clone(),

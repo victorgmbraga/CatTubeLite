@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+#[cfg(target_arch = "aarch64")]
+pub const DENO_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip";
+#[cfg(not(target_arch = "aarch64"))]
 pub const DENO_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
 /// How often CatTube asks yt-dlp to update itself.
@@ -150,7 +154,7 @@ pub fn resolution_label(h: u32) -> String {
 
 /// yt-dlp's format choice: the preferred codec at most `max_h` high, then
 /// any codec at that height, then anything. `hdr = false` keeps to SDR.
-pub fn format_string(max_h: u32, codec: Codec, hdr: bool) -> String {
+pub fn format_string(max_h: u32, codec: Codec, hdr: bool, low_power: bool) -> String {
     let h = if max_h == 0 {
         String::new()
     } else {
@@ -164,7 +168,20 @@ pub fn format_string(max_h: u32, codec: Codec, hdr: bool) -> String {
     } else {
         String::new()
     };
-    format!("bv*{h}{sdr}[vcodec^={p}]+ba{alt}/bv*{h}{sdr}+ba/bv*{h}+ba/b{h}/b")
+    let general = format!("bv*{h}{sdr}[vcodec^={p}]+ba{alt}/bv*{h}{sdr}+ba/bv*{h}+ba/b{h}/b");
+    if !low_power {
+        return general;
+    }
+    // Try capped formats with either separate or combined audio before
+    // falling back to higher frame rates or an unknown frame rate.
+    let sdr = if hdr { "" } else { "[dynamic_range=?SDR]" };
+    let cap = format!("{h}{sdr}[fps<=30]");
+    let preferred = if codec == Codec::Vp9 {
+        "[vcodec~='^(vp09|vp9$)']".to_string()
+    } else {
+        format!("[vcodec^={p}]")
+    };
+    format!("(bv*{cap}{preferred}+ba/b{cap}{preferred})/bv*{cap}+ba/b{cap}/{general}")
 }
 
 /// Playback speeds the player offers.
@@ -184,6 +201,7 @@ pub const SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 /// Everything that shapes one playback.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayOptions {
+    pub low_power: bool,
     /// How much to load ahead, in MiB (the Buffer setting).
     pub buffer_mib: u32,
     pub video_id: String,
@@ -235,6 +253,9 @@ pub fn mpv_argv(
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if o.low_power {
+        v.push("--hwdec=auto-safe".into());
+    }
     v.push(format!(
         "--demuxer-max-bytes={}MiB",
         o.buffer_mib.clamp(16, 1024)
@@ -265,6 +286,9 @@ pub fn mpv_argv(
     if o.hide_on_back {
         opts.push("cattube_osd-hide=yes".to_string());
     }
+    if o.low_power {
+        opts.push("cattube_osd-low_power=yes".into());
+    }
     opts.push(format!(
         "cattube_osd-position_dir={}",
         data.join("positions").display()
@@ -272,7 +296,7 @@ pub fn mpv_argv(
     v.push(format!("--script-opts={}", opts.join(",")));
     v.push(format!(
         "--ytdl-format={}",
-        format_string(o.max_height, o.codec, o.hdr)
+        format_string(o.max_height, o.codec, o.hdr, o.low_power)
     ));
     let mut raw: Vec<String> = Vec::new();
     if let Some(js) = js {
@@ -469,11 +493,11 @@ mod tests {
     #[test]
     fn formats() {
         assert_eq!(
-            format_string(1080, Codec::Avc, false),
+            format_string(1080, Codec::Avc, false, false),
             "bv*[height<=1080][dynamic_range=SDR][vcodec^=avc1]+ba/bv*[height<=1080][dynamic_range=SDR]+ba/bv*[height<=1080]+ba/b[height<=1080]/b"
         );
         assert_eq!(
-            format_string(0, Codec::Vp9, true),
+            format_string(0, Codec::Vp9, true, false),
             "bv*[vcodec^=vp09]+ba/bv*[vcodec=vp9]+ba/bv*+ba/bv*+ba/b/b"
         );
         assert_eq!(Codec::from_key("av1"), Codec::Av1);
@@ -483,8 +507,21 @@ mod tests {
     }
 
     #[test]
+    fn low_power_tries_all_capped_formats_before_uncapped_fallbacks() {
+        let selector = format_string(720, Codec::Vp9, false, true);
+        let capped = "[height<=720][dynamic_range=?SDR][fps<=30]";
+        let vp9 = "[vcodec~='^(vp09|vp9$)']";
+        let priority = format!("(bv*{capped}{vp9}+ba/b{capped}{vp9})/bv*{capped}+ba/b{capped}/");
+        assert_eq!(
+            selector,
+            priority + &format_string(720, Codec::Vp9, false, false)
+        );
+    }
+
+    #[test]
     fn mpv_command_line() {
         let o = PlayOptions {
+            low_power: false,
             buffer_mib: 256,
             video_id: "WhWc3b3KhnY".into(),
             title: "Spring\n".into(),
@@ -538,6 +575,7 @@ mod tests {
         let o2 = PlayOptions {
             start: 0.0,
             sub_langs: String::new(),
+            low_power: true,
             ..o
         };
         let v2 = mpv_argv(
@@ -549,6 +587,12 @@ mod tests {
         );
         assert!(!v2.iter().any(|a| a.starts_with("--start")));
         assert!(!v2.iter().any(|a| a.starts_with("--ytdl-raw-options")));
+        assert!(v2.iter().any(|a| a == "--hwdec=auto-safe"));
+        assert!(v2.iter().any(|a| a.contains("cattube_osd-low_power=yes")));
+        assert!(
+            v2.iter()
+                .any(|a| a.starts_with("--ytdl-format=") && a.contains("[fps<=30]"))
+        );
     }
 
     #[test]

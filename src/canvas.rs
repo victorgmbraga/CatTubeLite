@@ -32,6 +32,7 @@ pub struct Canvas<H: Copy = ()> {
     /// Screen points per design unit.
     pub s: f32,
     pub screen: Rect,
+    pub reduce_motion: bool,
     hits: Rc<RefCell<Vec<(Rect, H)>>>,
     interactive: bool,
 }
@@ -54,6 +55,7 @@ impl<H: Copy> Canvas<H> {
             origin,
             s,
             screen,
+            reduce_motion: false,
             hits: Rc::new(RefCell::new(Vec::new())),
             interactive: true,
         }
@@ -133,6 +135,9 @@ impl<H: Copy> Canvas<H> {
 
     /// Soft drop shadow / glow under a rounded rect.
     pub fn shadow(&self, rect: Rect, radius: f32, offset_y: f32, blur: f32, color: Color32) {
+        if theme::FLAT {
+            return;
+        }
         // egui feathers a shadow by offsetting the outline inwards by half
         // the blur: when that is more than the element's half-height (or
         // more than the corner radius) the inner path folds over and
@@ -370,6 +375,9 @@ impl<H: Copy> Canvas<H> {
     /// focused app's name, a page's tiles). Unlike [`Self::anim`], whose
     /// first value is already the target.
     pub fn appear(&self, id: impl std::hash::Hash + std::fmt::Debug, secs: f32) -> f32 {
+        if self.reduce_motion {
+            return 1.0;
+        }
         let id = egui::Id::new(("appear", id));
         let now = self.ctx.input(|i| i.time);
         let frame = self.ctx.cumulative_frame_nr();
@@ -391,6 +399,9 @@ impl<H: Copy> Canvas<H> {
 
     /// Focus and scrolling retain their velocity during repeated input.
     pub fn anim(&self, id: impl std::hash::Hash + std::fmt::Debug, target: f32) -> f32 {
+        if self.reduce_motion {
+            return target;
+        }
         let id = egui::Id::new(("motion", id));
         let now = self.ctx.input(|i| i.time);
         let (value, _, moving) = self.ctx.data_mut(|d| {
@@ -409,6 +420,9 @@ impl<H: Copy> Canvas<H> {
         key: K,
         seconds: f32,
     ) -> f32 {
+        if self.reduce_motion {
+            return 1.0;
+        }
         let id = egui::Id::new(("entrance", id));
         let now = self.ctx.input(|i| i.time);
         let value = self.ctx.data_mut(|d| {
@@ -444,6 +458,10 @@ impl<H: Copy> Canvas<H> {
     /// [`Self::background`] at time `t` (seconds): the light bands drift
     /// and turn slowly so the screen is never a still picture. Periods are long and unrelated, so it never visibly loops.
     pub fn background_at(&self, tint: Option<Rgb>, glow: bool, t: f64) {
+        if theme::FLAT {
+            self.fill(self.screen, 0.0, Color32::BLACK);
+            return;
+        }
         self.vgradient(
             self.screen,
             theme::rgb(theme::BG_TOP),
@@ -540,6 +558,9 @@ impl<H: Copy> Canvas<H> {
     /// A rounded rect filled with a top-to-bottom gradient (sheens on glass).
     pub fn rounded_gradient(&self, rect: Rect, radius: f32, color: Rgb, top: u8, bottom: u8) {
         use std::f32::consts::FRAC_PI_2;
+        if theme::FLAT {
+            return;
+        }
         let r = (radius * self.s)
             .min(rect.width() / 2.0)
             .min(rect.height() / 2.0);
@@ -645,7 +666,7 @@ impl<H: Copy> Canvas<H> {
     /// dithered when it is quantised). `sigma` and `offset_y` in design
     /// units; `color` carries the shadow's colour and strength.
     pub fn soft_shadow(&self, rect: Rect, radius: f32, sigma: f32, offset_y: f32, color: Color32) {
-        if color.a() == 0 {
+        if theme::FLAT || color.a() == 0 {
             return;
         }
         let r_px = (radius * self.s).round().clamp(0.0, 160.0) as u32;
@@ -686,7 +707,7 @@ impl<H: Copy> Canvas<H> {
     /// down the corners (the 1-px inner highlight of focused glass).
     pub fn top_highlight(&self, rect: Rect, radius: f32, color: Color32) {
         use std::f32::consts::FRAC_PI_2;
-        if color.a() == 0 {
+        if theme::FLAT || color.a() == 0 {
             return;
         }
         let w = (self.s * 0.45).max(1.0);
