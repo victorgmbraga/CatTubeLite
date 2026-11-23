@@ -221,6 +221,11 @@ fn now_playing_bar(c: &C, tile: &Tile, focused: bool) {
 
 /// The screen under the video menu.
 fn draw_under(c: &C, v: &View) {
+    if theme::FLAT {
+        // A solid cover: nothing to draw beneath it.
+        c.fill(c.screen, 0.0, Color32::BLACK);
+        return;
+    }
     let below = v.tube.stack.len().saturating_sub(2);
     match v.tube.stack.get(below) {
         Some(Screen::Page {
@@ -259,6 +264,10 @@ fn draw_under(c: &C, v: &View) {
 /// The focused video's picture across the screen, cross-faded when it
 /// changes and darkened so the text reads.
 fn backdrop(c: &C, v: &View, tile: Option<&Tile>) {
+    // BTV9: plain black, no picture behind the screens.
+    if theme::FLAT {
+        return;
+    }
     let dark = theme::BG_BOTTOM;
     // Blurred, so the text over it reads and the eye stays on the cards.
     let url = tile
@@ -484,8 +493,11 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
         // copy fills the sides (squeezed into the card it looked wrong).
         (Kind::Short, Some(tex)) => {
             let k = c.appear(("tube-pic", &t.thumb), 0.3);
-            let tint = Color32::from_white_alpha((255.0 * k) as u8);
-            match v.pics.get(c, &format!("{}#blur", t.thumb)) {
+            let tint = Color32::from_gray((255.0 * k) as u8);
+            let soft = (!theme::FLAT)
+                .then(|| v.pics.get(c, &format!("{}#blur", t.thumb)))
+                .flatten();
+            match soft {
                 Some(soft) => c.image_rounded(rect, RADIUS, soft, tint),
                 None => c.fill(rect, RADIUS, theme::rgba(theme::BLACK, 200)),
             }
@@ -499,7 +511,7 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, w: f32, h: f32, focus: f32) {
                 RADIUS,
                 tex,
                 crop_16_9(v.pics.size(&t.thumb)),
-                Color32::from_white_alpha((255.0 * k) as u8),
+                Color32::from_gray((255.0 * k) as u8),
             );
         }
         (_, None) => c.fill(rect, RADIUS, theme::glass()),

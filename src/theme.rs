@@ -17,8 +17,20 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 pub type Rgb = (u8, u8, u8);
 
-/// Unmultiplied colour from an RGB tuple and alpha.
+/// BTV9: no translucent surfaces, shadows or sheens (the Mali-450 pays for
+/// every blended layer). See [`rgba`].
+pub const FLAT: bool = true;
+
+/// Colour from an RGB tuple and alpha. With [`FLAT`] the alpha is resolved
+/// against black, so the result is solid; 0 stays invisible.
 pub fn rgba(c: Rgb, a: u8) -> Color32 {
+    if FLAT {
+        if a == 0 {
+            return Color32::TRANSPARENT;
+        }
+        let m = |x: u8, y: u8| ((x as u32 * a as u32 + y as u32 * (255 - a as u32)) / 255) as u8;
+        return Color32::from_rgb(m(c.0, BLACK.0), m(c.1, BLACK.1), m(c.2, BLACK.2));
+    }
     Color32::from_rgba_unmultiplied(c.0, c.1, c.2, a)
 }
 

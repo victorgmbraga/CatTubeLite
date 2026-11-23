@@ -47,6 +47,9 @@ pub fn focus_pill<H: Copy>(c: &Canvas<H>, rect: Rect, radius: f32, t: f32) {
     if t <= 0.01 {
         return;
     }
+    if theme::FLAT {
+        c.fill(rect, radius, theme::rgba(theme::WHITE, (34.0 * t) as u8));
+    }
     c.rounded_gradient(
         rect,
         radius,
@@ -191,6 +194,9 @@ pub fn button<H: Copy>(c: &Canvas<H>, rect: Rect, label: &str, style: ButtonStyl
             focus_pill(c, rect, radius, t);
         }
         _ if t > 0.01 => {
+            if theme::FLAT {
+                c.outline(rect, radius, 2.0, theme::rgba(theme::WHITE, (255.0 * t) as u8));
+            }
             c.rounded_gradient(rect, radius, theme::WHITE, (34.0 * t) as u8, 0);
             c.top_highlight(rect, radius, theme::rgba(theme::WHITE, (150.0 * t) as u8));
         }
