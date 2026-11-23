@@ -1707,6 +1707,251 @@ fn safe_media_title(title: &str) -> String {
         .collect()
 }
 
+/// Wait for mpv to answer with a playing video (up to a minute). `None`: the
+/// player went away, or was stopped for never getting there.
+fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Option<mpv::IpcConn> {
+    let started = Instant::now();
+    loop {
+        if player.exited() {
+            return None;
+        }
+        if let Ok(mut c) = mpv::IpcConn::connect(socket)
+            && c.get_f64("time-pos").is_some()
+        {
+            return Some(c);
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            player.stop_and_reap();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// YouTube's pick for what follows `id`, delivered on `tx`.
+fn spawn_next_lookup(s: &Session, id: String, tx: std::sync::mpsc::Sender<Option<yt::Tile>>) {
+    let (ctx, refresh) = (s.ctx.clone(), s.refresh.clone());
+    std::thread::spawn(move || {
+        let next = details(&ctx, &id, refresh.as_deref()).ok().and_then(|d| {
+            let id = d.autoplay?;
+            Some(
+                d.related
+                    .into_iter()
+                    .find(|t| t.id == id)
+                    .unwrap_or(yt::Tile {
+                        thumb: yt::video_thumb(&id),
+                        id,
+                        title: "Next video".into(),
+                        ..Default::default()
+                    }),
+            )
+        });
+        let _ = tx.send(next);
+    });
+}
+
+/// Offer live chat on the bar once this stream's token is found.
+fn spawn_chat_lookup(
+    id: String,
+    region: String,
+    slot: std::sync::Arc<Mutex<Option<String>>>,
+    video_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    current_gen: u64,
+) {
+    std::thread::spawn(move || {
+        if let Some(t) = live_chat_token(&id, &region)
+            && video_gen.load(std::sync::atomic::Ordering::SeqCst) == current_gen
+        {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
+            let _ = mpv::ipc_request(
+                &player::player_socket(),
+                &[
+                    Arg::Str("script-message"),
+                    Arg::Str("cattube-chat-available"),
+                    Arg::Str("yes"),
+                ],
+            );
+        }
+    });
+}
+
+fn spawn_segments_lookup(url: String, tx: std::sync::mpsc::Sender<Vec<community::Segment>>) {
+    std::thread::spawn(move || {
+        let segments = curl(&url, None, None)
+            .ok()
+            .map(|b| community::parse_segments(&b))
+            .unwrap_or_default();
+        let _ = tx.send(segments);
+    });
+}
+
+/// SponsorBlock: jump over the segment at `p`, once. True when the skip runs
+/// to the end of the video, which then ends here: seeking past the real end
+/// can leave mpv paused without reporting it.
+fn skip_segment(
+    conn: &mut mpv::IpcConn,
+    segments: &[community::Segment],
+    skipped: &mut Vec<f64>,
+    p: f64,
+    dur: Option<f64>,
+    looping: bool,
+) -> bool {
+    let Some((to, cat)) = community::skip_at(segments, p, dur, skipped) else {
+        return false;
+    };
+    if let Some(seg) = segments.iter().find(|x| p >= x.start && p < x.end) {
+        skipped.push(seg.start);
+    }
+    let to_end = dur.is_some_and(|d| to >= d - 1.0);
+    if looping && to_end {
+        skipped.clear();
+        let _ = conn.command(&[Arg::Str("seek"), Arg::Num(0.0), Arg::Str("absolute")]);
+    } else if to_end {
+        let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("pause"), Arg::Str("yes")]);
+    } else {
+        let _ = conn.command(&[Arg::Str("seek"), Arg::Num(to), Arg::Str("absolute")]);
+    }
+    osd(
+        conn,
+        &format!("Skipped: {}", community::category_label(&cat)),
+    );
+    to_end && !looping
+}
+
+/// Quality from the control bar: same video, same place.
+fn change_quality(conn: &mut mpv::IpcConn, s: &Session, cur: &yt::Tile, height: u32, at: f64) {
+    let fmt = player::format_string(height, s.codec, s.hdr, s.low_power);
+    let _ = conn.command(&[
+        Arg::Str("set_property"),
+        Arg::Str("ytdl-format"),
+        Arg::Str(&fmt),
+    ]);
+    let title = safe_media_title(&cur.title);
+    let opts = if title.trim().is_empty() {
+        format!("start={at:.3}")
+    } else {
+        format!(
+            "start={at:.3},force-media-title={}",
+            mpv::option_value(&title)
+        )
+    };
+    loadfile_replace(conn, &cur.watch_url(), &opts);
+    osd(
+        conn,
+        &format!("Quality: {}", player::resolution_label(height)),
+    );
+}
+
+/// Comments for the control bar's panel, fetched aside so skipping and the
+/// bar stay on time. `arg`: "first", or the token of the next page.
+fn spawn_comments(
+    s: &Session,
+    id: String,
+    arg: String,
+    video_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    current_gen: u64,
+) {
+    let token = if arg == "first" { String::new() } else { arg };
+    let (ctx, refresh) = (s.ctx.clone(), s.refresh.clone());
+    std::thread::spawn(move || {
+        let json = comments_json(comments(&ctx, &id, &token, refresh.as_deref()));
+        if video_gen.load(std::sync::atomic::Ordering::SeqCst) == current_gen {
+            let _ = mpv::ipc_request(
+                &player::player_socket(),
+                &[
+                    Arg::Str("script-message"),
+                    Arg::Str("cattube-comments-data"),
+                    Arg::Str(&json),
+                ],
+            );
+        }
+    });
+}
+
+/// The newest valid request for the related-videos browser.
+fn related_request(msgs: &[Vec<String>]) -> Option<String> {
+    msgs.iter()
+        .rev()
+        .find(|m| m.first().map(String::as_str) == Some("cattube-related"))
+        .and_then(|m| m.get(1))
+        .filter(|s| s.len() <= 20 && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .cloned()
+}
+
+/// A new request supersedes prior work, including replies from the previous
+/// video. The Lua browser preserves its focus as each thumbnail arrives.
+fn spawn_related(
+    s: &Session,
+    id: String,
+    request: String,
+    requests: std::sync::Arc<RelatedRequests>,
+) {
+    let rs = Session {
+        low_power: s.low_power,
+        ctx: s.ctx.clone(),
+        refresh: s.refresh.clone(),
+        cache: s.cache.clone(),
+        autoplay: s.autoplay,
+        sponsorblock: None,
+        codec: s.codec,
+        hdr: s.hdr,
+        region: s.region.clone(),
+        queue: Vec::new(),
+        on_hide: None,
+        on_video: None,
+    };
+    let expected = requests.begin();
+    std::thread::spawn(move || send_related(&rs, &id, &request, &requests, expected));
+}
+
+/// The last related video picked in the player, if a valid one.
+fn picked_related(msgs: &[Vec<String>]) -> Option<yt::Tile> {
+    msgs.iter()
+        .filter(|m| m.first().map(String::as_str) == Some("cattube-related-pick"))
+        .filter_map(|m| {
+            let id = m.get(1)?;
+            yt::is_video_id(id).then(|| yt::Tile {
+                id: id.clone(),
+                title: m.get(2).cloned().unwrap_or_default(),
+                byline: m.get(3).cloned().unwrap_or_default(),
+                thumb: yt::video_thumb(id),
+                ..yt::Tile::default()
+            })
+        })
+        .next_back()
+}
+
+/// The "Up next" card, counting down from five.
+fn show_up_next(conn: &mut mpv::IpcConn, next: &yt::Tile, thumb: Option<&CardThumbnail>) {
+    let mut args: Vec<String> = vec!["next".into(), next.title.clone(), "5".into()];
+    if let Some(pic) = thumb {
+        let (p, w, h) = &pic.0;
+        args.extend([p.clone(), w.to_string(), h.to_string()]);
+    }
+    let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    card(conn, &a);
+}
+
+/// Wait for the replacement video itself to load (not the previous video's
+/// leftover `time-pos` or `eof-reached`). False: the player is gone.
+fn wait_for_video(conn: &mut mpv::IpcConn, player: &PlayerHandle, id: &str) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(45) {
+        if conn.closed() || player.exited() {
+            return false;
+        }
+        let switched = conn.get_str("path").is_some_and(|p| p.contains(id));
+        if switched
+            && conn.get_f64("time-pos").is_some()
+            && !conn.get_bool("eof-reached").unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    true
+}
+
 /// Watch the player until it goes away: SponsorBlock skips, the speed the
 /// viewer picked, quality changes from the control bar, and what plays
 /// next (an "Up next" card counting down, a loop, or nothing). Runs on
@@ -1722,23 +1967,9 @@ pub fn spawn_watcher(
         .spawn(move || {
             let socket = player::player_socket();
             let mut ended = Ended::default();
-            let started = Instant::now();
-            let mut conn = loop {
-                if player.exited() {
-                    done(ended);
-                    return;
-                }
-                if let Ok(mut c) = mpv::IpcConn::connect(&socket)
-                    && c.get_f64("time-pos").is_some()
-                {
-                    break c;
-                }
-                if started.elapsed() > Duration::from_secs(60) {
-                    player.stop_and_reap();
-                    done(ended);
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(250));
+            let Some(mut conn) = connect_to_player(&player, &socket) else {
+                done(ended);
+                return;
             };
             let mut queue = s.queue.clone();
             let mut history: Vec<yt::Tile> = Vec::new();
@@ -1767,22 +1998,7 @@ pub fn spawn_watcher(
                     s.autoplay == crate::prefs::Autoplay::Next && next_id.is_none();
                 let (next_tx, next_rx) = std::sync::mpsc::channel();
                 if next_pending {
-                    let (ctx, refresh, id) = (s.ctx.clone(), s.refresh.clone(), cur.id.clone());
-                    std::thread::spawn(move || {
-                        let next =
-                            details(&ctx, &id, refresh.as_deref()).ok().and_then(|d| {
-                                let id = d.autoplay?;
-                                Some(d.related.into_iter().find(|t| t.id == id).unwrap_or(
-                                    yt::Tile {
-                                        thumb: yt::video_thumb(&id),
-                                        id,
-                                        title: "Next video".into(),
-                                        ..Default::default()
-                                    },
-                                ))
-                            });
-                        let _ = next_tx.send(next);
-                    });
+                    spawn_next_lookup(&s, cur.id.clone(), next_tx);
                 }
                 episode_controls(
                     &mut conn,
@@ -1817,27 +2033,13 @@ pub fn spawn_watcher(
                     .and_then(|j| j.as_str().map(|s| s == "true"))
                     .unwrap_or(false);
                 if is_live || cur.kind == yt::Kind::Live {
-                    let (id, region, slot, vg) = (
+                    spawn_chat_lookup(
                         cur.id.clone(),
                         s.region.clone(),
                         chat_token.clone(),
                         video_gen.clone(),
+                        current_gen,
                     );
-                    std::thread::spawn(move || {
-                        if let Some(t) = live_chat_token(&id, &region)
-                            && vg.load(std::sync::atomic::Ordering::SeqCst) == current_gen
-                        {
-                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
-                            let _ = mpv::ipc_request(
-                                &player::player_socket(),
-                                &[
-                                    Arg::Str("script-message"),
-                                    Arg::Str("cattube-chat-available"),
-                                    Arg::Str("yes"),
-                                ],
-                            );
-                        }
-                    });
                 }
                 // The chat stops with the video.
                 let stop_chat = || chat_on.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1847,13 +2049,7 @@ pub fn spawn_watcher(
                     .as_ref()
                     .and_then(|cats| community::segments_url(&cur.id, cats))
                 {
-                    std::thread::spawn(move || {
-                        let segments = curl(&url, None, None)
-                            .ok()
-                            .map(|b| community::parse_segments(&b))
-                            .unwrap_or_default();
-                        let _ = segments_tx.send(segments);
-                    });
+                    spawn_segments_lookup(url, segments_tx);
                 }
                 let mut segments: Vec<community::Segment> = Vec::new();
                 let _ = conn.command(&[
@@ -1924,38 +2120,10 @@ pub fn spawn_watcher(
                         ended.speed = Some(sp);
                     }
                     // SponsorBlock: jump over the segment once.
-                    if let Some(p) = pos
-                        && let Some((to, cat)) = community::skip_at(&segments, p, dur, &skipped)
-                    {
-                        if let Some(seg) = segments.iter().find(|x| p >= x.start && p < x.end) {
-                            skipped.push(seg.start);
-                        }
+                    if let Some(p) = pos {
                         let looping = s.autoplay == crate::prefs::Autoplay::Loop;
-                        if looping && dur.is_some_and(|d| to >= d - 1.0) {
-                            skipped.clear();
-                            let _ = conn.command(&[
-                                Arg::Str("seek"),
-                                Arg::Num(0.0),
-                                Arg::Str("absolute"),
-                            ]);
-                        } else if dur.is_some_and(|d| to >= d - 1.0) {
-                            skipped_to_end = true;
-                            let _ = conn.command(&[
-                                Arg::Str("set_property"),
-                                Arg::Str("pause"),
-                                Arg::Str("yes"),
-                            ]);
-                        } else {
-                            let _ = conn.command(&[
-                                Arg::Str("seek"),
-                                Arg::Num(to),
-                                Arg::Str("absolute"),
-                            ]);
-                        }
-                        osd(
-                            &mut conn,
-                            &format!("Skipped: {}", community::category_label(&cat)),
-                        );
+                        skipped_to_end |=
+                            skip_segment(&mut conn, &segments, &mut skipped, p, dur, looping);
                     }
                     let want = |name: &str| {
                         msgs.iter()
@@ -1982,27 +2150,7 @@ pub fn spawn_watcher(
                     }
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
-                        let fmt = player::format_string(h, s.codec, s.hdr, s.low_power);
-                        let _ = conn.command(&[
-                            Arg::Str("set_property"),
-                            Arg::Str("ytdl-format"),
-                            Arg::Str(&fmt),
-                        ]);
-                        let title = safe_media_title(&cur.title);
-                        let opts = if title.trim().is_empty() {
-                            format!("start={:.3}", last.0)
-                        } else {
-                            format!(
-                                "start={:.3},force-media-title={}",
-                                last.0,
-                                mpv::option_value(&title)
-                            )
-                        };
-                        loadfile_replace(&mut conn, &cur.watch_url(), &opts);
-                        osd(
-                            &mut conn,
-                            &format!("Quality: {}", player::resolution_label(h)),
-                        );
+                        change_quality(&mut conn, &s, &cur, h, last.0);
                     }
                     match want("cattube-chat").as_deref() {
                         Some("on") => {
@@ -2019,77 +2167,16 @@ pub fn spawn_watcher(
                     // Comments for the control bar's panel, fetched aside
                     // so skipping and the bar stay on time.
                     if let Some(arg) = want("cattube-comments") {
-                        let token_ = if arg == "first" { String::new() } else { arg };
-                        let (ctx, refresh, id, vg) = (
-                            s.ctx.clone(),
-                            s.refresh.clone(),
-                            cur.id.clone(),
-                            video_gen.clone(),
-                        );
-                        std::thread::spawn(move || {
-                            let json =
-                                comments_json(comments(&ctx, &id, &token_, refresh.as_deref()));
-                            if vg.load(std::sync::atomic::Ordering::SeqCst) == current_gen {
-                                let _ = mpv::ipc_request(
-                                    &player::player_socket(),
-                                    &[
-                                        Arg::Str("script-message"),
-                                        Arg::Str("cattube-comments-data"),
-                                        Arg::Str(&json),
-                                    ],
-                                );
-                            }
-                        });
+                        spawn_comments(&s, cur.id.clone(), arg, video_gen.clone(), current_gen);
                     }
                     // A new request supersedes prior work, including replies from
                     // the previous video. The Lua browser preserves its focus as
                     // each thumbnail arrives.
-                    if let Some(request) = msgs
-                        .iter()
-                        .rev()
-                        .find(|m| m.first().map(String::as_str) == Some("cattube-related"))
-                        .and_then(|m| m.get(1))
-                        .filter(|s| {
-                            s.len() <= 20 && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-                        })
-                        .cloned()
-                    {
-                        let id = cur.id.clone();
-                        let rs = Session {
-                            low_power: s.low_power,
-                            ctx: s.ctx.clone(),
-                            refresh: s.refresh.clone(),
-                            cache: s.cache.clone(),
-                            autoplay: s.autoplay,
-                            sponsorblock: None,
-                            codec: s.codec,
-                            hdr: s.hdr,
-                            region: s.region.clone(),
-                            queue: Vec::new(),
-                            on_hide: None,
-                            on_video: None,
-                        };
-                        let requests = related_requests.clone();
-                        let expected = requests.begin();
-                        std::thread::spawn(move || {
-                            send_related(&rs, &id, &request, &requests, expected)
-                        });
+                    if let Some(request) = related_request(&msgs) {
+                        spawn_related(&s, cur.id.clone(), request, related_requests.clone());
                     }
                     // A related video picked: it plays next, right away.
-                    let picked = msgs
-                        .iter()
-                        .filter(|m| m.first().map(String::as_str) == Some("cattube-related-pick"))
-                        .filter_map(|m| {
-                            let id = m.get(1)?;
-                            yt::is_video_id(id).then(|| yt::Tile {
-                                id: id.clone(),
-                                title: m.get(2).cloned().unwrap_or_default(),
-                                byline: m.get(3).cloned().unwrap_or_default(),
-                                thumb: yt::video_thumb(id),
-                                ..yt::Tile::default()
-                            })
-                        })
-                        .next_back();
+                    let picked = picked_related(&msgs);
                     let jump = match want("cattube-episode").as_deref() {
                         Some("next") => next_id.clone(),
                         Some("prev") => history.pop(),
@@ -2102,14 +2189,7 @@ pub fn spawn_watcher(
                     {
                         match &next_id {
                             Some(n) => {
-                                let mut args: Vec<String> =
-                                    vec!["next".into(), n.title.clone(), "5".into()];
-                                if let Some(pic) = &thumb {
-                                    let (p, w, h) = &pic.0;
-                                    args.extend([p.clone(), w.to_string(), h.to_string()]);
-                                }
-                                let a: Vec<&str> = args.iter().map(String::as_str).collect();
-                                card(&mut conn, &a);
+                                show_up_next(&mut conn, n, thumb.as_ref());
                                 card_until = Some(Instant::now() + Duration::from_secs(5));
                                 last_count = Some(5);
                             }
@@ -2164,20 +2244,8 @@ pub fn spawn_watcher(
                         cur = n;
                         // Wait for the replacement video itself to load (not the previous
                         // video's leftover `time-pos` or `eof-reached`).
-                        let t0 = Instant::now();
-                        while t0.elapsed() < Duration::from_secs(45) {
-                            if conn.closed() || player.exited() {
-                                break 'videos;
-                            }
-                            let switched =
-                                conn.get_str("path").is_some_and(|p| p.contains(&cur.id));
-                            let ready = switched
-                                && conn.get_f64("time-pos").is_some()
-                                && !conn.get_bool("eof-reached").unwrap_or(false);
-                            if ready {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(250));
+                        if !wait_for_video(&mut conn, &player, &cur.id) {
+                            break 'videos;
                         }
                         continue 'videos;
                     }
@@ -2191,6 +2259,26 @@ pub fn spawn_watcher(
 #[cfg(test)]
 mod player_tests {
     use super::*;
+
+    #[test]
+    fn player_messages_keep_the_newest_valid_request_and_pick() {
+        let m = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let msgs = vec![
+            m(&["cattube-related", "1"]),
+            m(&["cattube-related-pick", "aaaaaaaaaaa", "First", "Channel"]),
+            m(&["cattube-related", "22"]),
+            m(&["cattube-related-pick", "bbbbbbbbbbb", "Second"]),
+            m(&["cattube-related-pick", "not a video id"]),
+        ];
+        assert_eq!(related_request(&msgs).as_deref(), Some("22"));
+        let pick = picked_related(&msgs).unwrap();
+        assert_eq!(
+            (pick.id.as_str(), pick.title.as_str()),
+            ("bbbbbbbbbbb", "Second")
+        );
+        assert_eq!(related_request(&[m(&["cattube-related", "1; rm"])]), None);
+        assert!(picked_related(&[]).is_none());
+    }
 
     #[test]
     fn downloads_must_match_their_published_checksum() {
