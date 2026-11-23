@@ -15,6 +15,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
+#[cfg(target_arch = "aarch64")]
+pub const DENO_URL: &str =
+    "https://github.com/denoland/deno/releases/latest/download/deno-aarch64-unknown-linux-gnu.zip";
+#[cfg(not(target_arch = "aarch64"))]
 pub const DENO_URL: &str =
     "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
 /// How often CatTube asks yt-dlp to update itself.
@@ -164,7 +168,13 @@ pub fn format_string(max_h: u32, codec: Codec, hdr: bool) -> String {
     } else {
         String::new()
     };
-    format!("bv*{h}{sdr}[vcodec^={p}]+ba{alt}/bv*{h}{sdr}+ba/bv*{h}+ba/b{h}/b")
+    let geral = format!("bv*{h}{sdr}[vcodec^={p}]+ba{alt}/bv*{h}{sdr}+ba/bv*{h}+ba/b{h}/b");
+    // BTV9 (Cortex-A53): prefere até 30 quadros/s do codec escolhido
+    if cfg!(target_arch = "aarch64") {
+        format!("bv*{h}{sdr}[fps<=30][vcodec^={p}]+ba/{geral}")
+    } else {
+        geral
+    }
 }
 
 /// Playback speeds the player offers.
