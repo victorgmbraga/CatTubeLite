@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Build dist/cattube-<version>-x86_64.tar.gz: the binary, the player files,
-# the desktop entry and icon, and install.sh. Needs mpv and curl on the
-# system it runs on. Uses the binary staged by stage.sh.
+# Build dist/cattube-<version>-<arch>.tar.gz for this machine's architecture:
+# the binary, the player files, the desktop entry and icon, and install.sh.
+# Needs mpv, curl and Python 3 on the system it runs on.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-NAME="cattube-$VERSION-x86_64"
-[[ -x dist/stage/bin/cattube ]] || { echo "nothing staged: run packaging/stage.sh first" >&2; exit 1; }
+NAME="cattube-$VERSION-$(uname -m)"
+cargo build --release --locked
 rm -rf "dist/$NAME" && mkdir -p "dist/$NAME"
 D="dist/$NAME"
-install -Dm755 dist/stage/bin/cattube "$D/bin/cattube"
+install -Dm755 "${CARGO_TARGET_DIR:-target}/release/cattube" "$D/bin/cattube"
 install -Dm644 assets/cattube-osd.lua "$D/share/cattube/cattube-osd.lua"
 install -Dm644 assets/cattube-input.conf "$D/share/cattube/cattube-input.conf"
 install -Dm644 packaging/io.github.coderastic.CatTube.desktop "$D/share/applications/io.github.coderastic.CatTube.desktop"

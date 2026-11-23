@@ -36,7 +36,7 @@ pub fn runtime_dir() -> PathBuf {
 
 /// The player's on-screen controls and key bindings (`cattube-osd.lua`,
 /// `cattube-input.conf`): `$CATTUBE_DATA`, then `../share/cattube` next to the
-/// binary (packages, AppImage), then `assets/` (running from the source).
+/// binary (installed packages), then `assets/` (running from the source).
 pub fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("CATTUBE_DATA").filter(|v| !v.is_empty()) {
         return PathBuf::from(d);
