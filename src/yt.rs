@@ -1434,6 +1434,11 @@ pub fn spawn_watcher(
                 ]);
                 let mut skipped: Vec<f64> = Vec::new();
                 let mut last = (0.0f64, None::<f64>);
+                // A live stream has no place to come back to (its time is
+                // the stream's, and mpv cannot seek a start into it): it is
+                // never saved. Known from the card, else asked once.
+                let mut live = cur.kind == yt::Kind::Live;
+                let mut live_asked = live;
                 let mut card_until: Option<Instant> = None;
                 let mut last_count: Option<u64> = None;
                 let mut quit_sent = false;
@@ -1482,11 +1487,18 @@ pub fn spawn_watcher(
                     }
                     let msgs = conn.messages(Duration::from_millis(400));
                     if conn.closed() || player.exited() {
-                        ended.positions.push((cur.id.clone(), last.0, last.1));
+                        if !live {
+                            ended.positions.push((cur.id.clone(), last.0, last.1));
+                        }
                         break 'videos;
                     }
                     let pos = conn.get_f64("time-pos");
                     let dur = conn.get_f64("duration").filter(|d| *d > 0.0);
+                    if pos.is_some() && !live_asked {
+                        live_asked = true;
+                        live =
+                            conn.get_str("metadata/by-key/ytdl_is_live").as_deref() == Some("true");
+                    }
                     if let Some(p) = pos {
                         last = (p, dur);
                     }
@@ -1577,7 +1589,9 @@ pub fn spawn_watcher(
                     });
                     if let Some(n) = go_next {
                         card(&mut conn, &["hide"]);
-                        ended.positions.push((cur.id.clone(), last.0, last.1));
+                        if !live {
+                            ended.positions.push((cur.id.clone(), last.0, last.1));
+                        }
                         let backwards = want("cattube-episode").as_deref() == Some("prev");
                         if !backwards {
                             history.push(cur.clone());

@@ -152,7 +152,7 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 ## Arquivos locais
 
 - `~/.config/cattube/` — preferências.
-- `~/.local/share/cattube/` — `yt-dlp` (e sua cópia descompactada `yt-dlp.d`, com o lançador `yt-dlp-unpacked`), `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes.
+- `~/.local/share/cattube/` — `yt-dlp` (e sua cópia descompactada `yt-dlp.d`, com o lançador `yt-dlp-unpacked`), `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes. Transmissões ao vivo não guardam posição: sempre começam onde a transmissão está agora.
 - `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente).
 
 A pasta de cache também guarda `home.txt`, a última página inicial: ela aparece na hora na próxima abertura (se tiver menos de uma semana e for do mesmo idioma e país) enquanto a nova carrega, e continua na tela se a nova falhar.

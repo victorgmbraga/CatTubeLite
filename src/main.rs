@@ -583,7 +583,8 @@ impl App {
         let (r, g, b) = theme::accent_rgb();
         // Check only this video's single checkpoint file on demand instead of
         // scanning all 500 files on the UI thread.
-        let start = if from_start {
+        // A live stream starts where it is now: no saved place.
+        let start = if from_start || tile.kind == ytc::Kind::Live {
             0.0
         } else if let Some(point) = player::checkpoint(&self.data, &tile.id) {
             if point.finished { 0.0 } else { point.position }
