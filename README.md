@@ -152,7 +152,7 @@ To see hardware decoding, dropped frames and memory over the video, turn on **Se
 ## Your files
 
 - `~/.config/cattube/` — settings.
-- `~/.local/share/cattube/` — `yt-dlp` (and its unpacked copy `yt-dlp.d` with the `yt-dlp-unpacked` launcher), `deno`, watch history, playback checkpoints, `positions.conf` and recent searches.
+- `~/.local/share/cattube/` — `yt-dlp` (and its unpacked copy `yt-dlp.d` with the `yt-dlp-unpacked` launcher), `deno`, watch history, playback checkpoints, `positions.conf` and recent searches. Live streams keep no position: they always start where the stream is now.
 - `~/.cache/cattube/` — cached thumbnails (auto-pruned).
 
 The cache folder also keeps `home.txt`, the last Home: it shows at once on the next start (if under a week old and for the same language and country) while a fresh one loads, and stays if that fails.

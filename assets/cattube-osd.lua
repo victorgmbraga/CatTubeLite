@@ -55,6 +55,9 @@ local last_point = nil
 local saved_at = -10
 local function checkpoint(force, finished)
     if opts.position_dir == "" then return end
+    -- A live stream has no place to come back to (mpv cannot seek a start
+    -- into it): nothing is saved.
+    if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then return end
     local at = mp.get_time()
     local min_gap = opts.low_power and 10 or 5
     if not force and at - saved_at < min_gap then return end
