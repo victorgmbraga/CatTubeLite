@@ -60,27 +60,15 @@ pub fn tr(text: &str) -> &str {
 fn arabic(text: &str) -> &str {
     match text {
         "Home" => "الرئيسية",
-        "Subscriptions" => "الاشتراكات",
         "History" => "السجل",
-        "Playlists" => "قوائم التشغيل",
         "Channels" => "القنوات",
         "Search" => "بحث",
         "Settings" => "الإعدادات",
-        "Accounts" => "الحسابات",
-        "Account" => "الحساب",
         "Video" => "الفيديو",
         "Videos" => "الفيديوهات",
         "Playback" => "التشغيل",
         "About" => "حول التطبيق",
         "Phone remote" => "التحكم بالهاتف",
-        "Add an account" => "إضافة حساب",
-        "YouTube account" => "حساب YouTube",
-        "Sign in with a code" => "تسجيل الدخول برمز",
-        "Sign in to see" => "سجّل الدخول لعرض",
-        "Sign in" => "تسجيل الدخول",
-        "Sign in to YouTube" => "تسجيل الدخول إلى YouTube",
-        "In use" => "قيد الاستخدام",
-        "OK uses it · hold OK to sign out" => "اضغط موافق لاستخدامه، أو مطولاً لتسجيل الخروج",
         "Highest quality" => "أعلى جودة",
         "Lower plays smoother on slow connections" => "الجودة الأقل تناسب الاتصال البطيء",
         "Preferred codec" => "ترميز الفيديو المفضل",
@@ -121,11 +109,6 @@ fn arabic(text: &str) -> &str {
         "Playing" => "قيد التشغيل",
         "Play" => "تشغيل",
         "Start over" => "التشغيل من البداية",
-        "Like" => "إعجاب",
-        "Dislike" => "عدم إعجاب",
-        "Subscribe" => "اشتراك",
-        "Unsubscribe" => "إلغاء الاشتراك",
-        "Save to Watch later" => "الحفظ للمشاهدة لاحقاً",
         "Go to channel" => "الانتقال إلى القناة",
         "No channel for this one" => "لا توجد قناة لهذا الفيديو",
         "For you" => "مقترح لك",
@@ -138,12 +121,7 @@ fn arabic(text: &str) -> &str {
         "Nothing here yet" => "لا يوجد محتوى بعد",
         "Down for results" => "اضغط لأسفل لعرض النتائج",
         "Press OK to try again" => "اضغط موافق للمحاولة مجدداً",
-        "Press OK for a new code" => "اضغط موافق لرمز جديد",
         "Getting a code…" => "جارٍ الحصول على رمز…",
-        "Waiting for you to enter it…" => "في انتظار إدخال الرمز…",
-        "Back to cancel" => "رجوع للإلغاء",
-        "On your phone or computer, go to" => "على هاتفك أو حاسوبك، افتح",
-        "and enter this code" => "وأدخل هذا الرمز",
         "Link your phone" => "ربط هاتفك",
         "Link with TV code" => "الربط برمز التلفزيون",
         "In the YouTube app on your phone, open Settings → Watch on TV" => {
@@ -162,10 +140,6 @@ fn arabic(text: &str) -> &str {
         "delete" => "حذف",
         "LIVE" => "مباشر",
         "Short" => "قصير",
-        "Choose the tab to sign in with a code" => "اختر تسجيل الدخول للحصول على رمز",
-        "Sign in (the button at the top right) for your recommendations and subscriptions" => {
-            "سجّل الدخول لعرض اقتراحاتك واشتراكاتك"
-        }
         "Sponsor" => "رعاية",
         "Unpaid or self promotion" => "ترويج شخصي أو غير مدفوع",
         "Reminder to subscribe" => "تذكير بالاشتراك",
@@ -256,8 +230,8 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix('"')?.split_once("\" =>"))
             .map(|(key, _)| key)
             .collect();
-        assert!(keys.len() > 90);
-        let same_in_both = ["Playlists", "Buffer", "Shorts", "Short"];
+        assert!(keys.len() > 60);
+        let same_in_both = ["Buffer", "Shorts", "Short"];
         for key in keys {
             assert!(
                 crate::i18n_pt::translate(key) != key || same_in_both.contains(&key),

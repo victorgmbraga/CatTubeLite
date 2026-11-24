@@ -1,15 +1,12 @@
 //! CatTube's network and playback jobs (run on background threads). The
-//! YouTube API, the sign-in and the screens are in `cattube_core`; this
+//! YouTube API and the screens are in `cattube_core`; this
 //! file only runs `curl` / `mpv` / yt-dlp and turns the answers into data.
 
-use cattube_core::account::{self, Client, DeviceCode, TokenReply};
 use cattube_core::community;
 use cattube_core::mpv::{self, Arg};
 use cattube_core::player::{self, PlayOptions};
 use cattube_core::process::{Cmd, Runner, SystemRunner};
-use cattube_core::subs;
-use cattube_core::youtube::{self as yt, Details, Page, Rating};
-use std::collections::HashMap;
+use cattube_core::youtube::{self as yt, Details, Page};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,21 +38,16 @@ pub fn friendly(t: &str) -> String {
     } else if t.contains("timed out") || t.contains("timeout") {
         "YouTube took too long to answer".into()
     } else if t.contains("401") || t.contains("403") {
-        "YouTube said no (sign in again?)".into()
+        "YouTube said no".into()
     } else {
         "YouTube didn't answer properly".into()
     }
 }
 
-/// Request headers in a private file (0600) for `curl -H @file`, so a
-/// token is never on a command line.
-fn header_file(token: Option<&str>) -> Result<PathBuf, String> {
-    header_file_for(token, false)
-}
-
+/// Request headers in a private file (0600) for `curl -H @file`.
 /// `web`: the web client's headers (live chat comes only through it).
-fn header_file_for(token: Option<&str>, web: bool) -> Result<PathBuf, String> {
-    let mut h = if web {
+fn header_file(web: bool) -> Result<PathBuf, String> {
+    let h = if web {
         format!(
             "Content-Type: application/json\nUser-Agent: {}\nX-YouTube-Client-Name: 1\nX-YouTube-Client-Version: {}\nOrigin: https://www.youtube.com\n",
             yt::WEB_USER_AGENT,
@@ -69,9 +61,6 @@ fn header_file_for(token: Option<&str>, web: bool) -> Result<PathBuf, String> {
             yt::CLIENT_VERSION
         )
     };
-    if let Some(t) = token {
-        h.push_str(&format!("Authorization: Bearer {t}\n"));
-    }
     private_file("headers", &h)
 }
 
@@ -94,31 +83,6 @@ fn private_file(kind: &str, text: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// A sign-in token request. The body (codes, tokens) goes in through a
-/// private file. Answers to "not yet" come as HTTP errors: read them anyway.
-fn token_request(body: &str) -> Result<cattube_core::process::Output, String> {
-    let h = header_file(None)?;
-    let b = private_file("body", body)?;
-    let out = SystemRunner.run(
-        &Cmd::new("curl")
-            .args([
-                "-sS".to_string(),
-                "-m".to_string(),
-                "20".to_string(),
-                "-H".to_string(),
-                format!("@{}", h.display()),
-                "--data-binary".to_string(),
-                format!("@{}", b.display()),
-                "--".to_string(),
-                account::TOKEN_URL.to_string(),
-            ])
-            .timeout(Duration::from_secs(25)),
-    );
-    let _ = std::fs::remove_file(&h);
-    let _ = std::fs::remove_file(&b);
-    out.map_err(|e| e.to_string())
-}
-
 /// Quote a string for `curl -K` config syntax so paths and URLs cannot inject
 /// additional options.
 fn curl_quote(s: &str) -> String {
@@ -135,72 +99,13 @@ fn curl_quote(s: &str) -> String {
     out
 }
 
-/// Many plain GETs at once in one `curl` (one HTTP/2 connection, in
-/// parallel). Each answer in order; empty when that one failed.
-fn fetch_many(urls: &[String], low_power: bool) -> Vec<String> {
-    if urls.is_empty() {
-        return Vec::new();
-    }
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir =
-        cattube_core::env::runtime_dir().join(format!("cattube-many-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    if std::fs::create_dir(&dir).is_err() {
-        return vec![String::new(); urls.len()];
-    }
-    // A curl config file: the addresses stay off the command line.
-    let config: String = urls
-        .iter()
-        .enumerate()
-        .map(|(i, u)| {
-            format!(
-                "url = {}\noutput = {}\n",
-                curl_quote(u),
-                curl_quote(&dir.join(i.to_string()).display().to_string())
-            )
-        })
-        .collect();
-    let list = dir.join("list");
-    let parallel_max = if low_power { "8" } else { "24" };
-    let total_secs = (30 + urls.len() as u64 / 3).min(120);
-    if std::fs::write(&list, config).is_ok() {
-        let _ = SystemRunner.run(
-            &Cmd::new("curl")
-                .args([
-                    "-sS".to_string(),
-                    "--compressed".to_string(),
-                    "--fail".to_string(),
-                    "--parallel".to_string(),
-                    "--parallel-max".to_string(),
-                    parallel_max.to_string(),
-                    "-m".to_string(),
-                    "20".to_string(),
-                    "-K".to_string(),
-                    list.display().to_string(),
-                ])
-                .timeout(Duration::from_secs(total_secs)),
-        );
-    }
-    let out = (0..urls.len())
-        .map(|i| std::fs::read_to_string(dir.join(i.to_string())).unwrap_or_default())
-        .collect();
-    let _ = std::fs::remove_dir_all(&dir);
-    out
-}
-
 /// One request; the header file is removed afterwards.
-fn curl(url: &str, body: Option<&str>, token: Option<&str>) -> Result<String, String> {
-    curl_as(url, body, token, false)
+fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
+    curl_as(url, body, false)
 }
 
-fn curl_as(
-    url: &str,
-    body: Option<&str>,
-    token: Option<&str>,
-    web: bool,
-) -> Result<String, String> {
-    let h = header_file_for(token, web)?;
+fn curl_as(url: &str, body: Option<&str>, web: bool) -> Result<String, String> {
+    let h = header_file(web)?;
     let mut args: Vec<String> = vec![
         "-sS".into(),
         "--compressed".into(),
@@ -223,284 +128,30 @@ fn curl_as(
     r
 }
 
-// ------------------------------------------------------------ signing in
-
-static CLIENT: Mutex<Option<Client>> = Mutex::new(None);
-
-/// The YouTube TV app's sign-in client, cached for a day between runs.
-fn client() -> Result<Client, String> {
-    let mut saved = CLIENT.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(c) = saved.clone() {
-        return Ok(c);
-    }
-    let path = cattube_core::env::cache_dir().join("youtube-client.json");
-    if let Some(c) = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| cached_client(&s, now()))
-    {
-        cattube_core::util::make_private(&path);
-        *saved = Some(c.clone());
-        return Ok(c);
-    }
-    let page = curl(account::TV_PAGE, None, None)?;
-    let js = account::base_js_path(&page).ok_or("YouTube's TV page has changed")?;
-    let base = curl(&format!("https://www.youtube.com{js}"), None, None)?;
-    let c = account::parse_client(&base).ok_or("YouTube's TV app has changed")?;
-    let text = format!(
-        "{{\"saved_at\":{},\"id\":{},\"secret\":{}}}",
-        now(),
-        mpv::json_string(&c.id),
-        mpv::json_string(&c.secret)
-    );
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = cattube_core::util::write_private(&path, &text);
-    }
-    *saved = Some(c.clone());
-    Ok(c)
-}
-
-fn cached_client(text: &str, now: u64) -> Option<Client> {
-    let value = mpv::parse_json(text)?;
-    let saved = value.get("saved_at")?.as_f64()? as u64;
-    if saved > now || now - saved >= 24 * 60 * 60 {
-        return None;
-    }
-    let field = |key| {
-        value
-            .get(key)?
-            .as_str()
-            .filter(|s| !s.is_empty() && s.len() <= 1024 && !s.chars().any(char::is_control))
-            .map(str::to_string)
-    };
-    Some(Client {
-        id: field("id")?,
-        secret: field("secret")?,
-    })
-}
-
-fn forget_client() {
-    *CLIENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    let _ = std::fs::remove_file(cattube_core::env::cache_dir().join("youtube-client.json"));
-}
-
-#[cfg(test)]
-mod client_tests {
-    use super::*;
-
-    #[test]
-    fn client_cache_expires_and_rejects_incomplete_entries() {
-        let saved = r#"{"saved_at":100000,"id":"test-client","secret":"test-secret"}"#;
-        assert_eq!(
-            cached_client(saved, 100001),
-            Some(Client {
-                id: "test-client".into(),
-                secret: "test-secret".into()
-            })
-        );
-        assert!(cached_client(saved, 100000 + 86400).is_none());
-        assert!(cached_client(saved, 99999).is_none());
-        assert!(cached_client(r#"{"saved_at":100000,"id":"test-client"}"#, 100001).is_none());
-        assert!(
-            cached_client(
-                r#"{"saved_at":100000,"id":"test-client","secret":"bad\nvalue"}"#,
-                100001
-            )
-            .is_none()
-        );
-    }
-}
-
-/// A code to show on the TV.
-pub fn sign_in_code(device_id: &str) -> Result<DeviceCode, String> {
-    let c = client()?;
-    let body = curl(
-        account::CODE_URL,
-        Some(&account::code_body(&c, &account::device_uuid(device_id))),
-        None,
-    )?;
-    account::parse_code(&body).ok_or_else(|| "YouTube didn't give a code".into())
-}
-
-/// Wait for the code to be entered. `keep_going` turns false when the
-/// screen is left. Returns (refresh token, access token, expires at).
-pub fn sign_in_wait(
-    code: &DeviceCode,
-    keep_going: &dyn Fn() -> bool,
-) -> Result<(String, String, u64), String> {
-    let c = client()?;
-    let started = Instant::now();
-    let mut every = Duration::from_secs(code.interval);
-    while keep_going() {
-        std::thread::sleep(every);
-        if !keep_going() {
-            break;
-        }
-        if started.elapsed() > Duration::from_secs(code.expires_in) {
-            return Err("The code expired. Press OK for a new one".into());
-        }
-        let out = token_request(&account::poll_body(&c, &code.device_code));
-        let Ok(out) = out else { continue };
-        match account::parse_token(&out.stdout) {
-            TokenReply::Token {
-                access,
-                expires_in,
-                refresh: Some(refresh),
-            } => return Ok((refresh, access, now() + expires_in)),
-            TokenReply::Token { .. } => return Err("YouTube didn't keep the sign-in".into()),
-            TokenReply::Pending => {}
-            TokenReply::SlowDown => every += Duration::from_secs(2),
-            TokenReply::Failed(e) => return Err(e),
-        }
-    }
-    Err("Cancelled".into())
-}
-
-/// Google's endpoint to cancel a sign-in.
-const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
-
-/// Signing out: the sign-in stops working at Google too (not only on this
-/// TV), and its access token is forgotten at once. The token goes in
-/// through a private file, never on a command line. Best effort: true when
-/// Google confirmed it.
-pub fn revoke(refresh: &str) -> bool {
-    TOKENS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .remove(refresh);
-    let Ok(body) = private_file(
-        "body",
-        &format!("token={}", cattube_core::util::percent_encode(refresh)),
-    ) else {
-        return false;
-    };
-    let out = SystemRunner.run(
-        &Cmd::new("curl")
-            .args([
-                "-sS".to_string(),
-                "-m".to_string(),
-                "20".to_string(),
-                "-o".to_string(),
-                "/dev/null".to_string(),
-                "-w".to_string(),
-                "%{http_code}".to_string(),
-                "-H".to_string(),
-                "Content-Type: application/x-www-form-urlencoded".to_string(),
-                "--data-binary".to_string(),
-                format!("@{}", body.display()),
-                "--".to_string(),
-                REVOKE_URL.to_string(),
-            ])
-            .timeout(Duration::from_secs(25)),
-    );
-    let _ = std::fs::remove_file(&body);
-    out.is_ok_and(|o| o.stdout.trim() == "200")
-}
-
-/// Access tokens by refresh token (they last an hour).
-static TOKENS: Mutex<Option<HashMap<String, (String, u64)>>> = Mutex::new(None);
-/// Serializes OAuth token refreshes so concurrent requests do not hammer the
-/// token endpoint on startup or expiry.
-static TOKEN_REFRESH: Mutex<()> = Mutex::new(());
-
-pub fn remember_token(refresh: &str, access: &str, expires_at: u64) {
-    TOKENS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get_or_insert_with(HashMap::new)
-        .insert(refresh.to_string(), (access.to_string(), expires_at));
-}
-
-fn cached_token(refresh: &str) -> Option<String> {
-    TOKENS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|m| m.get(refresh).cloned())
-        .filter(|(_, exp)| now() + 60 < *exp)
-        .map(|(a, _)| a)
-}
-
-/// A working token for the account with this refresh token.
-pub fn bearer(refresh: &str) -> Result<String, String> {
-    if let Some(a) = cached_token(refresh) {
-        return Ok(a);
-    }
-    let _refresh_guard = TOKEN_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(a) = cached_token(refresh) {
-        return Ok(a);
-    }
-    for retry in 0..2 {
-        let c = client()?;
-        let out = token_request(&account::refresh_body(&c, refresh));
-        let out = out.map_err(|e: String| friendly(&e))?;
-        match account::parse_token(&out.stdout) {
-            TokenReply::Token {
-                access, expires_in, ..
-            } => {
-                remember_token(refresh, &access, now() + expires_in);
-                return Ok(access);
-            }
-            TokenReply::Failed(e)
-                if retry == 0 && matches!(e.as_str(), "invalid_client" | "unauthorized_client") =>
-            {
-                forget_client()
-            }
-            TokenReply::Failed(e) => return Err(e),
-            _ => return Err("YouTube didn't renew the sign-in".into()),
-        }
-    }
-    Err("YouTube didn't renew the sign-in".into())
-}
-
-fn token(refresh: Option<&str>) -> Result<Option<String>, String> {
-    refresh.map(bearer).transpose()
-}
-
-/// The signed-in account's name and picture.
-pub fn account_name(ctx: &str, refresh: &str) -> Option<(String, String)> {
-    let t = bearer(refresh).ok()?;
-    let body = curl(
-        &yt::endpoint_url("account/accounts_list"),
-        Some(&account::accounts_list_body(ctx)),
-        Some(&t),
-    )
-    .ok()?;
-    account::parse_account_name(&body)
-}
-
 // --------------------------------------------------------------- lists
 
-pub fn page(ctx: &str, browse_id: &str, refresh: Option<&str>) -> Result<Page, String> {
-    if browse_id == yt::feeds::HOME && refresh.is_none() {
+pub fn page(ctx: &str, browse_id: &str) -> Result<Page, String> {
+    if browse_id == yt::feeds::HOME {
         return explore(ctx);
     }
-    let t = token(refresh)?;
     let body = yt::browse_body(ctx, browse_id).ok_or("That can't be opened")?;
-    let reply = curl(&yt::endpoint_url("browse"), Some(&body), t.as_deref())?;
+    let reply = curl(&yt::endpoint_url("browse"), Some(&body))?;
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
 /// A page of a video's comments: the first (`token` empty) or the next.
-pub fn comments(
-    ctx: &str,
-    id: &str,
-    token_: &str,
-    refresh: Option<&str>,
-) -> Result<yt::Comments, String> {
-    let t = token(refresh)?;
+pub fn comments(ctx: &str, id: &str, token_: &str) -> Result<yt::Comments, String> {
     let first;
     let token_ = if token_.is_empty() {
         let body = yt::next_body(ctx, id).ok_or("not a video")?;
-        let reply = curl(&yt::endpoint_url("next"), Some(&body), t.as_deref())?;
+        let reply = curl(&yt::endpoint_url("next"), Some(&body))?;
         first = yt::comments_token(&reply).ok_or("Comments are turned off")?;
         first.as_str()
     } else {
         token_
     };
     let body = yt::continuation_body(ctx, token_).ok_or("bad continuation")?;
-    let reply = curl(&yt::endpoint_url("next"), Some(&body), t.as_deref())?;
+    let reply = curl(&yt::endpoint_url("next"), Some(&body))?;
     yt::parse_comments(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
@@ -508,7 +159,7 @@ pub fn comments(
 pub fn live_chat_token(id: &str, region: &str) -> Option<String> {
     let ctx = yt::web_context("en", region);
     let body = yt::next_body(&ctx, id)?;
-    let reply = curl_as(&yt::endpoint_url("next"), Some(&body), None, true).ok()?;
+    let reply = curl_as(&yt::endpoint_url("next"), Some(&body), true).ok()?;
     yt::live_chat_token(&reply)
 }
 
@@ -519,7 +170,6 @@ pub fn live_chat(token_: &str, region: &str) -> Result<yt::Chat, String> {
     let reply = curl_as(
         &yt::endpoint_url("live_chat/get_live_chat"),
         Some(&body),
-        None,
         true,
     )?;
     yt::parse_live_chat(&reply).ok_or_else(|| "The chat has ended".into())
@@ -626,59 +276,13 @@ fn comments_json(r: Result<yt::Comments, String>) -> String {
     }
 }
 
-/// Subscriptions as a row per channel you follow, the newest first
-/// (`cattube_core::subs`).
-pub fn subscriptions(ctx: &str, refresh: Option<&str>) -> Result<Page, String> {
-    let (channels, uploads) = subscription_feeds(ctx, refresh)?;
-    Ok(subs::rows(&channels, &uploads))
-}
-
-/// The channels you follow, and each one's newest uploads from its public
-/// feed (fetched a dozen at a time).
-pub fn subscription_feeds(
-    ctx: &str,
-    refresh: Option<&str>,
-) -> Result<(Vec<yt::Tile>, Vec<Vec<subs::Upload>>), String> {
-    let mut list = page(ctx, yt::feeds::CHANNELS, refresh)?;
-    let mut channels: Vec<yt::Tile> = Vec::new();
-    for _ in 0..20 {
-        for t in list.tiles() {
-            if t.kind == yt::Kind::Channel
-                && subs::feed_url(&t.id).is_some()
-                && !channels.iter().any(|c| c.id == t.id)
-            {
-                channels.push(t);
-            }
-        }
-        let Some(c) = list.continuation.clone() else {
-            break;
-        };
-        list = more(ctx, &c, refresh)?;
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let urls: Vec<String> = channels
-        .iter()
-        .filter_map(|c| subs::feed_url(&c.id))
-        .collect();
-    let uploads: Vec<Vec<subs::Upload>> = fetch_many(&urls, cattube_core::env::low_power())
-        .iter()
-        .map(|xml| subs::parse_feed(xml, now))
-        .collect();
-    if !channels.is_empty() && uploads.iter().all(Vec::is_empty) {
-        return Err("YouTube didn't answer".into());
-    }
-    Ok((channels, uploads))
-}
-
-/// Home, signed out: YouTube's topic channels, fetched side by side.
+/// Home: YouTube's topic channels, fetched side by side.
 fn explore(ctx: &str) -> Result<Page, String> {
     let handles: Vec<_> = yt::feeds::TOPICS
         .iter()
         .map(|(name, id)| {
             let (ctx, id) = (ctx.to_string(), id.to_string());
-            (*name, std::thread::spawn(move || page(&ctx, &id, None)))
+            (*name, std::thread::spawn(move || page(&ctx, &id)))
         })
         .collect();
     let mut topics = Vec::new();
@@ -697,73 +301,39 @@ fn explore(ctx: &str) -> Result<Page, String> {
     }
 }
 
-pub fn more(ctx: &str, token_: &str, refresh: Option<&str>) -> Result<Page, String> {
-    let t = token(refresh)?;
+pub fn more(ctx: &str, token_: &str) -> Result<Page, String> {
     let body = yt::continuation_body(ctx, token_).ok_or("bad continuation")?;
-    let reply = curl(&yt::endpoint_url("browse"), Some(&body), t.as_deref())?;
+    let reply = curl(&yt::endpoint_url("browse"), Some(&body))?;
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
 /// The next results of a search (its continuation).
-pub fn search_more(ctx: &str, token_: &str, refresh: Option<&str>) -> Result<Page, String> {
-    let t = token(refresh)?;
+pub fn search_more(ctx: &str, token_: &str) -> Result<Page, String> {
     let body = yt::continuation_body(ctx, token_).ok_or("bad continuation")?;
-    let reply = curl(&yt::endpoint_url("search"), Some(&body), t.as_deref())?;
+    let reply = curl(&yt::endpoint_url("search"), Some(&body))?;
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
-pub fn search(ctx: &str, q: &str, refresh: Option<&str>) -> Result<Page, String> {
-    let t = token(refresh)?;
-    let reply = curl(
-        &yt::endpoint_url("search"),
-        Some(&yt::search_body(ctx, q)),
-        t.as_deref(),
-    )?;
+pub fn search(ctx: &str, q: &str) -> Result<Page, String> {
+    let reply = curl(&yt::endpoint_url("search"), Some(&yt::search_body(ctx, q)))?;
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
 }
 
 pub fn suggestions(q: &str, hl: &str) -> Vec<String> {
-    curl(&yt::suggest_url_for(q, hl), None, None)
+    curl(&yt::suggest_url_for(q, hl), None)
         .map(|b| yt::parse_suggestions(&b))
         .unwrap_or_default()
 }
 
-pub fn details(ctx: &str, id: &str, refresh: Option<&str>) -> Result<Details, String> {
-    let t = token(refresh)?;
+pub fn details(ctx: &str, id: &str) -> Result<Details, String> {
     let body = yt::next_body(ctx, id).ok_or("not a video")?;
-    let reply = curl(&yt::endpoint_url("next"), Some(&body), t.as_deref())?;
+    let reply = curl(&yt::endpoint_url("next"), Some(&body))?;
     yt::parse_details(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
-}
-
-pub fn rate(ctx: &str, id: &str, r: Rating, refresh: &str) -> Result<(), String> {
-    let t = bearer(refresh)?;
-    let (url, body) = yt::rate(ctx, id, r).ok_or("not a video")?;
-    curl(&url, Some(&body), Some(&t)).map(|_| ())
-}
-
-pub fn subscribe(ctx: &str, channel: &str, on: bool, refresh: &str) -> Result<(), String> {
-    let t = bearer(refresh)?;
-    let (url, body) = yt::subscribe(ctx, channel, on).ok_or("not a channel")?;
-    curl(&url, Some(&body), Some(&t)).map(|_| ())
-}
-
-pub fn watch_later(ctx: &str, id: &str, refresh: &str) -> Result<(), String> {
-    let t = bearer(refresh)?;
-    let body = format!(
-        "{{\"context\":{ctx},\"playlistId\":\"WL\",\"actions\":[{{\"addedVideoId\":{},\"action\":\"ACTION_ADD_VIDEO\"}}]}}",
-        mpv::json_string(id)
-    );
-    curl(
-        &yt::endpoint_url("browse/edit_playlist"),
-        Some(&body),
-        Some(&t),
-    )
-    .map(|_| ())
 }
 
 /// Like and dislike counts (Return YouTube Dislike).
 pub fn votes(id: &str) -> Option<(u64, u64)> {
-    curl(&community::votes_url(id), None, None)
+    curl(&community::votes_url(id), None)
         .ok()
         .and_then(|b| community::parse_votes(&b))
 }
@@ -1357,7 +927,6 @@ pub fn raise_window(window: &str) -> bool {
 pub struct Session {
     pub low_power: bool,
     pub ctx: String,
-    pub refresh: Option<String>,
     pub cache: PathBuf,
     pub autoplay: crate::prefs::Autoplay,
     pub sponsorblock: Option<Vec<String>>,
@@ -1529,7 +1098,7 @@ fn send_related(
             );
         }
     };
-    let details = match details(&session.ctx, id, session.refresh.as_deref()) {
+    let details = match details(&session.ctx, id) {
         Ok(d) => d,
         Err(e) => {
             send(&format!("{{\"error\":{}}}", mpv::json_string(&e)));
@@ -1729,9 +1298,9 @@ fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Option<mpv::IpcCon
 
 /// YouTube's pick for what follows `id`, delivered on `tx`.
 fn spawn_next_lookup(s: &Session, id: String, tx: std::sync::mpsc::Sender<Option<yt::Tile>>) {
-    let (ctx, refresh) = (s.ctx.clone(), s.refresh.clone());
+    let ctx = s.ctx.clone();
     std::thread::spawn(move || {
-        let next = details(&ctx, &id, refresh.as_deref()).ok().and_then(|d| {
+        let next = details(&ctx, &id).ok().and_then(|d| {
             let id = d.autoplay?;
             Some(
                 d.related
@@ -1776,7 +1345,7 @@ fn spawn_chat_lookup(
 
 fn spawn_segments_lookup(url: String, tx: std::sync::mpsc::Sender<Vec<community::Segment>>) {
     std::thread::spawn(move || {
-        let segments = curl(&url, None, None)
+        let segments = curl(&url, None)
             .ok()
             .map(|b| community::parse_segments(&b))
             .unwrap_or_default();
@@ -1851,9 +1420,9 @@ fn spawn_comments(
     current_gen: u64,
 ) {
     let token = if arg == "first" { String::new() } else { arg };
-    let (ctx, refresh) = (s.ctx.clone(), s.refresh.clone());
+    let ctx = s.ctx.clone();
     std::thread::spawn(move || {
-        let json = comments_json(comments(&ctx, &id, &token, refresh.as_deref()));
+        let json = comments_json(comments(&ctx, &id, &token));
         if video_gen.load(std::sync::atomic::Ordering::SeqCst) == current_gen {
             let _ = mpv::ipc_request(
                 &player::player_socket(),
@@ -1888,7 +1457,6 @@ fn spawn_related(
     let rs = Session {
         low_power: s.low_power,
         ctx: s.ctx.clone(),
-        refresh: s.refresh.clone(),
         cache: s.cache.clone(),
         autoplay: s.autoplay,
         sponsorblock: None,

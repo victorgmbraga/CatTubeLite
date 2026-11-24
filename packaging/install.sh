@@ -15,7 +15,7 @@ share/metainfo/io.github.coderastic.CatTube.metainfo.xml"
 if [ "$uninstall" = 1 ]; then
   for f in $files; do rm -f "$prefix/$f"; done
   rmdir "$prefix/share/cattube" 2>/dev/null || true
-  echo "CatTube removed from $prefix (your accounts stay in ~/.config/cattube)"
+  echo "CatTube removed from $prefix (your settings stay in ~/.config/cattube)"
   exit 0
 fi
 for f in $files; do

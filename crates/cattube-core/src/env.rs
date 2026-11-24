@@ -18,7 +18,7 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
         .unwrap_or_else(|| home().join(fallback))
 }
 
-/// `~/.config/cattube`: accounts and settings.
+/// `~/.config/cattube`: settings.
 pub fn config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("cattube")
 }
