@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "cattube"
-version = "1.0.4"
+version = "1.1.0"
 dependencies = [
  "arabic_reshaper",
  "cattube-core",
@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "cattube-core"
-version = "1.0.4"
+version = "1.1.0"
 
 [[package]]
 name = "cc"
