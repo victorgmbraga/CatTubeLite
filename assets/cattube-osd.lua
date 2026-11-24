@@ -7,7 +7,10 @@
 --                                     videos below: arrows move, OK plays,
 --                                     Up from the first row returns to
 --                                     controls, Back returns to the video
---                     Left / Right    scrub 10 s back / forward
+--                     Left / Right    scrub 10 s back / forward; the
+--                                     progress bar shows alone for 2 s
+--                     Rewind / Forward, Previous / Next (media keys)
+--                                     30 s / 90 s, with the same bar
 --                     Back            stop (on CatosTV: back to CatTube's
 --                                     list, the video plays on behind;
 --                                     --script-opts=cattube_osd-hide=yes)
@@ -91,6 +94,8 @@ local shown = false
 local focus = 1 -- index into visible_buttons(); set to Pause when shown
 local on_bar = false -- the seek bar has focus
 local scrubs = 0 -- consecutive scrubs while held: step grows
+local peek = false -- the bar alone, after a seek with the controls hidden
+local peek_timer = nil
 local hide_timer = nil
 local tick_timer = nil
 
@@ -255,66 +260,9 @@ local function lift_subs()
     end
 end
 
-local function render()
-    lift_subs()
-    if not shown and not menu then
-        set_osd("")
-        return
-    end
-    if not shown then
-        local a = assdraw.ass_new()
-        render_menu(a)
-        set_osd(a.text)
-        return
-    end
-    local pos = mp.get_property_number("time-pos", 0)
-    local dur = mp.get_property_number("duration", 0)
-    local paused = mp.get_property_native("pause", false)
-    local title = mp.get_property("media-title", "")
-    pause_button.label = paused and "Play" or "Pause"
-
-    local a = assdraw.ass_new()
-    -- The picture darkens towards the bottom so the controls read on
-    -- anything: a wide soft fade on desktop, or flat scrim bands on low-power
-    -- boxes to avoid expensive CPU libass Gaussian blurs on every tick.
-    if opts.low_power then
-        a:new_event()
-        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H40&}")
-        a:draw_start()
-        a:rect_cw(0, 720, W, H)
-        a:draw_stop()
-    else
-        a:new_event()
-        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur140\\1c&H000000&\\1a&H60&}")
-        a:draw_start()
-        a:rect_cw(-200, 700, W + 200, H + 200)
-        a:draw_stop()
-        a:new_event()
-        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur70\\1c&H000000&\\1a&H50&}")
-        a:draw_start()
-        a:rect_cw(-200, 880, W + 200, H + 200)
-        a:draw_stop()
-    end
-    -- Title: "Series · S1:E3 · Name" becomes a small "Series · S1:E3"
-    -- over the episode's name.
-    local title_clean = clean(title)
-    local series, ep, name = title_clean:match("^(.-) · (S%d+:E%d+) · (.+)$")
-    if series then
-        a:new_event()
-        a:append("{\\an1\\pos(120,792)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H50&}" .. series .. " · " .. ep)
-        title_clean = name
-    end
-    a:new_event()
-    a:append("{\\an1\\pos(120,846)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. title_clean)
-    -- When it ends, like a TV guide (a stream: that it is live).
-    if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then
-        a:new_event()
-        a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\b1\\1c&H4444FF&\\1a&H00&}● LIVE")
-    elseif dur > 0 then
-        local ends = os.time() + math.max(0, dur - pos)
-        a:new_event()
-        a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H40&}Ends at " .. os.date("%H:%M", math.floor(ends)))
-    end
+-- The progress bar and the times under it, as the controls show them and
+-- (alone) while seeking with the controls hidden.
+local function draw_bar(a, pos, dur)
     -- Progress track and fill.
     local tx, ty, tw, th = 120, 874, 1680, 8
     a:new_event()
@@ -374,6 +322,83 @@ local function render()
     a:append(string.format("{\\an7\\pos(120,898)\\bord0\\shad0\\fs30\\1c&HFFFFFF&\\1a&H30&}%s", clock(pos) .. (chapter and ("  ·  " .. chapter) or "")))
     a:new_event()
     a:append(string.format("{\\an9\\pos(1800,898)\\bord0\\shad0\\fs30\\1c&HFFFFFF&\\1a&H30&}%s", clock(dur)))
+end
+
+-- Seeking with the controls hidden shows the same bar, alone, for a moment.
+local function render_peek(a)
+    local pos = mp.get_property_number("time-pos", 0)
+    local dur = mp.get_property_number("duration", 0)
+    -- A flat dark band so the bar reads on any picture (no blur: cheap).
+    a:new_event()
+    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H50&}")
+    a:draw_start()
+    a:rect_cw(0, 840, W, H)
+    a:draw_stop()
+    draw_bar(a, pos, dur)
+end
+
+local function render()
+    lift_subs()
+    if not shown and not menu and not peek then
+        set_osd("")
+        return
+    end
+    if not shown then
+        local a = assdraw.ass_new()
+        if peek then render_peek(a) end
+        if menu then render_menu(a) end
+        set_osd(a.text)
+        return
+    end
+    local pos = mp.get_property_number("time-pos", 0)
+    local dur = mp.get_property_number("duration", 0)
+    local paused = mp.get_property_native("pause", false)
+    local title = mp.get_property("media-title", "")
+    pause_button.label = paused and "Play" or "Pause"
+
+    local a = assdraw.ass_new()
+    -- The picture darkens towards the bottom so the controls read on
+    -- anything: a wide soft fade on desktop, or flat scrim bands on low-power
+    -- boxes to avoid expensive CPU libass Gaussian blurs on every tick.
+    if opts.low_power then
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H000000&\\1a&H40&}")
+        a:draw_start()
+        a:rect_cw(0, 720, W, H)
+        a:draw_stop()
+    else
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur140\\1c&H000000&\\1a&H60&}")
+        a:draw_start()
+        a:rect_cw(-200, 700, W + 200, H + 200)
+        a:draw_stop()
+        a:new_event()
+        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\blur70\\1c&H000000&\\1a&H50&}")
+        a:draw_start()
+        a:rect_cw(-200, 880, W + 200, H + 200)
+        a:draw_stop()
+    end
+    -- Title: "Series · S1:E3 · Name" becomes a small "Series · S1:E3"
+    -- over the episode's name.
+    local title_clean = clean(title)
+    local series, ep, name = title_clean:match("^(.-) · (S%d+:E%d+) · (.+)$")
+    if series then
+        a:new_event()
+        a:append("{\\an1\\pos(120,792)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H50&}" .. series .. " · " .. ep)
+        title_clean = name
+    end
+    a:new_event()
+    a:append("{\\an1\\pos(120,846)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. title_clean)
+    -- When it ends, like a TV guide (a stream: that it is live).
+    if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then
+        a:new_event()
+        a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\b1\\1c&H4444FF&\\1a&H00&}● LIVE")
+    elseif dur > 0 then
+        local ends = os.time() + math.max(0, dur - pos)
+        a:new_event()
+        a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H40&}Ends at " .. os.date("%H:%M", math.floor(ends)))
+    end
+    draw_bar(a, pos, dur)
     -- Buttons: episodes from the left edge, playback centred, tracks to
     -- the right edge.
     -- Smaller when they would not fit side by side (both video buttons).
@@ -950,9 +975,34 @@ local function arm_hide()
     scrub_timer = mp.add_timeout(0.4, function() scrubs = 0 end)
 end
 
+local function end_peek()
+    peek = false
+    if peek_timer then peek_timer:kill(); peek_timer = nil end
+end
+
+-- A seek with the controls hidden: the bar shows alone, then goes. With
+-- the controls up, they show where it went.
+local function quick_seek(secs)
+    seek(secs)
+    if shown then
+        render()
+        arm_hide()
+        return
+    end
+    peek = true
+    render()
+    if peek_timer then peek_timer:kill() end
+    peek_timer = mp.add_timeout(2, function()
+        peek_timer = nil
+        peek = false
+        render()
+    end)
+end
+
 local function show()
     -- Coming up from hidden (OK, an arrow, or a pause from a media key):
     -- focus starts on Play / Pause.
+    end_peek()
     if not shown then
         focus = pause_index()
         on_bar = false
@@ -1258,8 +1308,7 @@ local function on_left()
         render()
         arm_hide()
     else
-        seek(-10)
-        mp.commandv("show-progress")
+        quick_seek(-10)
     end
 end
 
@@ -1276,8 +1325,7 @@ local function on_right()
         render()
         arm_hide()
     else
-        seek(10)
-        mp.commandv("show-progress")
+        quick_seek(10)
     end
 end
 
@@ -1356,6 +1404,13 @@ mp.add_forced_key_binding("DOWN", "cattube-down", on_down, { repeatable = true }
 mp.add_forced_key_binding("ESC", "cattube-back", on_back)
 mp.add_forced_key_binding("BS", "cattube-back-bs", on_back)
 mp.add_forced_key_binding("GO_BACK", "cattube-back-go", on_back) -- BTV9: tecla Voltar do controle remoto
+-- The remote's media keys seek like the arrows, with the same bar.
+for key, secs in pairs({ REWIND = -30, FORWARD = 30, PREV = -90, NEXT = 90 }) do
+    mp.add_forced_key_binding(key, "cattube-seek-" .. key, function()
+        if card or menu or related then return end
+        quick_seek(secs)
+    end, { repeatable = true })
+end
 -- Media keys keep working through the input conf; the bar follows pause.
 mp.observe_property("pause", "native", function(_, paused)
     if not related then
@@ -1437,12 +1492,16 @@ mp.observe_property("eof-reached", "bool", function(_, eof)
 end)
 mp.register_event("seek", function()
     if last_point then last_point.finished = false end
+    if peek then render() end
 end)
 mp.add_periodic_timer(opts.low_power and 10 or 5, function()
     if not mp.get_property_bool("pause", false) then checkpoint(false, false) end
 end)
 mp.observe_property("pause", "bool", function() checkpoint(true, false) end)
-mp.register_event("playback-restart", function() checkpoint(true, false) end)
+mp.register_event("playback-restart", function()
+    checkpoint(true, false)
+    if peek then render() end
+end)
 mp.observe_property("paused-for-cache", "bool", function(_, waiting)
     if waiting then loading(true) elseif mp.get_property("time-pos") then loading(false) end
 end)

@@ -133,7 +133,8 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 
 | Controle remoto / teclado | Nas listas | No player |
 |---|---|---|
-| Setas | navegar | Esquerda / Direita pulam 10 s; Cima / Baixo alternam barra, botões e vídeos relacionados |
+| Setas | navegar | Esquerda / Direita pulam 10 s (com os controles escondidos, a barra de progresso aparece sozinha por um instante); Cima / Baixo alternam barra, botões e vídeos relacionados |
+| Retroceder / Avançar, Anterior / Próximo | | pulam 30 s / 90 s, com a mesma barra de progresso |
 | OK, Enter | abrir, reproduzir | mostrar controles, acionar botão focado |
 | Segurar OK, F2 | menu do vídeo | menu de legendas (fallback) |
 | Voltar, Esc, `GO_BACK` | voltar | ocultar controles e depois parar |
