@@ -812,7 +812,7 @@ fn bgra_thumbnail_pixels(
     width: f64,
 ) -> Option<(Vec<u8>, u32, u32)> {
     let (w, h) = thumbnail_size(osd_width, width);
-    let pic = fetch_image(cache, &yt::video_thumb(id))?;
+    let pic = fetch_image(cache, &yt::video_thumb_hq(id))?;
     let img = image::load_from_memory(&std::fs::read(pic).ok()?).ok()?;
     let mut px = img
         .resize_to_fill(w, h, image::imageops::FilterType::Triangle)
@@ -977,7 +977,7 @@ fn send_related(
         if !current() {
             return;
         }
-        let urls: Vec<String> = chunk.iter().map(|t| yt::video_thumb(&t.id)).collect();
+        let urls: Vec<String> = chunk.iter().map(|t| yt::video_thumb_hq(&t.id)).collect();
         let _ = fetch_images_batch(&session.cache, &urls, session.low_power);
         for (offset, tile) in chunk.iter().enumerate() {
             if !current() {

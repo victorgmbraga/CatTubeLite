@@ -124,7 +124,7 @@ Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](http
 
 | Variável de ambiente | Valores | Efeito |
 |---|---|---|
-| `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido) |
+| `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido). Entre outras coisas, no baixo desempenho os cards usam as imagens de 320×180 do YouTube (`mqdefault`) em vez das de 480×360 com faixas pretas: um terço dos pixels para decodificar, download menor e card mais nítido |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface (padrão `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido) |
 
 Para ver decodificação por hardware, quadros descartados e memória sobre o vídeo, ative **Settings → About → Player statistics**. Também é possível consultar as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` sem essa variável).

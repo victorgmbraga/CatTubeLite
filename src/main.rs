@@ -121,6 +121,7 @@ impl App {
         let data = player::data_home();
         let prefs = prefs::load(&config);
         let low_power = cattube_core::env::low_power();
+        ytc::use_small_pictures(low_power);
         theme::set_accent(&prefs.accent);
         i18n::set_language(prefs.language);
         let yt_dlp_ready = player::yt_dlp_path(&data).is_file();
