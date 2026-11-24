@@ -89,6 +89,30 @@ dist/cattube-*-"$(uname -m)"/install.sh
 
 Em `aarch64`, o pacote é compilado sem o renderizador `wgpu` (`--no-default-features`), o que deixa o binário cerca de 31% menor. Nesse caso, ele sempre desenha com OpenGL.
 
+### Nome e logo próprios
+
+Para uma compilação só sua, duas variáveis de compilação trocam o nome e o logo do app. Sem elas, nada muda, e os pacotes publicados pelo CI mantêm sempre o nome e a marca do CatTube.
+
+| Variável | O que muda |
+|---|---|
+| `CATTUBE_NAME` | O nome no título da janela, no cabeçalho, nas Configurações e no atalho (menus e lançadores) |
+| `CATTUBE_LOGO` | Um PNG que aparece no lugar da marca do gato (no cabeçalho e nas telas de canal e de Configurações) e também é instalado como ícone do atalho |
+
+Gere o pacote com elas e instale como de costume (no aparelho de TV também, em `aarch64`):
+
+```sh
+CATTUBE_NAME="Meu Tube" CATTUBE_LOGO=/caminho/do/logo.png packaging/tarball.sh
+tar -xzf dist/cattube-*-"$(uname -m)".tar.gz -C dist
+dist/cattube-*-"$(uname -m)"/install.sh
+```
+
+- **O logo:** precisa ser PNG (SVG não é aceito), quadrado ou mais largo que alto, com fundo transparente e pelo menos 256 px de altura. No app, ele aparece na altura da marca original, mantendo as proporções. Se o arquivo não existir ou não for PNG, a compilação para com um erro.
+- **Instalar por cima de uma instalação anterior:** o `install.sh` copia só o ícone que o pacote tem (`share/pixmaps/io.github.coderastic.CatTube.png` para um logo, o SVG do gato no caso contrário) e remove o outro, deixado por uma instalação anterior.
+- **Um `cargo build` comum:** lê as mesmas variáveis, mas aí só o app muda. O atalho e o ícone vêm do `packaging/tarball.sh`.
+- **O que continua igual:** o comando `cattube`, as pastas `~/.config/cattube` e `~/.local/share/cattube` e o identificador interno `io.github.coderastic.CatTube` (app id da janela e nome do arquivo do atalho). As configurações, o histórico e a CatosTV continuam funcionando como antes.
+
+O arquivo do logo fica por sua conta: este repositório não traz nenhum logo de terceiros. Não redistribua uma compilação com o nome ou o logo de outra empresa.
+
 O pacote não inclui `mpv`, `curl` nem Python 3, que precisam estar instalados no aparelho.
 
 Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](https://github.com/yt-dlp/yt-dlp) e do [Deno](https://deno.com) (usando o binário nativo ARM64 em `aarch64`) em `~/.local/share/cattube`, verifica os arquivos e os mantém atualizados automaticamente.

@@ -296,8 +296,20 @@ fn backdrop(c: &C, v: &View, tile: Option<&Tile>) {
 
 // ---------------------------------------------------------------- header
 
-/// The CatTube mark: a red tile with a play triangle and cat ears.
+/// The app's mark: the logo given at build time (`CATTUBE_LOGO`), else
+/// CatTube's red tile with a play triangle and cat ears.
 fn mark(c: &C, x: f32, cy: f32, size: f32, alpha: u8) {
+    if let Some((tex, [w, h])) = crate::brand::logo(&c.ctx) {
+        // Fit the logo's height to the mark's, keeping its shape.
+        let lh = size;
+        let lw = (lh * w / h).min(size * 2.0);
+        c.image(
+            c.r(x, cy - lh / 2.0, lw, lh),
+            tex,
+            egui::Color32::from_white_alpha(alpha),
+        );
+        return;
+    }
     icons::draw(
         c,
         "cattube",
@@ -318,7 +330,7 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         92.0,
         y + 26.0,
         Align2::LEFT_CENTER,
-        "CatTube",
+        crate::brand::NAME,
         22.0,
         theme::text(),
         Weight::Semibold,
@@ -1111,7 +1123,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
         92.0,
         52.0,
         Align2::LEFT_CENTER,
-        "CatTube",
+        crate::brand::NAME,
         19.0,
         theme::rgba(theme::INK, 200),
         Weight::Semibold,
@@ -1293,7 +1305,11 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             ),
             SettingRow::UpdateYtDlp => (
                 tr("Update the player").into(),
-                format!("{tools} · CatTube {}", cattube_core::env::version()),
+                format!(
+                    "{tools} · {} {}",
+                    crate::brand::NAME,
+                    cattube_core::env::version()
+                ),
                 String::new(),
                 RowKind::Action,
                 "download",

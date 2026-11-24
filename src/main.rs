@@ -5,6 +5,7 @@
 //! window, the background jobs (YouTube requests, pictures, the
 //! yt-dlp updates) and the player.
 
+mod brand;
 mod canvas;
 mod i18n;
 mod i18n_pt;
@@ -1170,7 +1171,7 @@ fn main() -> eframe::Result {
         || std::env::var("CATTUBE_WINDOWED").is_ok_and(|v| v == "1");
     let (renderer, explicit) = renderer();
     let viewport = egui::ViewportBuilder::default()
-        .with_title("CatTube")
+        .with_title(brand::NAME)
         .with_app_id(yt::APP_WINDOW)
         .with_decorations(windowed)
         .with_fullscreen(!windowed)
