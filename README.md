@@ -133,7 +133,8 @@ To see hardware decoding, dropped frames and memory over the video, turn on **Se
 
 | Remote / keyboard | In the lists | In the player |
 |---|---|---|
-| Arrows | move around | Left / Right skip 10 s, Up / Down between seek bar, controls and related videos |
+| Arrows | move around | Left / Right skip 10 s (with the controls hidden, the progress bar shows alone for a moment), Up / Down between seek bar, controls and related videos |
+| Rewind / Forward, Previous / Next | | skip 30 s / 90 s, with the same progress bar |
 | OK, Enter | open, play | show controls, press focused button |
 | Hold OK, F2 | video menu | subtitle menu (fallback) |
 | Back, Esc, `GO_BACK` | back | hide controls, then stop |
