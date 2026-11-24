@@ -88,7 +88,7 @@ tar -xzf dist/cattube-*-"$(uname -m)".tar.gz -C dist
 dist/cattube-*-"$(uname -m)"/install.sh
 ```
 
-On `aarch64` the package is built without the `wgpu` renderer (`--no-default-features`), which makes the binary about 31% smaller. It then always draws with OpenGL.
+CatTubeLite is built without the `wgpu` (Vulkan) renderer by default, on every architecture: it draws with OpenGL and the binary is about 31% smaller. For a desktop build with Vulkan, use `cargo build --release --features wgpu`, or `CATTUBE_WGPU=1 packaging/tarball.sh`.
 
 ### Your own name and logo
 
@@ -125,7 +125,7 @@ On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.co
 | Environment variable | Values | Effect |
 |---|---|---|
 | `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (detected from RAM, GPU and architecture when unset). Among other things, low-power cards use YouTube's 320×180 video pictures (`mqdefault`) instead of the 480×360 letterboxed ones: a third of the pixels to decode, a smaller download, and a sharper card |
-| `CATTUBE_RENDERER` | `glow` / `wgpu` | Forces UI renderer (defaults to `glow` in `low_power`, `wgpu` otherwise, with automatic fallback when unset) |
+| `CATTUBE_RENDERER` | `glow` / `wgpu` | Forces UI renderer. Only builds with `--features wgpu` have `wgpu`; they default to `glow` in `low_power` and `wgpu` otherwise, with automatic fallback when unset |
 
 To see hardware decoding, dropped frames and memory over the video, turn on **Settings → About → Player statistics**. You can also query `mpv`'s IPC socket at `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` without it) for `hwdec-current` and `frame-drop-count`.
 

@@ -88,7 +88,7 @@ tar -xzf dist/cattube-*-"$(uname -m)".tar.gz -C dist
 dist/cattube-*-"$(uname -m)"/install.sh
 ```
 
-Em `aarch64`, o pacote é compilado sem o renderizador `wgpu` (`--no-default-features`), o que deixa o binário cerca de 31% menor. Nesse caso, ele sempre desenha com OpenGL.
+Por padrão, o CatTubeLite é compilado sem o renderizador `wgpu` (Vulkan), em todas as arquiteturas: ele desenha com OpenGL e o binário fica cerca de 31% menor. Para uma compilação de PC com Vulkan, use `cargo build --release --features wgpu` ou `CATTUBE_WGPU=1 packaging/tarball.sh`.
 
 ### Nome e logo próprios
 
@@ -125,7 +125,7 @@ Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](http
 | Variável de ambiente | Valores | Efeito |
 |---|---|---|
 | `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido). Entre outras coisas, no baixo desempenho os cards usam as imagens de 320×180 do YouTube (`mqdefault`) em vez das de 480×360 com faixas pretas: um terço dos pixels para decodificar, download menor e card mais nítido |
-| `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface (padrão `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido) |
+| `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface. Só compilações com `--features wgpu` têm o `wgpu`; nelas o padrão é `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido |
 
 Para ver decodificação por hardware, quadros descartados e memória sobre o vídeo, ative **Settings → About → Player statistics**. Também é possível consultar as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` sem essa variável).
 

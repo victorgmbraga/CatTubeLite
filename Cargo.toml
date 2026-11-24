@@ -15,8 +15,10 @@ name = "cattube"
 path = "src/main.rs"
 
 [features]
-default = ["wgpu"]
-# The Vulkan/Metal renderer. TV boxes use OpenGL and leave it out (31% smaller).
+# OpenGL only by default: TV boxes draw with it, and the binary is about
+# 31% smaller.
+default = []
+# The Vulkan/Metal renderer, for desktops that want it: --features wgpu.
 wgpu = ["eframe/wgpu"]
 
 [dependencies]

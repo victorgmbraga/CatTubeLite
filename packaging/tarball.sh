@@ -8,9 +8,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 NAME="cattube-$VERSION-$(uname -m)"
-# TV boxes draw with OpenGL: their build leaves the wgpu renderer out.
+# OpenGL only, on every architecture; CATTUBE_WGPU=1 adds the Vulkan
+# renderer (wgpu) for a desktop build.
 FEATURES=()
-if [[ "$(uname -m)" == aarch64 ]]; then FEATURES=(--no-default-features); fi
+if [[ "${CATTUBE_WGPU:-0}" == 1 ]]; then FEATURES=(--features wgpu); fi
 cargo build --release --locked "${FEATURES[@]}"
 rm -rf "dist/$NAME" && mkdir -p "dist/$NAME"
 D="dist/$NAME"
