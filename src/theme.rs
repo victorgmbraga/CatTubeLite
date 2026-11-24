@@ -146,7 +146,8 @@ pub enum Weight {
     Semibold,
 }
 
-/// Inter (SIL Open Font License, `assets/fonts/LICENSE-Inter.txt`), built in.
+/// Inter (SIL Open Font License, `assets/fonts/LICENSE-Inter.txt`), built
+/// in, cut down to Latin, Greek and Cyrillic (`packaging/subset-fonts.sh`).
 fn load_face(w: Weight) -> Option<FontData> {
     let bytes: &'static [u8] = match w {
         Weight::Regular => include_bytes!("../assets/fonts/Inter-Regular.ttf"),
@@ -158,12 +159,17 @@ fn load_face(w: Weight) -> Option<FontData> {
 
 /// Install fonts and base visuals. Call once from the app constructor.
 pub fn setup(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    let base = fonts
-        .families
-        .get(&FontFamily::Proportional)
-        .cloned()
-        .unwrap_or_default();
+    // Only Inter and, after it, Noto Emoji (SIL OFL, `LICENSE-NotoEmoji.txt`)
+    // for the emoji in titles: egui's own fonts (Ubuntu, Hack, an icon
+    // font; about 1 MB) are left out of the build.
+    let mut fonts = FontDefinitions::empty();
+    fonts.font_data.insert(
+        "cattube-emoji".into(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../assets/fonts/NotoEmoji-Regular.ttf"
+        ))),
+    );
+    let base = vec!["cattube-emoji".to_string()];
     let mut family = |w: Weight, key: &str| -> Vec<String> {
         let mut list = base.clone();
         // Regular is the fallback for the heavier weights.
@@ -183,6 +189,10 @@ pub fn setup(ctx: &egui::Context) {
     let regular = family(Weight::Regular, "cattube-regular");
     let medium = family(Weight::Medium, "cattube-medium-face");
     let semibold = family(Weight::Semibold, "cattube-semibold-face");
+    // egui's own widgets may ask for the monospace family.
+    fonts
+        .families
+        .insert(FontFamily::Monospace, regular.clone());
     fonts.families.insert(FontFamily::Proportional, regular);
     fonts
         .families
@@ -197,4 +207,48 @@ pub fn setup(ctx: &egui::Context) {
     visuals.window_fill = rgb(BG_TOP);
     visuals.override_text_color = Some(text());
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_built_in_fonts_cover_the_interface_and_titles() {
+        let ctx = egui::Context::default();
+        setup(&ctx);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                for family in [
+                    FontFamily::Proportional,
+                    FontFamily::Monospace,
+                    FontFamily::Name(MEDIUM.into()),
+                    FontFamily::Name(SEMIBOLD.into()),
+                ] {
+                    let font = egui::FontId::new(20.0, family);
+                    // Portuguese, the interface's symbols, other Latin,
+                    // Greek and Cyrillic.
+                    for c in "AzáãçéêíóõúÀÑß·•…→€ŁőđẞΩλЖщ".chars() {
+                        assert!(fonts.has_glyph(&font, c), "missing {c:?}");
+                    }
+                }
+            });
+            // Emoji in titles: `has_glyph` cannot tell (the emoji font is
+            // also where egui finds its "missing" square), so compare with
+            // how a character no font has is drawn.
+            let uv = |text: &str| {
+                let g = ui.painter().layout_no_wrap(
+                    text.into(),
+                    egui::FontId::proportional(20.0),
+                    Color32::WHITE,
+                );
+                g.rows[0].glyphs[0].uv_rect
+            };
+            let missing = uv("\u{E000}");
+            for e in ["😀", "❤", "🔥", "⚽"] {
+                assert_ne!(uv(e), missing, "missing {e}");
+            }
+        })
+        .drop_without_applying_deltas();
+    }
 }

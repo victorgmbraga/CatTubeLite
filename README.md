@@ -164,4 +164,4 @@ The cache folder also keeps `home.txt`, the last Home: it shows at once on the n
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). The bundled Inter font uses the SIL Open Font License; its notice is in [`assets/fonts/`](assets/fonts/). CatTubeLite is not affiliated with YouTube or Google.
+MIT, see [`LICENSE`](LICENSE). The bundled Inter (cut down to Latin, Greek and Cyrillic by `packaging/subset-fonts.sh`) and Noto Emoji fonts use the SIL Open Font License; their notices are in [`assets/fonts/`](assets/fonts/). CatTubeLite is not affiliated with YouTube or Google.

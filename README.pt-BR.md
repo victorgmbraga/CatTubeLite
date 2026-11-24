@@ -164,4 +164,4 @@ A pasta de cache também guarda `home.txt`, a última página inicial: ela apare
 
 ## Licença
 
-MIT — veja [`LICENSE`](LICENSE). A fonte embutida Inter usa a licença SIL Open Font License (aviso em [`assets/fonts/`](assets/fonts/)). O CatTubeLite não é desenvolvido nem afiliado ao YouTube ou ao Google.
+MIT — veja [`LICENSE`](LICENSE). As fontes embutidas Inter (reduzida a latim, grego e cirílico por `packaging/subset-fonts.sh`) e Noto Emoji usam a licença SIL Open Font License (avisos em [`assets/fonts/`](assets/fonts/)). O CatTubeLite não é desenvolvido nem afiliado ao YouTube ou ao Google.

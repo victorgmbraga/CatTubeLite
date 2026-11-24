@@ -21,7 +21,7 @@ wgpu = ["eframe/wgpu"]
 
 [dependencies]
 cattube-core = { path = "crates/cattube-core" }
-eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+eframe = { version = "=0.36.2", default-features = false, features = ["glow", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # YouTube's API in-process, over kept-alive connections (rustls: no system
 # TLS library needed).
