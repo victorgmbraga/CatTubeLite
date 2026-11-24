@@ -5,6 +5,7 @@
 pub mod community;
 pub mod env;
 pub mod error;
+pub mod home_cache;
 pub mod input;
 pub mod mpv;
 pub mod net;
