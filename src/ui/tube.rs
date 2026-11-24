@@ -16,11 +16,10 @@ use crate::prefs::Prefs;
 use crate::target::Target;
 use crate::theme::{self, Weight};
 use crate::widgets::{self, ListRow, RowKind};
-use cattube_core::account::Accounts;
 use cattube_core::community;
 use cattube_core::player;
 use cattube_core::scan::Scan;
-use cattube_core::tube::{self, MenuItem, Screen, Section, SettingRow, Tube};
+use cattube_core::tube::{self, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{Kind, Page, Tile};
 use eframe::egui::{self, Align2, Color32, Rect};
 use std::collections::HashMap;
@@ -50,7 +49,6 @@ pub fn crop_16_9(size: Option<[usize; 2]>) -> Rect {
 /// Everything the screens draw from.
 pub struct View<'a> {
     pub tube: &'a Tube,
-    pub accounts: &'a Accounts,
     pub prefs: &'a Prefs,
     pub pics: &'a Images,
     pub positions: &'a [(String, f64)],
@@ -130,7 +128,6 @@ pub fn draw(c: &C, v: &View) {
             let panel = c.opacity(menu_t).translated(0.0, 14.0 * (1.0 - menu_t));
             draw_menu(&panel, v, tile, details, *index);
         }
-        Some(Screen::SignIn { code }) => draw_sign_in(c, v, code),
         Some(Screen::TvCode { code }) => draw_tv_code(c, v, code),
         Some(Screen::Settings { index, groups }) => draw_settings(c, v, *index, *groups),
     }
@@ -314,8 +311,8 @@ fn mark(c: &C, x: f32, cy: f32, size: f32, alpha: u8) {
     );
 }
 
-/// Mark, the tab bar and the account button. `focus`: the pill with focus
-/// while the header has it (tabs, then `Section::ALL.len()` = account).
+/// Mark, the tab bar and the Settings button. `focus`: the pill with focus
+/// while the header has it (tabs, then `Section::ALL.len()` = Settings).
 fn header(c: &C, v: &View, focus: Option<usize>) {
     let k = ease(c, "tube-header", 0.4);
     let y = 26.0 - 14.0 * (1.0 - k);
@@ -330,14 +327,8 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         Weight::Semibold,
     );
     let labels: Vec<&str> = Section::ALL.iter().map(|s| tr(s.label())).collect();
-    let name = v.accounts.active().map_or(tr("Sign in"), |a| {
-        if a.name.is_empty() {
-            tr("Account")
-        } else {
-            a.name.as_str()
-        }
-    });
-    let acct_w = c.text_width(name, 16.0, Weight::Semibold) + 96.0;
+    let name = tr("Settings");
+    let acct_w = c.text_width(name, 16.0, Weight::Semibold) + 76.0;
     let tab_widths: Vec<f32> = labels.iter().map(|l| widgets::tab_width(c, l)).collect();
     let tabs_w: f32 = tab_widths.iter().sum::<f32>() + 6.0 * (labels.len() as f32 + 1.0);
     let right_edge = 1216.0 - acct_w;
@@ -370,33 +361,14 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
     }
     let x = 1216.0 - w;
     let cy = y + 26.0;
-    let photo = v.accounts.active().map_or("", |a| a.photo.as_str());
-    match v.pics.get(&c.ctx, photo, false) {
-        Some(tex) => c.image_rounded(
-            c.r(x + 11.0, cy - 15.0, 30.0, 30.0),
-            15.0,
-            tex,
-            Color32::WHITE,
-        ),
-        None => {
-            // The initial's disc swaps colours on the accent pill.
-            c.circle(
-                x + 26.0,
-                cy,
-                15.0,
-                widgets::mix(theme::accent(), theme::on_accent(), t),
-            );
-            c.text(
-                x + 26.0,
-                cy,
-                Align2::CENTER_CENTER,
-                &name.chars().take(1).collect::<String>().to_uppercase(),
-                15.0,
-                widgets::mix(theme::on_accent(), theme::accent(), t),
-                Weight::Semibold,
-            );
-        }
-    }
+    icons::draw(
+        c,
+        "gear",
+        x + 30.0,
+        cy,
+        18.0,
+        widgets::mix(theme::text2(), theme::on_accent(), t),
+    );
     c.text(
         x + 50.0,
         cy,
@@ -405,14 +377,6 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
         16.0,
         widgets::mix(theme::text(), theme::on_accent(), t),
         Weight::Semibold,
-    );
-    icons::draw(
-        c,
-        "gear",
-        x + w - 26.0,
-        cy,
-        16.0,
-        widgets::mix(theme::text2(), theme::on_accent(), t),
     );
     c.hit(rect, Target::Tube(usize::MAX, labels.len()));
 }
@@ -777,14 +741,6 @@ fn draw_browse(c: &C, v: &View) {
         motion::PAGE,
     );
     let c = &layer;
-    if section.needs_sign_in() && v.accounts.active().is_none() {
-        message(
-            c,
-            &format!("{} {}", tr("Sign in to see"), tr(section.label())),
-            tr("Choose the tab to sign in with a code"),
-        );
-        return;
-    }
     match t.current() {
         Some(Scan::Done(p)) if p.first().is_some_and(|p| !p.shelves.is_empty()) => {
             let p = &p[0];
@@ -795,14 +751,8 @@ fn draw_browse(c: &C, v: &View) {
             rows(c, v, p, focus, 300.0, "browse", true);
         }
         Some(Scan::Done(_)) => {
-            if section == Section::Home && v.accounts.active().is_none() {
-                message(
-                    c,
-                    tr("Search to get started"),
-                    tr(
-                        "Sign in (the button at the top right) for your recommendations and subscriptions",
-                    ),
-                );
+            if section == Section::Home {
+                message(c, tr("Search to get started"), "");
             } else {
                 message(c, tr("Nothing here yet"), "");
             }
@@ -1070,10 +1020,8 @@ fn draw_menu(
     details: &Scan<cattube_core::youtube::Details>,
     index: usize,
 ) {
-    let signed_in = v.accounts.active().is_some();
     let resumable = v.positions.iter().any(|(id, _)| *id == tile.id);
-    let items = tube::menu_items(tile, signed_in, resumable);
-    let subscribed = details.items().first().is_some_and(|d| d.subscribed);
+    let items = tube::menu_items(resumable);
     let h = 238.0 + items.len() as f32 * 56.0;
     let m = widgets::modal(c, 620.0, h.min(660.0));
     let (mx, my) = c.to_design(m.min);
@@ -1152,7 +1100,7 @@ fn draw_menu(
         widgets::button(
             c,
             r,
-            tr(it.label(subscribed)),
+            tr(it.label()),
             if i == 0 {
                 widgets::ButtonStyle::Primary
             } else {
@@ -1163,156 +1111,6 @@ fn draw_menu(
         c.hit(r, Target::Tube(0, i));
         y += 56.0;
     }
-    if matches!(details, Scan::Busy) && items.contains(&MenuItem::Subscribe) {
-        widgets::spinner(c, mx + 590.0, my + 40.0, 10.0, v.now);
-    }
-}
-
-/// "https://www.google.com/device" → "google.com/device".
-fn short_url(url: &str) -> String {
-    let u = url.trim();
-    let u = u
-        .strip_prefix("https://")
-        .or_else(|| u.strip_prefix("http://"))
-        .unwrap_or(u);
-    let u = u.strip_prefix("www.").unwrap_or(u);
-    u.trim_end_matches('/').to_string()
-}
-
-/// How big to draw a sign-in code so it fits `max_w`: (letter size,
-/// space per letter, padding inside a part, gap between parts).
-fn code_layout(code: &str, max_w: f32) -> (f32, f32, f32, f32) {
-    let parts = code.split('-').filter(|p| !p.is_empty()).count().max(1) as f32;
-    let letters = code.chars().filter(|c| *c != '-').count().max(1) as f32;
-    // At full size: letters 40, 44 apart, 18 padding, 36 between parts.
-    let full = letters * 44.0 + parts * 36.0 + (parts - 1.0) * 36.0;
-    let k = (max_w / full).min(1.0);
-    (40.0 * k, 44.0 * k, 18.0 * k, 36.0 * k)
-}
-
-fn draw_sign_in(c: &C, v: &View, code: &Scan<(String, String)>) {
-    backdrop(c, v, None);
-    let panel = c.r(250.0, 90.0, 780.0, 540.0);
-    c.glass(panel, 32.0);
-    let k = ease(c, "tube-sign-in", 0.4);
-    mark(c, 610.0, 148.0, 44.0, 255);
-    c.text(
-        640.0,
-        204.0,
-        Align2::CENTER_CENTER,
-        tr("Sign in to YouTube"),
-        28.0,
-        theme::text(),
-        Weight::Semibold,
-    );
-    match code {
-        Scan::Done(v2) if !v2.is_empty() => {
-            let (user_code, url) = &v2[0];
-            c.text(
-                640.0,
-                250.0,
-                Align2::CENTER_CENTER,
-                tr("On your phone or computer, go to"),
-                18.0,
-                theme::text2(),
-                Weight::Regular,
-            );
-            // The address as people type it ("google.com/device").
-            let shown = short_url(url);
-            c.text(
-                640.0,
-                288.0,
-                Align2::CENTER_CENTER,
-                &c.fit(&shown, 700.0, 30.0, Weight::Semibold),
-                30.0,
-                theme::accent(),
-                Weight::Semibold,
-            );
-            c.text(
-                640.0,
-                326.0,
-                Align2::CENTER_CENTER,
-                tr("and enter this code"),
-                18.0,
-                theme::text2(),
-                Weight::Regular,
-            );
-            // The code in its parts ("QZY-PCK-NJB": three pills), each
-            // letter well apart; everything shrinks to fit the panel, so
-            // a longer code never runs off it.
-            let (size, step, pad, gap) = code_layout(user_code, 680.0);
-            let parts: Vec<&str> = user_code.split('-').filter(|p| !p.is_empty()).collect();
-            let widths: Vec<f32> = parts
-                .iter()
-                .map(|p| p.chars().count() as f32 * step + 2.0 * pad)
-                .collect();
-            let total = widths.iter().sum::<f32>() + gap * (parts.len().saturating_sub(1)) as f32;
-            let mut x = 640.0 - total / 2.0;
-            let h = size * 2.0;
-            for (pi, (part, w)) in parts.iter().zip(&widths).enumerate() {
-                let ki = (k * 1.6 - pi as f32 * 0.12).clamp(0.0, 1.0);
-                let r = c.r(x, 366.0 - 12.0 * (1.0 - ki), *w, h);
-                c.fill(r, 18.0, theme::rgba(theme::WHITE, (18.0 * ki) as u8));
-                c.top_highlight(r, 18.0, theme::rgba(theme::WHITE, (140.0 * ki) as u8));
-                c.outline(r, 18.0, 1.0, theme::rgba(theme::WHITE, (40.0 * ki) as u8));
-                let (_, cy) = c.to_design(r.center());
-                for (ci, ch) in part.chars().enumerate() {
-                    c.text(
-                        x + pad + step * (ci as f32 + 0.5),
-                        cy,
-                        Align2::CENTER_CENTER,
-                        &ch.to_string(),
-                        size,
-                        theme::rgba(theme::INK, (255.0 * ki) as u8),
-                        Weight::Semibold,
-                    );
-                }
-                if pi + 1 < parts.len() {
-                    // The dash between parts, as on the code people read.
-                    c.fill(
-                        c.r(x + w + gap / 2.0 - 7.0, cy - 1.5, 14.0, 3.0),
-                        1.5,
-                        theme::rgba(theme::WHITE, (90.0 * ki) as u8),
-                    );
-                }
-                x += w + gap;
-            }
-            let msg = tr("Waiting for you to enter it…");
-            let w = c.text_width(msg, 16.0, Weight::Medium) + 30.0;
-            widgets::busy_line(c, 640.0 - w / 2.0, 490.0, msg, true, v.now);
-        }
-        Scan::Failed(e) => {
-            icons::draw(c, "refresh", 640.0, 380.0, 30.0, theme::text3());
-            c.text(
-                640.0,
-                430.0,
-                Align2::CENTER_CENTER,
-                e,
-                19.0,
-                theme::text2(),
-                Weight::Medium,
-            );
-            c.text(
-                640.0,
-                462.0,
-                Align2::CENTER_CENTER,
-                tr("Press OK for a new code"),
-                16.0,
-                theme::text3(),
-                Weight::Regular,
-            );
-        }
-        _ => widgets::busy_line(c, 545.0, 380.0, tr("Getting a code…"), true, v.now),
-    }
-    c.text(
-        640.0,
-        590.0,
-        Align2::CENTER_CENTER,
-        tr("Back to cancel"),
-        15.0,
-        theme::text3(),
-        Weight::Regular,
-    );
 }
 
 /// The phone remote's "Link with TV code" screen: where to type the code
@@ -1444,7 +1242,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
         Weight::Semibold,
     );
     widgets::title(c, 64.0, 92.0, tr("Settings"), 30.0);
-    let rows = tube::setting_rows(v.accounts.list.len(), v.prefs.sponsorblock);
+    let rows = tube::setting_rows(v.prefs.sponsorblock);
     let groups = tube::setting_groups(&rows);
     let shown = groups
         .iter()
@@ -1523,31 +1321,6 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
             continue;
         }
         let (title, sub, value, kind, icon): (String, String, String, RowKind, &str) = match row {
-            SettingRow::Account(i) => {
-                let a = &v.accounts.list[*i];
-                (
-                    if a.name.is_empty() {
-                        tr("YouTube account").into()
-                    } else {
-                        a.name.clone()
-                    },
-                    tr("OK uses it · hold OK to sign out").into(),
-                    if *i == v.accounts.active {
-                        tr("In use").into()
-                    } else {
-                        String::new()
-                    },
-                    RowKind::Action,
-                    "cattube",
-                )
-            }
-            SettingRow::AddAccount => (
-                tr("Add an account").into(),
-                tr("Sign in with a code").into(),
-                String::new(),
-                RowKind::Action,
-                "plus",
-            ),
             SettingRow::Quality => (
                 tr("Highest quality").into(),
                 tr("Lower plays smoother on slow connections").into(),
@@ -1787,27 +1560,6 @@ pub fn focus(t: &mut Tube, row: usize, col: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sign_in_code_and_address_fit_the_panel() {
-        assert_eq!(
-            short_url("https://www.google.com/device"),
-            "google.com/device"
-        );
-        assert_eq!(
-            short_url("http://youtube.com/activate/"),
-            "youtube.com/activate"
-        );
-        // Google's usual code: full size, inside the 680 wide area.
-        let (size, step, pad, gap) = code_layout("QZY-PCK-NJB", 680.0);
-        assert_eq!(size, 40.0);
-        assert!(9.0 * step + 3.0 * 2.0 * pad + 2.0 * gap <= 680.0);
-        // A longer one shrinks to fit.
-        let code = "ABCD-EFGH-IJKL-MNOP";
-        let (size, step, pad, gap) = code_layout(code, 680.0);
-        assert!(size < 40.0);
-        assert!(16.0 * step + 4.0 * 2.0 * pad + 3.0 * gap <= 680.0 + 0.01);
-    }
 
     #[test]
     fn letterboxed_pictures_lose_their_black_bars() {

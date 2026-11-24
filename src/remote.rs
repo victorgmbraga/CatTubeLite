@@ -9,7 +9,6 @@
 //! token is never on a command line) and drives mpv over its socket.
 
 use crate::{prefs, theme, yt};
-use cattube_core::account;
 use cattube_core::lounge::{self, Bind, Command, Lost, Msg, Out, Playing, Queue, Screen, Token};
 use cattube_core::mpv::{Arg, IpcConn};
 use cattube_core::player::{self, PlayOptions};
@@ -698,11 +697,9 @@ impl Remote {
         };
         self.seq += 1;
         let seq = self.seq;
-        let accounts = account::load(&self.config);
         let s = yt::Session {
             low_power,
             ctx: ytc::context(p.language.key(), &p.region),
-            refresh: accounts.active().map(|a| a.refresh_token.clone()),
             cache: self.cache.clone(),
             // The phone's queue decides what comes next.
             autoplay: prefs::Autoplay::Off,

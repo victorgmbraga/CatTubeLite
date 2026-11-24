@@ -4,52 +4,36 @@
 //! methods. Drawing lives in the app's `ui/tube.rs`.
 //!
 //! ```text
-//! Browse     tabs: Home · Subscriptions · History · Playlists · Channels
-//!            · Search, rows of tiles under them (Up from the first row:
-//!            the tabs, then the account button = Settings)
+//! Browse     tabs: Home · History · Search, rows of tiles under them
+//!            (Up from the first row: the tabs, then the Settings button)
 //! Page       a channel or a playlist, rows of tiles
 //! Search     keyboard and suggestions, then result rows
-//! Menu       a video's options: Play, Start over, Go to channel,
-//!            Like / Dislike, Subscribe, Watch later
-//! SignIn     the code to enter at google.com/device
+//! Menu       a video's options: Play, Start over, Go to channel
 //! TvCode     the code for the phone's "Link with TV code" (phone remote)
-//! Settings   accounts, quality, playback, SponsorBlock
+//! Settings   quality, playback, SponsorBlock, phone remote
 //! ```
 
 use crate::input::Action;
 use crate::osk::{Edge, Osk, OskEvent};
 use crate::scan::Scan;
-use crate::youtube::{Details, Kind, Page, Rating, Shelf, Tile, feeds};
+use crate::youtube::{Details, Kind, Page, Shelf, Tile, feeds};
 
-/// The tabs, in order. Signed out, only Home (trending-ish results from
-/// YouTube's own nudge) and Search work; the others ask to sign in.
+/// The tabs, in order. CatTubeLite has no YouTube sign-in: Home shows
+/// YouTube's signed-out picks, History what was watched on this TV.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
     Home,
-    Subscriptions,
     History,
-    Playlists,
-    Channels,
     Search,
 }
 
 impl Section {
-    pub const ALL: [Section; 6] = [
-        Section::Home,
-        Section::Subscriptions,
-        Section::History,
-        Section::Playlists,
-        Section::Channels,
-        Section::Search,
-    ];
+    pub const ALL: [Section; 3] = [Section::Home, Section::History, Section::Search];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
-            Self::Subscriptions => "Subscriptions",
             Self::History => "History",
-            Self::Playlists => "Playlists",
-            Self::Channels => "Channels",
             Self::Search => "Search",
         }
     }
@@ -57,16 +41,9 @@ impl Section {
     pub fn browse_id(self) -> Option<&'static str> {
         match self {
             Self::Home => Some(feeds::HOME),
-            Self::Subscriptions => Some(feeds::SUBSCRIPTIONS),
             Self::History => Some(feeds::HISTORY),
-            Self::Playlists => Some(feeds::LIBRARY),
-            Self::Channels => Some(feeds::CHANNELS),
             Self::Search => None,
         }
-    }
-
-    pub fn needs_sign_in(self) -> bool {
-        !matches!(self, Self::Home | Self::Search | Self::History)
     }
 }
 
@@ -76,51 +53,31 @@ pub enum MenuItem {
     Play,
     StartOver,
     Channel,
-    Like,
-    Dislike,
-    Subscribe,
-    WatchLater,
 }
 
 impl MenuItem {
-    pub fn label(self, subscribed: bool) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Play => "Play",
             Self::StartOver => "Start over",
             Self::Channel => "Go to channel",
-            Self::Like => "Like",
-            Self::Dislike => "Dislike",
-            Self::Subscribe if subscribed => "Unsubscribe",
-            Self::Subscribe => "Subscribe",
-            Self::WatchLater => "Save to Watch later",
         }
     }
 }
 
-/// The menu's entries for a tile (signed in or not; resumable or not).
-pub fn menu_items(tile: &Tile, signed_in: bool, resumable: bool) -> Vec<MenuItem> {
+/// The menu's entries (resumable or not).
+pub fn menu_items(resumable: bool) -> Vec<MenuItem> {
     let mut v = vec![MenuItem::Play];
     if resumable {
         v.push(MenuItem::StartOver);
     }
     v.push(MenuItem::Channel);
-    if signed_in && tile.playable() {
-        v.extend([
-            MenuItem::Like,
-            MenuItem::Dislike,
-            MenuItem::Subscribe,
-            MenuItem::WatchLater,
-        ]);
-    }
     v
 }
 
 /// Settings rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingRow {
-    /// Account `i` (OK uses it, Options signs it out).
-    Account(usize),
-    AddAccount,
     Quality,
     Codec,
     Hdr,
@@ -145,7 +102,6 @@ pub enum SettingRow {
 /// focused group's rows on the right.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingGroup {
-    Accounts,
     Video,
     Playback,
     SponsorBlock,
@@ -156,7 +112,6 @@ pub enum SettingGroup {
 impl SettingGroup {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Accounts => "Accounts",
             Self::Video => "Video",
             Self::Playback => "Playback",
             Self::SponsorBlock => "SponsorBlock",
@@ -167,7 +122,6 @@ impl SettingGroup {
 
     pub fn icon(self) -> &'static str {
         match self {
-            Self::Accounts => "cattube",
             Self::Video => "display",
             Self::Playback => "play",
             Self::SponsorBlock => "check",
@@ -179,7 +133,6 @@ impl SettingGroup {
 
 pub fn group_of(row: SettingRow) -> SettingGroup {
     match row {
-        SettingRow::Account(_) | SettingRow::AddAccount => SettingGroup::Accounts,
         SettingRow::Quality | SettingRow::Codec | SettingRow::Hdr => SettingGroup::Video,
         SettingRow::Subtitles
         | SettingRow::SubtitleLanguage
@@ -206,10 +159,8 @@ pub fn setting_groups(rows: &[SettingRow]) -> Vec<(SettingGroup, std::ops::Range
     out
 }
 
-pub fn setting_rows(accounts: usize, sponsorblock: bool) -> Vec<SettingRow> {
-    let mut v: Vec<SettingRow> = (0..accounts).map(SettingRow::Account).collect();
-    v.extend([
-        SettingRow::AddAccount,
+pub fn setting_rows(sponsorblock: bool) -> Vec<SettingRow> {
+    let mut v = vec![
         SettingRow::Quality,
         SettingRow::Codec,
         SettingRow::Hdr,
@@ -220,7 +171,7 @@ pub fn setting_rows(accounts: usize, sponsorblock: bool) -> Vec<SettingRow> {
         SettingRow::Region,
         SettingRow::Language,
         SettingRow::SponsorBlock,
-    ]);
+    ];
     if sponsorblock {
         v.extend((0..crate::community::CATEGORIES.len()).map(SettingRow::Category));
     }
@@ -263,9 +214,6 @@ pub enum Screen {
         details: Scan<Details>,
         index: usize,
     },
-    SignIn {
-        code: Scan<(String, String)>,
-    },
     /// The 12-digit code (shown "123 456 789 012").
     TvCode {
         code: Scan<String>,
@@ -295,18 +243,8 @@ pub enum Effect {
         tile: Box<Tile>,
         from_start: bool,
     },
-    SignInStart,
-    SignInStop,
     /// Fetch a code for the phone's "Link with TV code".
     TvCode,
-    SwitchAccount(usize),
-    SignOut(usize),
-    Rate(String, Rating),
-    Subscribe {
-        channel_id: String,
-        on: bool,
-    },
-    WatchLater(String),
     /// A setting row changed by `delta` (−1, +1; OK = +1).
     Setting(SettingRow, i32),
     Close,
@@ -318,8 +256,6 @@ pub enum Effect {
 /// What the app knows that the screens need.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ctx {
-    pub signed_in: bool,
-    pub accounts: usize,
     pub sponsorblock: bool,
     /// A video plays behind CatTube's list (Back in the player hid it).
     pub playing: bool,
@@ -335,7 +271,7 @@ pub struct Tube {
     pub row: usize,
     pub cols: Vec<usize>,
     pub header: bool,
-    /// Which pill has focus in the header: a tab, or `ALL.len()` = account.
+    /// Which pill has focus in the header: a tab, or `ALL.len()` = Settings.
     pub header_index: usize,
     /// The Now playing bar has focus (only while `Ctx::playing`).
     pub now_playing: bool,
@@ -360,7 +296,7 @@ impl Tube {
         self.recent.truncate(RECENT_SEARCHES);
     }
 
-    pub fn open(ctx: Ctx) -> (Self, Vec<Effect>) {
+    pub fn open() -> (Self, Vec<Effect>) {
         let mut t = Tube {
             stack: vec![Screen::Browse],
             section: Section::Home,
@@ -373,9 +309,7 @@ impl Tube {
             error: None,
             recent: Vec::new(),
         };
-        // Signed out, Home is nearly empty on YouTube's TV app: start in
-        // Search's place on Home with its results instead.
-        let eff = t.select(Section::Home, ctx);
+        let eff = t.select(Section::Home);
         (t, eff)
     }
 
@@ -401,7 +335,7 @@ impl Tube {
         self.section.browse_id().and_then(|b| self.pages.get(b))
     }
 
-    fn select(&mut self, s: Section, ctx: Ctx) -> Vec<Effect> {
+    fn select(&mut self, s: Section) -> Vec<Effect> {
         self.section = s;
         self.row = 0;
         self.cols.clear();
@@ -415,10 +349,6 @@ impl Tube {
             }
             return vec![];
         }
-        if s.needs_sign_in() && !ctx.signed_in {
-            self.header = true;
-            return vec![];
-        }
         let id = s.browse_id().unwrap_or_default().to_string();
         match self.pages.get(&id) {
             Some(Scan::Done(_)) | Some(Scan::Busy) => vec![],
@@ -429,8 +359,8 @@ impl Tube {
         }
     }
 
-    /// Reload the current tab (after signing in or out, after playback).
-    pub fn reload(&mut self, ctx: Ctx) -> Vec<Effect> {
+    /// Reload the current tab (after playback, after a setting changed).
+    pub fn reload(&mut self) -> Vec<Effect> {
         if let Some(id) = self.section.browse_id() {
             self.pages.remove(id);
         }
@@ -438,22 +368,19 @@ impl Tube {
         if s == Section::Search {
             return vec![];
         }
-        self.select(s, ctx)
+        self.select(s)
     }
 
-    /// Forget every tab (the account changed).
-    pub fn reset(&mut self, ctx: Ctx) -> Vec<Effect> {
+    /// Forget every tab (the language or the region changed).
+    pub fn reset(&mut self) -> Vec<Effect> {
         self.pages.clear();
         self.stack.truncate(1);
         let s = self.section;
-        self.select(
-            if s == Section::Search {
-                Section::Home
-            } else {
-                s
-            },
-            ctx,
-        )
+        self.select(if s == Section::Search {
+            Section::Home
+        } else {
+            s
+        })
     }
 
     /// The Browse tab on screen has rows of videos.
@@ -465,18 +392,13 @@ impl Tube {
 
     fn back(&mut self) -> Vec<Effect> {
         if self.stack.len() > 1 {
-            let leaving_sign_in = matches!(self.stack.last(), Some(Screen::SignIn { .. }));
             self.stack.pop();
             self.error = None;
             if matches!(self.stack.last(), Some(Screen::Browse)) && self.section == Section::Search
             {
                 self.section = Section::Home;
             }
-            return if leaving_sign_in {
-                vec![Effect::SignInStop]
-            } else {
-                vec![]
-            };
+            return vec![];
         }
         if self.header {
             return vec![Effect::Close];
@@ -527,12 +449,6 @@ impl Tube {
         } else {
             vec![]
         }
-    }
-
-    pub fn sign_in(&mut self) -> Vec<Effect> {
-        self.error = None;
-        self.stack.push(Screen::SignIn { code: Scan::Busy });
-        vec![Effect::SignInStart]
     }
 
     pub fn handle(
@@ -756,8 +672,7 @@ impl Tube {
                 details,
                 index,
             } => {
-                let subscribed = details.items().first().is_some_and(|d| d.subscribed);
-                let items = menu_items(tile, ctx.signed_in, resumable(&tile.id));
+                let items = menu_items(resumable(&tile.id));
                 match action {
                     Action::Back => self.back(),
                     Action::Up => {
@@ -793,16 +708,7 @@ impl Tube {
                             Some(MenuItem::Channel) => {
                                 vec![Effect::Toast("No channel for this one".into())]
                             }
-                            Some(MenuItem::Like) => vec![Effect::Rate(tile.id, Rating::Like)],
-                            Some(MenuItem::Dislike) => vec![Effect::Rate(tile.id, Rating::Dislike)],
-                            Some(MenuItem::Subscribe) if !channel.is_empty() => {
-                                vec![Effect::Subscribe {
-                                    channel_id: channel,
-                                    on: !subscribed,
-                                }]
-                            }
-                            Some(MenuItem::WatchLater) => vec![Effect::WatchLater(tile.id)],
-                            _ => vec![],
+                            None => vec![],
                         }
                     }
                     _ => vec![],
@@ -816,17 +722,8 @@ impl Tube {
                 }
                 _ => vec![],
             },
-            Screen::SignIn { code } => match action {
-                Action::Back => self.back(),
-                Action::Ok if matches!(code, Scan::Failed(_)) => {
-                    *code = Scan::Busy;
-                    self.error = None;
-                    vec![Effect::SignInStop, Effect::SignInStart]
-                }
-                _ => vec![],
-            },
             Screen::Settings { index, groups } => {
-                let rows = setting_rows(ctx.accounts, ctx.sponsorblock);
+                let rows = setting_rows(ctx.sponsorblock);
                 let row = rows.get(*index).copied();
                 let all = setting_groups(&rows);
                 let gi = all.iter().position(|(_, r)| r.contains(index)).unwrap_or(0);
@@ -850,9 +747,7 @@ impl Tube {
                     (Action::Back, _)
                         | (
                             Action::Left,
-                            Some(SettingRow::Account(_))
-                                | Some(SettingRow::AddAccount)
-                                | Some(SettingRow::LinkPhone)
+                            Some(SettingRow::LinkPhone)
                                 | Some(SettingRow::PlayerStats)
                                 | Some(SettingRow::UpdateYtDlp)
                                 | Some(SettingRow::Hdr)
@@ -879,16 +774,6 @@ impl Tube {
                         }
                         vec![]
                     }
-                    (Action::Ok, Some(SettingRow::Account(i))) => {
-                        let eff = vec![Effect::SwitchAccount(i)];
-                        self.stack.truncate(1);
-                        eff
-                    }
-                    (Action::OkLong | Action::Options, Some(SettingRow::Account(i))) => {
-                        *index = index.saturating_sub(1);
-                        vec![Effect::SignOut(i)]
-                    }
-                    (Action::Ok, Some(SettingRow::AddAccount)) => self.sign_in(),
                     (Action::Ok, Some(SettingRow::LinkPhone)) => {
                         self.stack.push(Screen::TvCode { code: Scan::Busy });
                         vec![Effect::TvCode]
@@ -959,11 +844,7 @@ impl Tube {
                         return vec![];
                     }
                     let s = Section::ALL[self.header_index];
-                    if s.needs_sign_in() && !ctx.signed_in {
-                        self.section = s;
-                        return self.sign_in();
-                    }
-                    let eff = self.select(s, ctx);
+                    let eff = self.select(s);
                     if s != Section::Search {
                         self.header = !self
                             .current()
@@ -987,7 +868,7 @@ impl Tube {
             match action {
                 Action::Up | Action::Back => self.header = true,
                 Action::Ok if matches!(self.current(), Some(Scan::Failed(_))) => {
-                    return self.reload(ctx);
+                    return self.reload();
                 }
                 _ => {}
             }
@@ -1260,16 +1141,6 @@ impl Tube {
         }
     }
 
-    /// The sign-in code to show, or why there is none.
-    pub fn on_sign_in_code(&mut self, result: Result<(String, String), String>) {
-        if let Some(Screen::SignIn { code }) = self.stack.last_mut() {
-            *code = match result {
-                Ok(c) => Scan::Done(vec![c]),
-                Err(e) => Scan::Failed(e),
-            };
-        }
-    }
-
     /// The phone code to show (a new one replaces the old).
     pub fn on_tv_code(&mut self, result: Result<String, String>) {
         if let Some(Screen::TvCode { code }) = self.stack.last_mut() {
@@ -1277,21 +1148,6 @@ impl Tube {
                 Ok(c) => Scan::Done(vec![c]),
                 Err(e) => Scan::Failed(e),
             };
-        }
-    }
-
-    /// Signed in (or it failed for good).
-    pub fn on_signed_in(&mut self, result: Result<(), String>, ctx: Ctx) -> Vec<Effect> {
-        match result {
-            Ok(()) => {
-                self.stack.truncate(1);
-                self.header = false;
-                self.reset(ctx)
-            }
-            Err(e) => {
-                self.on_sign_in_code(Err(e));
-                vec![]
-            }
         }
     }
 }
@@ -1485,15 +1341,7 @@ mod tests {
         }
     }
 
-    const OUT: Ctx = Ctx {
-        signed_in: false,
-        accounts: 0,
-        sponsorblock: true,
-        playing: false,
-    };
     const IN: Ctx = Ctx {
-        signed_in: true,
-        accounts: 1,
         sponsorblock: true,
         playing: false,
     };
@@ -1511,7 +1359,7 @@ mod tests {
 
     #[test]
     fn opens_on_home_and_plays() {
-        let (mut t, eff) = Tube::open(IN);
+        let (mut t, eff) = Tube::open();
         assert_eq!(eff, vec![Effect::Load("FEwhat_to_watch".into())]);
         t.on_page(
             "FEwhat_to_watch",
@@ -1536,7 +1384,7 @@ mod tests {
 
     #[test]
     fn the_now_playing_bar_goes_back_to_the_video() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.on_page("FEwhat_to_watch", ok(page(&[&["aaaaaaaaaaa"]])));
         // The video was hidden: the bar has focus, OK goes back to it.
         t.now_playing = true;
@@ -1563,7 +1411,7 @@ mod tests {
 
     #[test]
     fn player_strip_preserves_channel_focus_and_search_pagination() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.open_page("UCchannel".into());
         t.on_page("UCchannel", ok(page(&[&["a", "b"], &["c", "d"]])));
         t.handle(Down, PLAYING, &no);
@@ -1574,7 +1422,7 @@ mod tests {
         t.handle(Up, PLAYING, &no);
         assert!(!t.now_playing);
         assert_eq!(t.focused().unwrap().id, "d");
-        t.select(Section::Search, IN);
+        t.select(Section::Search);
         let mut reply = page(&[&["a", "b"]]);
         reply.continuation = Some("next".into());
         t.on_search(ok(reply));
@@ -1597,7 +1445,7 @@ mod tests {
 
     #[test]
     fn refreshed_history_preserves_the_selected_video() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.on_page("FEwhat_to_watch", ok(page(&[&["a", "b", "c"]])));
         t.handle(Right, IN, &no);
         t.replace_page("FEwhat_to_watch", ok(page(&[&["new", "a", "b", "c"]])));
@@ -1615,29 +1463,23 @@ mod tests {
     }
 
     #[test]
-    fn tabs_load_once_and_ask_to_sign_in() {
-        let (mut t, _) = Tube::open(OUT);
+    fn tabs_load_once() {
+        assert_eq!(
+            Section::ALL,
+            [Section::Home, Section::History, Section::Search]
+        );
+        let (mut t, _) = Tube::open();
         t.on_page("FEwhat_to_watch", ok(Page::default()));
         assert!(t.header);
-        t.handle(Right, OUT, &no);
-        // Subscriptions signed out: the sign-in screen.
-        assert_eq!(t.handle(Ok, OUT, &no), vec![Effect::SignInStart]);
-        t.on_sign_in_code(ok((
-            "WZY-WHH-FZQ".into(),
-            "https://www.google.com/device".into(),
-        )));
-        assert_eq!(t.handle(Back, OUT, &no), vec![Effect::SignInStop]);
-        // Signed in: Subscriptions loads, and only once.
-        let (mut t, _) = Tube::open(IN);
-        t.header = true;
+        // History loads, and only once.
         t.header_index = 1;
         assert_eq!(
             t.handle(Ok, IN, &no),
-            vec![Effect::Load("FEsubscriptions".into())]
+            vec![Effect::Load("FEhistory".into())]
         );
         t.header = true;
         assert!(t.handle(Ok, IN, &no).is_empty());
-        // The last pill is the account button: Settings.
+        // The last pill is the Settings button.
         t.header = true;
         t.header_index = Section::ALL.len();
         t.handle(Ok, IN, &no);
@@ -1646,7 +1488,7 @@ mod tests {
 
     #[test]
     fn channels_and_playlists_open_pages() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         let mut p = page(&[&[]]);
         p.shelves[0].tiles = vec![tile("UCxyz", Kind::Channel), tile("PLabc", Kind::Playlist)];
         t.on_page("FEwhat_to_watch", ok(p));
@@ -1662,14 +1504,14 @@ mod tests {
 
     #[test]
     fn video_menu() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.on_page("FEwhat_to_watch", ok(page(&[&["aaaaaaaaaaa"]])));
         let resumable = |id: &str| id == "aaaaaaaaaaa";
         assert_eq!(
             t.handle(OkLong, IN, &resumable),
             vec![Effect::Details("aaaaaaaaaaa".into())]
         );
-        // Play, Start over, Channel, Like, Dislike, Subscribe, Watch later.
+        // Play, Start over, Go to channel.
         t.handle(Down, IN, &resumable);
         assert!(matches!(
             &t.handle(Ok, IN, &resumable)[0],
@@ -1683,7 +1525,6 @@ mod tests {
             "aaaaaaaaaaa",
             ok(Details {
                 channel_id: "UCchan".into(),
-                subscribed: true,
                 ..Details::default()
             }),
         );
@@ -1692,16 +1533,9 @@ mod tests {
         }
         assert_eq!(
             t.handle(Ok, IN, &resumable),
-            vec![Effect::Subscribe {
-                channel_id: "UCchan".into(),
-                on: false
-            }]
+            vec![Effect::Load("UCchan".into())]
         );
-        // Signed out: no rating or subscribing.
-        assert_eq!(
-            menu_items(&tile("aaaaaaaaaaa", Kind::Video), false, false),
-            vec![MenuItem::Play, MenuItem::Channel]
-        );
+        assert_eq!(menu_items(false), vec![MenuItem::Play, MenuItem::Channel]);
     }
 
     #[test]
@@ -1744,7 +1578,7 @@ mod tests {
 
         // On screen: Down from a video keeps its column; near the end the
         // next results are asked for, once.
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.stack.push(search_screen());
         t.on_search(ok(reply));
         assert!(matches!(
@@ -1791,7 +1625,7 @@ mod tests {
 
     #[test]
     fn right_and_down_off_the_keyboard_reach_suggestions_and_results() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.stack.push(search_screen());
         if let Some(Screen::Search { osk, .. }) = t.stack.last_mut() {
             osk.set_text("mkbh");
@@ -1827,9 +1661,9 @@ mod tests {
 
     #[test]
     fn search_with_suggestions() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.header = true;
-        t.header_index = 5;
+        t.header_index = search_tab();
         t.handle(Ok, IN, &no);
         assert!(t.text_mode());
         // Typing "ca" (the keyboard's own keys stand in for typed text).
@@ -1853,7 +1687,7 @@ mod tests {
 
     #[test]
     fn recent_searches_show_while_the_box_is_empty() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.remember_search("cats");
         t.remember_search("dogs ");
         t.remember_search("Cats");
@@ -1879,7 +1713,7 @@ mod tests {
 
     #[test]
     fn up_from_search_reaches_the_top_bar() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.header = true;
         t.header_index = search_tab();
         t.handle(Ok, IN, &no);
@@ -1905,7 +1739,7 @@ mod tests {
 
     #[test]
     fn rows_fetch_more_near_the_end() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         let mut p = page(&[&["a0000000000", "a1111111111"]]);
         p.shelves[0].continuation = Some("TOK".into());
         t.on_page("FEwhat_to_watch", ok(p));
@@ -1925,20 +1759,13 @@ mod tests {
 
     #[test]
     fn settings_rows() {
-        assert_eq!(
-            setting_rows(2, false)[..3],
-            [
-                SettingRow::Account(0),
-                SettingRow::Account(1),
-                SettingRow::AddAccount
-            ]
-        );
-        let all = setting_rows(0, true);
+        assert_eq!(setting_rows(false)[0], SettingRow::Quality);
+        let all = setting_rows(true);
         assert!(all.contains(&SettingRow::Category(0)));
         assert_eq!(*all.last().unwrap(), SettingRow::UpdateYtDlp);
         // The phone code: OK opens it, OK again asks for a fresh one.
-        let (mut p, _) = Tube::open(IN);
-        let at = setting_rows(OUT.accounts, OUT.sponsorblock)
+        let (mut p, _) = Tube::open();
+        let at = setting_rows(IN.sponsorblock)
             .iter()
             .position(|r| *r == SettingRow::LinkPhone)
             .unwrap();
@@ -1946,17 +1773,17 @@ mod tests {
             index: at,
             groups: false,
         });
-        assert_eq!(p.handle(Action::Ok, OUT, &no), vec![Effect::TvCode]);
+        assert_eq!(p.handle(Action::Ok, IN, &no), vec![Effect::TvCode]);
         p.on_tv_code(Result::Ok("961234567890".into()));
         assert!(
             matches!(p.stack.last(), Some(Screen::TvCode { code: Scan::Done(c) }) if c[0] == "961234567890")
         );
-        assert_eq!(p.handle(Action::Ok, OUT, &no), vec![Effect::TvCode]);
-        p.handle(Back, OUT, &no);
+        assert_eq!(p.handle(Action::Ok, IN, &no), vec![Effect::TvCode]);
+        p.handle(Back, IN, &no);
         assert!(matches!(p.stack.last(), Some(Screen::Settings { .. })));
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.stack.push(Screen::Settings {
-            index: 2,
+            index: 0,
             groups: false,
         });
         assert_eq!(
@@ -1967,21 +1794,15 @@ mod tests {
             t.handle(Left, IN, &no),
             vec![Effect::Setting(SettingRow::Quality, -1)]
         );
-        t.stack.push(Screen::Settings {
-            index: 0,
-            groups: false,
-        });
-        assert_eq!(t.handle(Options, IN, &no), vec![Effect::SignOut(0)]);
     }
 
     #[test]
     fn settings_are_shown_by_group() {
-        let rows = setting_rows(1, true);
+        let rows = setting_rows(true);
         let groups: Vec<SettingGroup> = setting_groups(&rows).iter().map(|(g, _)| *g).collect();
         assert_eq!(
             groups,
             [
-                SettingGroup::Accounts,
                 SettingGroup::Video,
                 SettingGroup::Playback,
                 SettingGroup::SponsorBlock,
@@ -1992,7 +1813,7 @@ mod tests {
         // From the top bar's gear: the groups have focus. Down picks the
         // next group, Right goes into it, Down stays inside it, Left on a
         // value changes it, Back returns to the groups, Back again leaves.
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.stack.push(Screen::Settings {
             index: 0,
             groups: true,
@@ -2001,9 +1822,8 @@ mod tests {
             Some(Screen::Settings { index, groups }) => (*index, *groups),
             _ => (usize::MAX, false),
         };
-        let rows = setting_rows(IN.accounts, IN.sponsorblock);
+        let rows = setting_rows(IN.sponsorblock);
         let video = rows.iter().position(|r| *r == SettingRow::Quality).unwrap();
-        t.handle(Down, IN, &no);
         assert_eq!(idx(&t), (video, true));
         t.handle(Right, IN, &no);
         assert_eq!(idx(&t), (video, false));
@@ -2029,7 +1849,7 @@ mod tests {
 
     #[test]
     fn shrinking_suggestions_clamps_focus_and_empty_search_stays_on_keyboard() {
-        let (mut t, _) = Tube::open(IN);
+        let (mut t, _) = Tube::open();
         t.stack.push(search_screen());
         if let Some(Screen::Search {
             osk,
@@ -2064,8 +1884,8 @@ mod tests {
 
     #[test]
     fn right_arrow_in_settings_does_not_toggle_or_trigger_actions() {
-        let (mut t, _) = Tube::open(IN);
-        let rows = setting_rows(IN.accounts, IN.sponsorblock);
+        let (mut t, _) = Tube::open();
+        let rows = setting_rows(IN.sponsorblock);
         let hdr = rows.iter().position(|r| *r == SettingRow::Hdr).unwrap();
         let update = rows
             .iter()

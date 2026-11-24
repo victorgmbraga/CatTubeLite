@@ -14,7 +14,7 @@ Assim como o CatTube original, abre em tela cheia, funciona com setas, OK e Volt
 
 ## O que mudou neste fork
 
-O CatTubeLite parte do CatTube `1.0.4` e reúne quatro frentes de mudanças voltadas para desempenho, estabilidade e menor uso de CPU/GPU/RAM:
+O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças voltadas para desempenho, estabilidade e menor uso de CPU/GPU/RAM:
 
 ### Interface plana e renderização leve
 - **Tema plano em preto puro (`FLAT`):** remove fundos animados, backdrops borrados, camadas translúcidas de vidro, sombras suaves, brilhos especulares, overdraw redundante e animações de fade em toasts, eliminando composições com transparência caras em GPUs como a Mali-450.
@@ -30,25 +30,29 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne quatro frentes de mudanças volt
 ### Arquitetura de memória, rede e E/S
 - **Caches de imagem limitados em RAM e em disco:** limita texturas em memória (`16 MiB` em `low_power`, `64 MiB` padrão, despejo LRU com prioridade ao foco e lado máximo de `320 px` / `640 px`) e limpa automaticamente `~/.cache/cattube/images` na inicialização (`64 MiB` / 1.500 arquivos em `low_power`; `256 MiB` / 4.000 arquivos padrão), além de arquivos `.part` abandonados.
 - **Pool limitado de workers:** substitui a criação ilimitada de threads por tarefa por um pool fixo (`4` workers em `low_power`, `8` padrão).
-- **Download de thumbnails em lote e refresh OAuth serializado:** baixa thumbnails ausentes em lote com `curl --parallel` (reaproveitando conexões HTTP/2 + TLS), limita o paralelismo dos feeds de Inscrições (`--parallel-max` 8 em `low_power`, 24 padrão) e serializa renovações de token OAuth para evitar múltiplas requisições simultâneas.
+- **Download de thumbnails em lote:** baixa thumbnails ausentes em lote com `curl --parallel`, reaproveitando conexões HTTP/2 + TLS.
 - **Debounce real na busca e E/S não bloqueante:** debounce real de 200 ms no timer de UI com cancelamento por geração nas sugestões de busca; carregamento assíncrono de Histórico e posições fora da thread de UI com merge de checkpoints em `O(N)`; e substituição do polling de 10 ms em subprocessos por espera orientada a EOF com limite de buffer e proteção contra descritores herdados por processos filhos.
 - **Daemon `--remote` mais econômico:** intervalo de 1 s (em vez de 200 ms) quando o casting está desativado, verificação de atualização do `yt-dlp` em segundo plano quando já instalado e throttle de 1 Hz no polling de estado do `mpv`.
 
 ### Estabilidade, compatibilidade e persistência atômica
 - **Ciclo de vida e IPC do `mpv` endurecidos:** `PlayerHandle` compartilhado com detecção precoce de saída e `reap_or_kill` com limite de tempo, correção de leituras parciais e EOF no `IpcConn`, fallbacks para versões mais antigas do `mpv` (`loadfile` `< 0.38` e `overlay-add` `< 0.39`), escape ASS e truncamento UTF-8 seguro no OSD, correção da largura da miniatura de *Up Next* (`256 px`) e guardas de geração para chat ao vivo e comentários.
 - **Correções de bugs:** elimina panics ao encolher sugestões de busca ou redimensionar thumbnails com proporções extremas, evita travar o teclado em buscas vazias, corrige o pulo de outros do SponsorBlock no fim do vídeo, corrige a primeira execução com `--play` e salvamento de velocidade ao sair, evita sobrescrita de contas reais ao atualizar perfil, corrige arredondamento em `views_text` e completa traduções do menu de vídeo, selo `LIVE` e idioma das sugestões.
-- **Escritas atômicas:** grava contas, pareamento remoto, checkpoints, `positions.conf` mesclado, histórico de buscas, backdrops borrados e downloads de ferramentas usando arquivos temporários únicos e `rename` atômico. Configurações, contas e pareamento remoto também são forçados para o disco e resistem a uma queda de energia.
+- **Escritas atômicas:** grava pareamento remoto, checkpoints, `positions.conf` mesclado, histórico de buscas, backdrops borrados e downloads de ferramentas usando arquivos temporários únicos e `rename` atômico. Configurações e pareamento remoto também são forçados para o disco e resistem a uma queda de energia.
 - **Um player por vez:** o app e o daemon `--remote` se coordenam pelo socket do `mpv`. Quem inicia um vídeo salva a posição atual e fecha antes o player do outro.
 - **Ferramentas verificadas:** `yt-dlp` e Deno são conferidos com o SHA-256 publicado antes do uso. O Deno é instalado de forma atômica, testado antes de ser ativado, reparado após uma instalação interrompida e verificado para atualização a cada 30 dias.
 - **Tarefas em segundo plano resilientes:** uma tarefa que falha não derruba mais o worker, e a tela que a aguardava mostra um erro em vez de ficar carregando para sempre.
 
+### Sem conta do YouTube
+- **Sem login:** o CatTubeLite nunca entra numa conta do YouTube e não guarda tokens. Saíram a tela de login, as contas, as abas Inscrições, Playlists e Canais e as ações Curtir / Não curtir / Inscrever-se / Assistir mais tarde. Um `~/.config/cattube/accounts.conf` que tenha sobrado do CatTube original é ignorado; pode apagá-lo se não precisar mais dele.
+- **O que continua:** Início (transmissões ao vivo e tópicos populares do YouTube), Histórico (guardado na TV), Busca, páginas de canais e playlists, comentários, chat ao vivo, SponsorBlock, contagem do Return YouTube Dislike e transmissão pelo celular, nada disso precisa de conta.
+
 ## Recursos
 
-- **Seu YouTube.** Início, Inscrições, Histórico, Playlists e Canais. Login no estilo TV via `google.com/device` no celular, com suporte a múltiplas contas. Sem login, a tela inicial exibe transmissões ao vivo e tópicos populares.
+- **YouTube sem conta.** O Início mostra transmissões ao vivo e tópicos populares, o Histórico lista o que foi assistido na TV e a Busca encontra o resto. Páginas de canais e playlists abrem a partir de qualquer vídeo.
 - **Busca** com sugestões com debounce enquanto digita e buscas recentes quando o campo está vazio, exibindo canais correspondentes e grade paginada de vídeos.
 - **Player feito para controle remoto.** OK abre os controles, Esquerda/Direita pulam 10 s e Cima vai para a barra de progresso. Qualidade, legendas e faixas de áudio ficam acessíveis no OSD sem perder o ponto do vídeo. Neste fork os vídeos tocam sempre na velocidade normal, e o player fecha com Voltar (não há botão Parar).
 - **SponsorBlock.** Pula e marca na barra segmentos de patrocínio, intros, encerramentos e demais categorias escolhidas.
-- **Dislikes** via Return YouTube Dislike. Segure OK em um vídeo para curtir/descurtir, inscrever-se, salvar em Assistir mais tarde ou abrir o canal.
+- **Dislikes** via Return YouTube Dislike. Segure OK em um vídeo para ver as contagens, recomeçar ou abrir o canal.
 - **Comentários e chat ao vivo** ao lado do vídeo.
 - **Próximo vídeo (Up next).** Inicia o próximo vídeo após contagem regressiva, repete ou para, conforme configurado.
 - **Celular como controle remoto.** No app do YouTube no celular, vá em Configurações → Assistir na TV → Vincular com código da TV e digite o código exibido nas Configurações do CatTubeLite.
@@ -119,20 +123,18 @@ No CatosTV, a opção **Cast to this TV** também controla a conexão de pareame
 
 | Opção | O que faz |
 |---|---|
-| `--section NOME` | abre em `home`, `subscriptions`, `history`, `playlists`, `channels` ou `search` |
+| `--section NOME` | abre em `home`, `history` ou `search` |
 | `--play VIDEO_ID` | reproduz um vídeo e fecha ao terminar |
 | `--remote` | fica online em segundo plano para o app do celular, sem abrir janela |
 | `--tv-code` | imprime o código para "Vincular com código da TV" |
-| `--feed subscriptions` | imprime os vídeos mais recentes das suas inscrições |
+| `--feed home` | imprime os vídeos do Início (para a tela inicial da TV); outras listas saem com código 2 |
 | `--windowed` | inicia em janela em vez de tela cheia |
 
 ## Arquivos locais
 
-- `~/.config/cattube/` — preferências, contas conectadas (`0600`) e pareamento do controle remoto (`0600`).
+- `~/.config/cattube/` — preferências e pareamento do controle remoto (`0600`).
 - `~/.local/share/cattube/` — `yt-dlp`, `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes.
 - `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente) e metadados do cliente YouTube.
-
-Sair da conta nas Configurações também revoga o token junto ao Google.
 
 ## Créditos e agradecimentos
 

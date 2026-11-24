@@ -237,7 +237,7 @@ pub fn tab_bar_with_widths<H: Copy>(
     widths: &[f32],
     selected: Option<usize>,
     focus: Option<usize>,
-    // Focus is on another control of the same bar (the account button):
+    // Focus is on another control of the same bar (the Settings button):
     // the open tab keeps only its dot, so the pill does not look like it
     // is still there.
     elsewhere: bool,
@@ -334,7 +334,7 @@ pub fn toggle<H: Copy>(c: &Canvas<H>, x: f32, y: f32, on: Option<bool>) {
     c.circle(knob_x, y + 13.0, 10.0, theme::rgb(theme::WHITE));
 }
 
-/// A row in a vertical list (settings, accounts).
+/// A row in a vertical list (settings).
 pub struct ListRow<'a> {
     pub title: &'a str,
     pub subtitle: &'a str,

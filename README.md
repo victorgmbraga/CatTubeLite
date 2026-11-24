@@ -14,7 +14,7 @@ Like upstream CatTube, it opens full screen, works with arrows, OK and Back on a
 
 ## What changed in this fork
 
-CatTubeLite is based on upstream CatTube `1.0.4` and introduces four main sets of changes:
+CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets of changes:
 
 ### Lightweight flat UI & rendering
 - **Pure black flat theme (`FLAT`):** removes animated background glows, blurred video backdrops, translucent glass layers, soft shadows, specular sheens, redundant overdraw fills, and toast fade animations to avoid expensive alpha-blended passes on GPUs such as Mali-450.
@@ -30,25 +30,29 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces four main sets o
 ### Memory, network & I/O architecture
 - **Bounded RAM & disk image caches:** caps decoded texture memory (`16 MiB` in `low_power`, `64 MiB` standard, LRU eviction with focus priority, max side `320 px` / `640 px`) and automatically prunes `~/.cache/cattube/images` on startup (`64 MiB` / 1,500 files in `low_power`; `256 MiB` / 4,000 files standard) plus abandoned `.part` files.
 - **Bounded worker thread pool:** replaces per-request thread spawning with a fixed worker pool (`4` workers in `low_power`, `8` standard).
-- **Parallel thumbnail batching & OAuth serialization:** fetches missing thumbnails in batches via `curl --parallel` (reusing HTTP/2 + TLS connections), caps subscription feed concurrency (`--parallel-max` 8 in `low_power`, 24 standard), and serializes OAuth token refreshes to prevent concurrent refresh bursts.
+- **Parallel thumbnail batching:** fetches missing thumbnails in batches via `curl --parallel`, reusing HTTP/2 + TLS connections.
 - **Real search debounce & non-blocking I/O:** uses a 200 ms UI-timer debounce with generation cancellation for search suggestions, loads History and playback positions off the UI thread with single-pass `O(N)` checkpoint merging, and replaces 10 ms polling loops in subprocess execution with event-driven EOF waits, pipe size caps, and protection against leaked grandchild file descriptors.
 - **Lighter `--remote` daemon:** sleeps 1 s instead of 200 ms when casting is disabled, runs stale `yt-dlp` update checks in the background when tools are already installed, and throttles `mpv` state polling to 1 Hz.
 
 ### Stability, compatibility & atomic persistence
 - **Hardened `mpv` lifecycle & IPC:** adds a shared `PlayerHandle` with early-exit detection and bounded `reap_or_kill`, fixes partial-line/EOF handling in `IpcConn`, adds compatibility fallbacks for older `mpv` versions (`loadfile` `< 0.38` and `overlay-add` `< 0.39`), escapes ASS strings with UTF-8-safe truncation in the OSD, fixes the Up Next card thumbnail width (`256 px`), and guards live chat/comments threads against stale video switches.
 - **Bug fixes:** fixes panics on shrinking search suggestions and extreme thumbnail aspect ratios, empty search results locking out the keyboard, SponsorBlock end-of-video outro skipping, `--play` first-run startup and speed persistence, account profile merging without overwriting existing accounts, `views_text` rounding, and localized video menu labels, live badges, and search suggestions.
-- **Atomic writes:** writes accounts, remote pairing, checkpoints, merged `positions.conf`, search history, blurred backdrops, and downloaded tools via unique sibling temporary files and atomic renames. Settings, accounts and remote pairing are also flushed to disk, so they survive a power cut.
+- **Atomic writes:** writes remote pairing, checkpoints, merged `positions.conf`, search history, blurred backdrops, and downloaded tools via unique sibling temporary files and atomic renames. Settings and remote pairing are also flushed to disk, so they survive a power cut.
 - **One player at a time:** the app and the `--remote` daemon coordinate over the `mpv` socket. Whichever starts a video saves the current position and closes the other's player first.
 - **Verified tools:** `yt-dlp` and Deno are checked against their published SHA-256 before use. Deno is installed atomically, tested before activation, repaired after an interrupted install, and checked for updates every 30 days.
 - **Resilient background jobs:** a crashing job no longer takes down its worker, and the screen waiting on it shows an error instead of loading forever.
 
+### No YouTube account
+- **No sign-in:** CatTubeLite never signs in to YouTube and keeps no tokens. The sign-in screen, accounts, Subscriptions, Playlists and Channels tabs, and the Like / Dislike / Subscribe / Watch later actions are gone. A leftover `~/.config/cattube/accounts.conf` from upstream CatTube is ignored; delete it if you no longer need it.
+- **What stays:** Home (YouTube's live streams and popular topics), History (kept on this TV), Search, channel and playlist pages, comments, live chat, SponsorBlock, Return YouTube Dislike counts and phone casting, none of which need an account.
+
 ## What it does
 
-- **Your YouTube.** Home, Subscriptions, History, Playlists and Channels. You sign in the TV way: CatTubeLite shows a code and you enter it at `google.com/device` on your phone. Multiple accounts are supported. Signed out, Home shows live streams and popular topics.
+- **YouTube without an account.** Home shows live streams and popular topics, History lists what was watched on this TV, and Search finds the rest. Channel and playlist pages open from any video.
 - **Search** with debounced suggestions as you type and recent searches when the box is empty. Results show matching channels first, followed by a paginated grid of videos.
 - **A player made for the remote.** OK shows the controls, Left and Right skip 10 seconds, Up goes to the progress bar. Quality, subtitles and audio tracks are a button away; in this fork videos always play at normal speed and Back closes the player (there is no Stop button), chapters show on the bar, and changing quality keeps your position.
 - **SponsorBlock.** Sponsor segments, intros, outros, reminders and other chosen categories are skipped and marked on the progress bar.
-- **Dislikes** via Return YouTube Dislike. Hold OK on a video to like/dislike it, subscribe, save to Watch later or open the channel.
+- **Dislikes** via Return YouTube Dislike. Hold OK on a video to see its counts, start over or open the channel.
 - **Comments and live chat** next to the video.
 - **Up next.** Plays the next video after a short countdown, loops, or stops — configurable in Settings.
 - **Phone remote / casting.** In the YouTube mobile app go to Settings → Watch on TV → Link with TV code and enter the code from Settings.
@@ -119,20 +123,18 @@ On CatosTV, the **Cast to this TV** switch also controls the paired-phone connec
 
 | Option | What it does |
 |---|---|
-| `--section NAME` | open on `home`, `subscriptions`, `history`, `playlists`, `channels` or `search` |
+| `--section NAME` | open on `home`, `history` or `search` |
 | `--play VIDEO_ID` | play one video, then close |
 | `--remote` | stay online for the phone app, without a window |
 | `--tv-code` | print the code for Link with TV code |
-| `--feed subscriptions` | print the newest videos from your subscriptions (for a TV home screen) |
+| `--feed home` | print Home's videos (for a TV home screen); other lists exit with code 2 |
 | `--windowed` | start in a window instead of full screen |
 
 ## Your files
 
-- `~/.config/cattube/` — settings, signed-in accounts (`0600`) and phone pairing (`0600`).
+- `~/.config/cattube/` — settings and phone pairing (`0600`).
 - `~/.local/share/cattube/` — `yt-dlp`, `deno`, watch history, playback checkpoints, `positions.conf` and recent searches.
 - `~/.cache/cattube/` — cached thumbnails (auto-pruned) and YouTube client metadata.
-
-Signing out in Settings also revokes the token at Google.
 
 ## Credits & thanks
 

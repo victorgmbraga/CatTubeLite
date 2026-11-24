@@ -2,7 +2,7 @@
 //!
 //! One full-screen window, driven with arrows, OK (Enter) and Back (Esc).
 //! The screens' logic lives in `cattube_core::tube`; this file runs the
-//! window, the background jobs (YouTube requests, pictures, sign-in, the
+//! window, the background jobs (YouTube requests, pictures, the
 //! yt-dlp updates) and the player.
 
 mod canvas;
@@ -23,7 +23,6 @@ mod widgets;
 mod yt;
 
 use canvas::Canvas;
-use cattube_core::account::{self, Accounts};
 use cattube_core::input::{Action, InputMapper};
 use cattube_core::player::{self, Codec, PlayOptions, RESOLUTIONS};
 use cattube_core::scan::Scan;
@@ -33,8 +32,6 @@ use eframe::egui;
 use jobs::Jobs;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use target::Target;
 
@@ -46,11 +43,7 @@ enum Msg {
     Suggestions(u64, String, Vec<String>),
     Details(String, Result<Details, String>),
     Votes(String, Option<(u64, u64)>),
-    SignInCode(Result<(String, String), String>),
     TvCode(Result<String, String>),
-    SignedIn(Result<(String, String, u64), String>),
-    AccountName(String, Option<(String, String)>),
-    Done(String),
     /// A background job with nothing to show.
     Quiet,
     Images(Vec<(String, Option<egui::ColorImage>)>),
@@ -77,7 +70,6 @@ enum PendingSuggest {
 
 struct App {
     tube: Tube,
-    accounts: Accounts,
     prefs: prefs::Prefs,
     config: PathBuf,
     cache: PathBuf,
@@ -94,8 +86,6 @@ struct App {
     fetching: HashSet<String>,
     low_power: bool,
     toast: Option<(String, Instant)>,
-    /// Bumped to stop waiting for a sign-in code.
-    sign_in_wait: Arc<AtomicU64>,
     player: Option<yt::PlayerHandle>,
     /// Counts the players started; only the newest one's end counts.
     player_seq: u64,
@@ -116,9 +106,8 @@ struct App {
     search_query: String,
     suggest_generation: u64,
     pending_suggest: Option<(String, Instant)>,
-    account_generation: u64,
+    page_generation: u64,
     page_requests: HashSet<(String, String)>,
-    home_prefetches: u8,
 }
 
 impl App {
@@ -131,15 +120,12 @@ impl App {
         let low_power = cattube_core::env::low_power();
         theme::set_accent(&prefs.accent);
         i18n::set_language(prefs.language);
-        let accounts = account::load(&config);
         let yt_dlp_ready = player::yt_dlp_path(&data).is_file();
         let ctx = Ctx {
-            signed_in: accounts.active().is_some(),
-            accounts: accounts.list.len(),
             sponsorblock: prefs.sponsorblock,
             playing: false,
         };
-        let (mut tube, mut effects) = Tube::open(ctx);
+        let (mut tube, mut effects) = Tube::open();
         tube.recent = std::fs::read_to_string(data.join("searches.txt"))
             .map(|t| {
                 t.lines()
@@ -152,7 +138,6 @@ impl App {
             .unwrap_or_default();
         let mut app = App {
             tube: tube.clone(),
-            accounts,
             prefs,
             config,
             cache: cache.clone(),
@@ -167,7 +152,6 @@ impl App {
             fetching: HashSet::new(),
             low_power,
             toast: None,
-            sign_in_wait: Arc::new(AtomicU64::new(0)),
             player: None,
             player_seq: 0,
             now_playing: None,
@@ -183,9 +167,8 @@ impl App {
             suggest_generation: 0,
             pending_suggest: None,
             tv_code_at: None,
-            account_generation: 0,
+            page_generation: 0,
             page_requests: HashSet::new(),
-            home_prefetches: 0,
         };
         let pos_data = data.clone();
         app.jobs
@@ -234,8 +217,6 @@ impl App {
 
     fn ctx(&self) -> Ctx {
         Ctx {
-            signed_in: self.accounts.active().is_some(),
-            accounts: self.accounts.list.len(),
             sponsorblock: self.prefs.sponsorblock,
             playing: self.now_playing.is_some() && self.player.is_some(),
         }
@@ -245,19 +226,9 @@ impl App {
         ytc::context(self.prefs.language.key(), &self.prefs.region)
     }
 
-    fn refresh(&self) -> Option<String> {
-        self.accounts.active().map(|a| a.refresh_token.clone())
-    }
-
     fn toast(&mut self, ctx: &egui::Context, text: &str) {
         self.toast = Some((text.to_string(), Instant::now() + Duration::from_secs(3)));
         ctx.request_repaint();
-    }
-
-    fn save_accounts(&mut self, ctx: &egui::Context) {
-        if let Err(e) = account::save(&self.config, &self.accounts) {
-            self.toast(ctx, &format!("Could not save the account ({e})"));
-        }
     }
 
     fn save_prefs(&mut self, ctx: &egui::Context) {
@@ -275,8 +246,7 @@ impl App {
 
     fn effect(&mut self, ctx: &egui::Context, e: Effect) {
         let yctx = self.yt_ctx();
-        let refresh = self.refresh();
-        let generation = self.account_generation;
+        let generation = self.page_generation;
         match e {
             // History is what was watched here (read off the UI thread).
             Effect::Load(id) if id == ytc::feeds::HISTORY => {
@@ -315,34 +285,15 @@ impl App {
                     failed,
                 );
             }
-            Effect::Load(id) if id == ytc::feeds::SUBSCRIPTIONS && refresh.is_some() => {
-                let key = (id.clone(), String::new());
-                if !self.page_requests.insert(key.clone()) {
-                    return;
-                }
-                let failed_id = id.clone();
-                if !self.jobs.try_spawn_or(
-                    move || {
-                        let r = yt::subscriptions(&yctx, refresh.as_deref());
-                        Msg::Page(generation, id, r)
-                    },
-                    move || Msg::Page(generation, failed_id, Err(JOB_FAILED.into())),
-                ) {
-                    self.page_requests.remove(&key);
-                }
-            }
             Effect::Load(id) => {
                 let key = (id.clone(), String::new());
                 if !self.page_requests.insert(key.clone()) {
                     return;
                 }
-                if id == ytc::feeds::HOME {
-                    self.home_prefetches = 0;
-                }
                 let failed_id = id.clone();
                 if !self.jobs.try_spawn_or(
                     move || {
-                        let mut r = yt::page(&yctx, &id, refresh.as_deref());
+                        let mut r = yt::page(&yctx, &id);
                         if id == ytc::feeds::HOME
                             && let Ok(p) = r.as_mut()
                         {
@@ -363,7 +314,7 @@ impl App {
                 let (failed_id, failed_token) = key.clone();
                 if !self.jobs.try_spawn_or(
                     move || {
-                        let mut r = yt::more(&yctx, &token, refresh.as_deref());
+                        let mut r = yt::more(&yctx, &token);
                         if browse_id == ytc::feeds::HOME
                             && let Ok(p) = r.as_mut()
                         {
@@ -401,7 +352,7 @@ impl App {
                 let failed_q = q.clone();
                 self.jobs.spawn_or(
                     move || {
-                        let result = yt::search(&yctx, &q, refresh.as_deref());
+                        let result = yt::search(&yctx, &q);
                         Msg::Search(generation, q, result)
                     },
                     move || Msg::Search(generation, failed_q, Err(JOB_FAILED.into())),
@@ -410,9 +361,7 @@ impl App {
             Effect::SearchMore(t) => {
                 let generation = self.search_generation;
                 self.jobs.spawn_or(
-                    move || {
-                        Msg::SearchMore(generation, yt::search_more(&yctx, &t, refresh.as_deref()))
-                    },
+                    move || Msg::SearchMore(generation, yt::search_more(&yctx, &t)),
                     move || Msg::SearchMore(generation, Err(JOB_FAILED.into())),
                 )
             }
@@ -428,7 +377,7 @@ impl App {
                 let failed_id = id.clone();
                 self.jobs.spawn_or(
                     move || {
-                        let r = yt::details(&yctx, &id, refresh.as_deref());
+                        let r = yt::details(&yctx, &id);
                         Msg::Details(id, r)
                     },
                     move || Msg::Details(failed_id, Err(JOB_FAILED.into())),
@@ -438,39 +387,6 @@ impl App {
                 // The rest of the row it came from plays after it.
                 let queue = self.queue_after(&tile);
                 self.play(ctx, *tile, from_start, queue);
-            }
-            Effect::SignInStart => {
-                let generation = self.sign_in_wait.fetch_add(1, Ordering::SeqCst) + 1;
-                let wait = self.sign_in_wait.clone();
-                let device = self.accounts.device_id.clone();
-                let (tx, rctx) = self.jobs.sender();
-                std::thread::spawn(move || {
-                    let send = |m: Msg| {
-                        let _ = tx.send(m);
-                        rctx.request_repaint();
-                    };
-                    let keep = || wait.load(Ordering::SeqCst) == generation;
-                    let flow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let code = match yt::sign_in_code(&device) {
-                            Ok(c) => c,
-                            Err(e) => return send(Msg::SignInCode(Err(e))),
-                        };
-                        let url = code
-                            .url
-                            .trim_start_matches("https://")
-                            .trim_start_matches("www.")
-                            .to_string();
-                        send(Msg::SignInCode(Ok((code.user_code.clone(), url))));
-                        let r = yt::sign_in_wait(&code, &keep);
-                        if keep() {
-                            send(Msg::SignedIn(r));
-                        }
-                    }));
-                    // The sign-in screen must not keep waiting for a dead thread.
-                    if flow.is_err() && keep() {
-                        send(Msg::SignInCode(Err(JOB_FAILED.into())));
-                    }
-                });
             }
             Effect::TvCode => {
                 self.tv_code_at = Some(Instant::now());
@@ -483,74 +399,6 @@ impl App {
                     },
                     || Msg::TvCode(Err(JOB_FAILED.into())),
                 );
-            }
-            Effect::SignInStop => {
-                self.sign_in_wait.fetch_add(1, Ordering::SeqCst);
-            }
-            Effect::SwitchAccount(i) => {
-                if i < self.accounts.list.len() {
-                    self.accounts.active = i;
-                    self.reset_requests();
-                    self.save_accounts(ctx);
-                    let c = self.ctx();
-                    for e in self.tube.reset(c) {
-                        self.effect(ctx, e);
-                    }
-                }
-            }
-            Effect::SignOut(i) => {
-                // Cancelled at Google as well, in the background.
-                if let Some(refresh) = self.accounts.list.get(i).map(|a| a.refresh_token.clone()) {
-                    self.jobs.spawn(move || {
-                        if !yt::revoke(&refresh) {
-                            eprintln!("cattube: Google did not confirm the sign-out");
-                        }
-                        Msg::Quiet
-                    });
-                }
-                self.accounts.remove(i);
-                self.reset_requests();
-                self.save_accounts(ctx);
-                self.toast(ctx, "Signed out");
-                let c = self.ctx();
-                for e in self.tube.reset(c) {
-                    self.effect(ctx, e);
-                }
-            }
-            Effect::Rate(id, r) => {
-                if let Some(rt) = refresh {
-                    self.jobs.spawn(move || {
-                        Msg::Done(match yt::rate(&yctx, &id, r, &rt) {
-                            Ok(()) => match r {
-                                ytc::Rating::Like => "Liked".into(),
-                                ytc::Rating::Dislike => "Disliked".into(),
-                                ytc::Rating::None => "Rating removed".into(),
-                            },
-                            Err(e) => e,
-                        })
-                    });
-                }
-            }
-            Effect::Subscribe { channel_id, on } => {
-                if let Some(rt) = refresh {
-                    self.jobs.spawn(move || {
-                        Msg::Done(match yt::subscribe(&yctx, &channel_id, on, &rt) {
-                            Ok(()) if on => "Subscribed".into(),
-                            Ok(()) => "Unsubscribed".into(),
-                            Err(e) => e,
-                        })
-                    });
-                }
-            }
-            Effect::WatchLater(id) => {
-                if let Some(rt) = refresh {
-                    self.jobs.spawn(move || {
-                        Msg::Done(match yt::watch_later(&yctx, &id, &rt) {
-                            Ok(()) => "Saved to Watch later".into(),
-                            Err(e) => e,
-                        })
-                    });
-                }
             }
             Effect::Setting(row, d) => self.setting(ctx, row, d),
             Effect::Close => {
@@ -656,8 +504,7 @@ impl App {
                     Some(Screen::Settings { index, .. }) => *index,
                     _ => 0,
                 };
-                let c = self.ctx();
-                let effects = self.tube.reset(c);
+                let effects = self.tube.reset();
                 self.tube.stack.push(Screen::Settings {
                     index: at,
                     groups: false,
@@ -690,7 +537,6 @@ impl App {
                 );
                 return;
             }
-            SettingRow::Account(_) | SettingRow::AddAccount => return,
         }
         self.save_prefs(ctx);
     }
@@ -755,7 +601,6 @@ impl App {
                 let s = yt::Session {
                     low_power: self.low_power,
                     ctx: self.yt_ctx(),
-                    refresh: self.refresh(),
                     cache: self.cache.clone(),
                     autoplay: self.prefs.autoplay,
                     sponsorblock: self
@@ -795,27 +640,18 @@ impl App {
     }
 
     fn message(&mut self, ctx: &egui::Context, msg: Msg) {
-        let c = self.ctx();
         match msg {
             Msg::Page(generation, id, r) => {
-                if generation == self.account_generation {
+                if generation == self.page_generation {
                     self.page_requests.remove(&(id.clone(), String::new()));
                     self.tube.replace_page(&id, r);
-                    if id == ytc::feeds::HOME {
-                        self.prefetch_home(ctx);
-                    }
                 }
             }
             Msg::More(generation, id, tok, r) => {
-                if generation == self.account_generation {
+                if generation == self.page_generation {
                     self.page_requests.remove(&(id.clone(), tok.clone()));
                     match r {
-                        Ok(p) => {
-                            self.tube.on_more(&id, &tok, p);
-                            if id == ytc::feeds::HOME {
-                                self.prefetch_home(ctx);
-                            }
-                        }
+                        Ok(p) => self.tube.on_more(&id, &tok, p),
                         Err(e) => self.toast(ctx, &e),
                     }
                 }
@@ -846,43 +682,7 @@ impl App {
                     self.votes.insert(id, v);
                 }
             }
-            Msg::SignInCode(r) => self.tube.on_sign_in_code(r),
             Msg::TvCode(r) => self.tube.on_tv_code(r),
-            Msg::SignedIn(r) => match r {
-                Ok((refresh, access, expires_at)) => {
-                    yt::remember_token(&refresh, &access, expires_at);
-                    self.accounts.add(account::Account {
-                        name: String::new(),
-                        refresh_token: refresh.clone(),
-                        ..account::Account::default()
-                    });
-                    self.reset_requests();
-                    self.save_accounts(ctx);
-                    self.toast(ctx, "Signed in");
-                    let yctx = self.yt_ctx();
-                    self.jobs.spawn(move || {
-                        let n = yt::account_name(&yctx, &refresh);
-                        Msg::AccountName(refresh, n)
-                    });
-                    let c = self.ctx();
-                    for e in self.tube.on_signed_in(Ok(()), c) {
-                        self.effect(ctx, e);
-                    }
-                }
-                Err(e) => {
-                    for e in self.tube.on_signed_in(Err(e), c) {
-                        self.effect(ctx, e);
-                    }
-                }
-            },
-            Msg::AccountName(refresh, n) => {
-                if let Some((name, photo)) = n
-                    && self.accounts.set_profile(&refresh, name, photo)
-                {
-                    self.save_accounts(ctx);
-                }
-            }
-            Msg::Done(t) => self.toast(ctx, &t),
             Msg::Quiet => {}
             Msg::Images(batch) => {
                 let frame = ctx.cumulative_frame_nr();
@@ -960,10 +760,8 @@ impl App {
                     return;
                 }
                 // Fresh progress must not steal focus from another window.
-                if matches!(
-                    self.tube.section,
-                    Section::History | Section::Home | Section::Subscriptions
-                ) && let Some(id) = self.tube.section.browse_id()
+                if matches!(self.tube.section, Section::History | Section::Home)
+                    && let Some(id) = self.tube.section.browse_id()
                 {
                     self.effect(ctx, Effect::Load(id.to_string()));
                 }
@@ -972,41 +770,11 @@ impl App {
     }
 
     fn reset_requests(&mut self) {
-        self.account_generation += 1;
+        self.page_generation += 1;
         self.search_generation += 1;
         self.suggest_generation += 1;
         self.pending_suggest = None;
         self.page_requests.clear();
-        self.home_prefetches = 0;
-    }
-
-    /// Show the first recommendations immediately, then fill out a short
-    /// Home page without making the user wait at its last row.
-    fn prefetch_home(&mut self, ctx: &egui::Context) {
-        if self.accounts.active().is_none() || self.home_prefetches >= 2 {
-            return;
-        }
-        let Some(page) = self
-            .tube
-            .pages
-            .get(ytc::feeds::HOME)
-            .and_then(|p| p.items().first())
-        else {
-            return;
-        };
-        if page.shelves.len() >= 8 && page.tiles().len() >= 48 {
-            return;
-        }
-        if let Some(token) = page.continuation.clone() {
-            self.home_prefetches += 1;
-            self.effect(
-                ctx,
-                Effect::LoadMore {
-                    browse_id: ytc::feeds::HOME.into(),
-                    token,
-                },
-            );
-        }
     }
 
     fn fetch_pictures(&mut self) {
@@ -1202,7 +970,6 @@ impl eframe::App for App {
         canvas.background_at(None, false, now);
         let view = ui::tube::View {
             tube: &self.tube,
-            accounts: &self.accounts,
             prefs: &self.prefs,
             pics: &self.images,
             positions: &self.positions,
@@ -1260,7 +1027,6 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        self.sign_in_wait.fetch_add(1, Ordering::SeqCst);
         if let Some(p) = self.player.take() {
             if !p.exited() {
                 yt::checkpoint_player(&self.data);
@@ -1273,7 +1039,7 @@ impl Drop for App {
 /// Where CatTube starts.
 enum Start {
     Home,
-    /// `--section subscriptions`: open on a tab.
+    /// `--section history`: open on a tab.
     Section(Section),
     /// `--play VIDEO [--title TITLE]`: play one video, close when it ends.
     Play(String, String),
@@ -1313,33 +1079,19 @@ fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) 
     let _ = player::save_positions_merged(data, ended);
 }
 
-/// `--feed`: the newest videos of a list, one per line, for a TV home
-/// screen. Exit 2 when not signed in, 1 when YouTube did not answer.
+/// `--feed home`: Home's videos, one per line, for a TV home screen.
+/// Exit 2 for a list that needs a YouTube account (CatTubeLite has
+/// none), 1 when YouTube did not answer.
 fn feed(which: &str) -> i32 {
-    let config = cattube_core::env::config_dir();
-    let accounts = account::load(&config);
-    let Some(a) = accounts.active() else {
+    if !matches!(which, "home" | "recommended") {
         return 2;
-    };
-    let p = prefs::load(&config);
+    }
+    let p = prefs::load(&cattube_core::env::config_dir());
     let ctx = ytc::context(p.language.key(), &p.region);
-    let refresh = Some(a.refresh_token.as_str());
-    let page = match which {
-        "home" | "recommended" => yt::page(&ctx, ytc::feeds::HOME, refresh).map(|mut p| {
-            ytc::tidy_home(&mut p);
-            p
-        }),
-        // Every channel's newest uploads, newest first.
-        _ => yt::subscription_feeds(&ctx, refresh).map(|(_, uploads)| ytc::Page {
-            shelves: vec![ytc::Shelf {
-                title: String::new(),
-                tiles: cattube_core::subs::newest(&uploads, 24),
-                continuation: None,
-                more: None,
-            }],
-            ..ytc::Page::default()
-        }),
-    };
+    let page = yt::page(&ctx, ytc::feeds::HOME).map(|mut p| {
+        ytc::tidy_home(&mut p);
+        p
+    });
     let page = match page {
         Ok(p) => p,
         Err(e) => {
@@ -1389,10 +1141,9 @@ const HELP: &str = "cattube {VERSION}: a native Linux YouTube app for TV screens
 and remotes. https://github.com/victorgmbraga/CatTubeLite
 
 Usage: cattube [--windowed] [--section NAME | --play VIDEO_ID]
-       cattube --feed subscriptions|home
+       cattube --feed home
 
-  --section NAME   open on home, subscriptions, history, playlists,
-                   channels or search
+  --section NAME   open on home, history or search
   --play VIDEO_ID  play one video, then close (--title TITLE names it)
   --remote         keep this TV online for the YouTube phone app: a phone
                    paired with 'Link with TV code' (the code is in
@@ -1400,12 +1151,12 @@ Usage: cattube [--windowed] [--section NAME | --play VIDEO_ID]
   --tv-code        print the code for the phone's 'Link with TV code'
   --pair CODE      pair the phone that cast to this TV (its pairing code)
   --stop           close the player
-  --feed LIST      print the newest videos of a list (signed in) as
+  --feed home      print Home's videos as
                    tab-separated lines: id, title, channel, facts, length,
                    picture; no window (for TV home screens)
 
 Keys: arrows move, Enter = OK (hold for the video menu), Esc/Backspace = Back.
-Settings and accounts live in ~/.config/cattube/; yt-dlp, Deno and
+Settings live in ~/.config/cattube/; yt-dlp, Deno and
 watch positions in ~/.local/share/cattube/.";
 
 fn main() -> eframe::Result {
@@ -1451,11 +1202,7 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     if let Some(i) = args.iter().position(|a| a == "--feed") {
-        std::process::exit(feed(
-            args.get(i + 1)
-                .map(String::as_str)
-                .unwrap_or("subscriptions"),
-        ));
+        std::process::exit(feed(args.get(i + 1).map(String::as_str).unwrap_or("home")));
     }
     let value = |flag: &str| {
         args.iter()
@@ -1528,7 +1275,7 @@ mod tests {
 
     #[test]
     fn search_replies_follow_the_current_query_and_request() {
-        let (mut tube, _) = Tube::open(Ctx::default());
+        let (mut tube, _) = Tube::open();
         tube.header = true;
         tube.header_index = Section::ALL
             .iter()
@@ -1572,7 +1319,7 @@ mod tests {
 
     #[test]
     fn suggest_debounce_cancels_stale_and_fires_once_when_due() {
-        let (mut tube, _) = Tube::open(Ctx::default());
+        let (mut tube, _) = Tube::open();
         tube.header = true;
         tube.header_index = Section::ALL
             .iter()

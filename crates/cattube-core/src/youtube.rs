@@ -7,17 +7,11 @@
 //!
 //! | What | Request (`POST https://www.youtube.com/youtubei/v1/…`) |
 //! |---|---|
-//! | Home (recommendations) | `browse` `browseId: FEwhat_to_watch` (signed in) |
-//! | Subscriptions | `browse` `FEsubscriptions` |
-//! | History | `browse` `FEhistory` |
-//! | Playlists | `browse` `FElibrary` (Watch later `VLWL`, Liked `VLLL`) |
-//! | Channels you follow | `browse` `FEchannels` |
+//! | Home | `browse` of YouTube's topic channels (see [`feeds::TOPICS`]) |
 //! | A channel / playlist | `browse` `UC…` / `VL…` |
 //! | Search | `search` `query` |
-//! | A video's page | `next` `videoId` (details, related, subscribe state) |
+//! | A video's page | `next` `videoId` (details, related) |
 //! | More of a list | the same endpoint with `continuation` |
-//! | Like / dislike / remove | `like/like`, `like/dislike`, `like/removelike` |
-//! | Subscribe | `subscription/subscribe`, `subscription/unsubscribe` |
 //!
 //! Lists come as shelves (`shelfRenderer`) of tiles, either the older
 //! `tileRenderer` or the newer `lockupViewModel`; both become a [`Tile`].
@@ -60,7 +54,7 @@ pub struct Tile {
     /// "7:45", "LIVE", "24 videos".
     pub badge: String,
     pub thumb: String,
-    /// 0–1 already watched (signed in), when YouTube says.
+    /// 0–1 already watched, when known.
     pub progress: Option<f32>,
 }
 
@@ -123,7 +117,6 @@ pub struct Details {
     pub channel_id: String,
     pub channel_thumb: String,
     pub subscribers: String,
-    pub subscribed: bool,
     pub date: String,
     pub views: String,
     pub description: String,
@@ -656,7 +649,6 @@ pub fn parse_details(body: &str) -> Option<Details> {
     let v = parse_json(body.trim())?;
     let meta = find_named(&v, "videoMetadataRenderer")?;
     let owner = path(meta, &["owner", "videoOwnerRenderer"]);
-    let sub = owner.and_then(|o| path(o, &["subscribeButton", "subscribeButtonRenderer"]));
     let mut related = Vec::new();
     collect_tiles(&v, &mut related);
     let id = meta
@@ -681,10 +673,6 @@ pub fn parse_details(body: &str) -> Option<Details> {
             .to_string(),
         channel_thumb: best_thumb(owner.and_then(|o| o.get("thumbnail"))),
         subscribers: text(owner.and_then(|o| o.get("subscriberCountText"))),
-        subscribed: sub
-            .and_then(|s| s.get("subscribed"))
-            .and_then(Json::as_bool)
-            .unwrap_or(false),
         date: text(meta.get("dateText")),
         views: text(meta.get("viewCountText").or_else(|| {
             find_named(meta, "videoViewCountRenderer").and_then(|r| r.get("viewCount"))
@@ -747,50 +735,6 @@ pub fn next_body(ctx: &str, video_id: &str) -> Option<String> {
     })
 }
 
-/// Like, dislike or take either back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Rating {
-    Like,
-    Dislike,
-    None,
-}
-
-/// (endpoint, body) for rating a video.
-pub fn rate(ctx: &str, video_id: &str, r: Rating) -> Option<(String, String)> {
-    let ep = match r {
-        Rating::Like => "like/like",
-        Rating::Dislike => "like/dislike",
-        Rating::None => "like/removelike",
-    };
-    is_video_id(video_id).then(|| {
-        (
-            endpoint_url(ep),
-            format!(
-                "{{\"context\":{ctx},\"target\":{{\"videoId\":{}}}}}",
-                json_string(video_id)
-            ),
-        )
-    })
-}
-
-/// (endpoint, body) for subscribing to a channel or leaving it.
-pub fn subscribe(ctx: &str, channel_id: &str, on: bool) -> Option<(String, String)> {
-    let ep = if on {
-        "subscription/subscribe"
-    } else {
-        "subscription/unsubscribe"
-    };
-    (channel_id.starts_with("UC") && is_safe_id(channel_id)).then(|| {
-        (
-            endpoint_url(ep),
-            format!(
-                "{{\"context\":{ctx},\"channelIds\":[{}]}}",
-                json_string(channel_id)
-            ),
-        )
-    })
-}
-
 /// Search suggestions while typing.
 pub fn suggest_url(query: &str) -> String {
     suggest_url_for(query, "en")
@@ -846,14 +790,10 @@ pub fn tidy_home(p: &mut Page) {
 
 /// The browse ids of CatTube's sections.
 pub mod feeds {
+    /// Home's key; its rows come from [`TOPICS`].
     pub const HOME: &str = "FEwhat_to_watch";
-    pub const SUBSCRIPTIONS: &str = "FEsubscriptions";
+    /// History's key; the list itself is kept on this TV.
     pub const HISTORY: &str = "FEhistory";
-    pub const LIBRARY: &str = "FElibrary";
-    pub const CHANNELS: &str = "FEchannels";
-    pub const WATCH_LATER: &str = "VLWL";
-    pub const LIKED: &str = "VLLL";
-    pub const SHORTS: &str = "FEshorts";
     /// YouTube's own topic channels (Live, Gaming, News and Sports); they
     /// answer signed out too.
     pub const TOPICS: [(&str, &str); 4] = [
@@ -1268,7 +1208,6 @@ mod tests {
             ("Blender Studio", "UCz75RVbH8q2jdBJ4SnwuZZQ")
         );
         assert_eq!(d.subscribers, "577K subscribers");
-        assert!(!d.subscribed);
         assert_eq!(d.autoplay.as_deref(), Some("B4EPW7JUMTM"));
         assert!(!d.related.is_empty());
         assert!(d.related.iter().all(|t| t.id != d.id));
@@ -1283,19 +1222,12 @@ mod tests {
             r#"{"client":{"clientName":"TVHTML5","clientVersion":"7.20260101.00.00","hl":"en","gl":"IN"}}"#
         );
         assert_eq!(
-            browse_body(&ctx, "FEsubscriptions").unwrap(),
-            format!(r#"{{"context":{ctx},"browseId":"FEsubscriptions"}}"#)
+            browse_body(&ctx, "UCz75RVbH8q2jdBJ4SnwuZZQ").unwrap(),
+            format!(r#"{{"context":{ctx},"browseId":"UCz75RVbH8q2jdBJ4SnwuZZQ"}}"#)
         );
         assert_eq!(browse_body(&ctx, "a\"b"), None);
         assert!(search_body(&ctx, "  cats \"x\" ").contains(r#""query":"cats \"x\"""#));
         assert_eq!(next_body(&ctx, "short"), None);
-        let (u, b) = rate(&ctx, "WhWc3b3KhnY", Rating::Dislike).unwrap();
-        assert!(u.ends_with("/like/dislike?prettyPrint=false"));
-        assert!(b.contains(r#""target":{"videoId":"WhWc3b3KhnY"}"#));
-        let (u, b) = subscribe(&ctx, "UCz75RVbH8q2jdBJ4SnwuZZQ", false).unwrap();
-        assert!(u.contains("subscription/unsubscribe"));
-        assert!(b.contains(r#""channelIds":["UCz75RVbH8q2jdBJ4SnwuZZQ"]"#));
-        assert_eq!(subscribe(&ctx, "PLx", true), None);
     }
 
     #[test]
