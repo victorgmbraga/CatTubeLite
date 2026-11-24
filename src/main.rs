@@ -59,6 +59,27 @@ enum Msg {
 const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Shown when a background job crashed instead of answering.
 const JOB_FAILED: &str = "Something went wrong, try again";
+/// The oldest saved Home shown while a fresh one loads.
+const HOME_CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Where the last Home is kept (see `cattube_core::home_cache`).
+fn home_cache_path(cache: &std::path::Path) -> PathBuf {
+    cache.join("home.txt")
+}
+
+/// The last Home saved for this request context, unless it is too old.
+fn cached_home(cache: &std::path::Path, ctx: &str) -> Option<Page> {
+    let path = home_cache_path(cache);
+    let age = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())?;
+    if age > HOME_CACHE_MAX_AGE {
+        return None;
+    }
+    cattube_core::home_cache::parse(ctx, &std::fs::read_to_string(path).ok()?)
+}
+
 /// The longest the app shows its own "opening" screen for a video: the
 /// player's window normally covers it well before.
 const OPENING_MAX: Duration = Duration::from_secs(10);
@@ -211,6 +232,13 @@ impl App {
             }
             Start::Home => {}
         }
+        // The last Home shows at once; the fresh one replaces it when it
+        // comes (keeping the selected video).
+        if !app.quit_after_play
+            && let Some(home) = cached_home(&app.cache, &app.yt_ctx())
+        {
+            tube.replace_page(ytc::feeds::HOME, Ok(home));
+        }
         app.tube = tube;
         for e in effects {
             app.effect(&cc.egui_ctx, e);
@@ -294,6 +322,7 @@ impl App {
                     return;
                 }
                 let failed_id = id.clone();
+                let cache = self.cache.clone();
                 if !self.jobs.try_spawn_or(
                     move || {
                         let mut r = yt::page(&yctx, &id);
@@ -301,6 +330,13 @@ impl App {
                             && let Ok(p) = r.as_mut()
                         {
                             ytc::tidy_home(p);
+                            let _ = std::fs::create_dir_all(&cache);
+                            let text = cattube_core::home_cache::to_text(&yctx, p);
+                            if let Err(e) =
+                                cattube_core::util::write_atomic(&home_cache_path(&cache), &text)
+                            {
+                                eprintln!("cattube: could not keep Home ({e})");
+                            }
                         }
                         Msg::Page(generation, id, r)
                     },
@@ -631,7 +667,14 @@ impl App {
             Msg::Page(generation, id, r) => {
                 if generation == self.page_generation {
                     self.page_requests.remove(&(id.clone(), String::new()));
-                    self.tube.replace_page(&id, r);
+                    // A saved Home on screen stays when the fresh one fails.
+                    let shown = self.tube.pages.get(&id).is_some_and(
+                        |p| matches!(p, Scan::Done(p) if p.first().is_some_and(|p| !p.shelves.is_empty())),
+                    );
+                    match r {
+                        Err(e) if id == ytc::feeds::HOME && shown => self.toast(ctx, &e),
+                        r => self.tube.replace_page(&id, r),
+                    }
                 }
             }
             Msg::More(generation, id, tok, r) => {
