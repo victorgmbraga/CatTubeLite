@@ -14,7 +14,8 @@
 --   controls shown:   Left / Right    move over the buttons: Previous /
 --                                     Next video on the left (when there
 --                                     is one), −10 s / Pause / +10 s in the
---                                     middle, Subtitles / Audio / Stop right
+--                                     middle, Quality / Comments /
+--                                     Subtitles / Audio right
 --                     OK              press the button (Pause first)
 --                     Up              focus the seek bar: Left / Right scrub
 --                                     (10 s, 60 s when held), Down returns
@@ -127,7 +128,6 @@ local buttons = {
     chat_button,
     { label = "Subtitles",        group = "track", act = function() open_menu("sub") end },
     { label = "Audio",            group = "track", act = function() open_menu("audio") end },
-    { label = "Stop",             group = "track", act = function() mp.commandv("quit") end },
 }
 
 local function visible_buttons()
