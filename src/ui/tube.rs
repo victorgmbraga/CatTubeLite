@@ -1258,7 +1258,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 tr("Subtitle language").into(),
                 String::new(),
                 match p.sub_lang.as_str() {
-                    "ar" => "العربية".into(),
+                    "pt" => "Português".into(),
                     "en" => "English".into(),
                     other => other.into(),
                 },

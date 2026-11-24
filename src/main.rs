@@ -463,7 +463,7 @@ impl App {
                 self.prefs.buffer = prefs::cycle(&player::BUFFERS, self.prefs.buffer, d)
             }
             SettingRow::SubtitleLanguage => {
-                let languages = ["en", "ar", "de", "fr", "es", "hi"];
+                let languages = ["en", "pt", "de", "fr", "es", "hi"];
                 let cur = languages
                     .iter()
                     .copied()
@@ -847,9 +847,6 @@ fn hit_test(hits: &[(egui::Rect, Target)], pos: egui::Pos2) -> Option<Target> {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if let Some(Screen::Search { osk, .. }) = self.tube.stack.last_mut() {
-            osk.configure_arabic(self.prefs.language == i18n::Language::Arabic);
-        }
         for msg in self.jobs.drain() {
             self.message(ctx, msg);
         }

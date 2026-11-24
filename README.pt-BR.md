@@ -19,7 +19,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 ### Interface plana e renderização leve
 - **Tema plano em preto puro (`FLAT`):** remove fundos animados, backdrops borrados, camadas translúcidas de vidro, sombras suaves, brilhos especulares, overdraw redundante e animações de fade em toasts, eliminando composições com transparência caras em GPUs como a Mali-450.
 - **Renderer OpenGL (`glow`) por padrão em `low_power`:** usa `glow` em vez de `wgpu` em dispositivos de baixo desempenho, com fallback automático entre `glow` e `wgpu` quando `CATTUBE_RENDERER` não é definido manualmente.
-- **Layout de texto e listas mais rápido:** adiciona cache limitado de medição de texto (`fit` / `two_lines` com busca binária), fast path ASCII que pula processamento Unicode BiDi/shaping, menos segmentos de curva com movimento reduzido, culling vertical em Configurações e remoção de `stat()` por frame e clones de `Page` a cada tecla.
+- **Layout de texto e listas mais rápido:** adiciona cache limitado de medição de texto (`fit` / `two_lines` com busca binária), menos segmentos de curva com movimento reduzido, culling vertical em Configurações e remoção de `stat()` por frame e clones de `Page` a cada tecla.
 
 ### Reprodução otimizada para ARM64 e dispositivos fracos
 - **Perfil de baixo desempenho automático (`CATTUBE_LOW_POWER`):** ativado automaticamente com até 3 GiB de RAM, em GPUs Mali-400/450 ou VideoCore IV e em máquinas ARM com menos de 6 GiB (pode ser forçado com `CATTUBE_LOW_POWER=1` ou desativado com `0`). Novas configurações passam a usar **720p SDR**, **H.264** e buffer de **64 MiB** por padrão, preservando preferências já salvas.
@@ -45,6 +45,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 - **Sem login:** o CatTubeLite nunca entra numa conta do YouTube e não guarda tokens. Saíram a tela de login, as contas, as abas Inscrições, Playlists e Canais e as ações Curtir / Não curtir / Inscrever-se / Assistir mais tarde. Um `~/.config/cattube/accounts.conf` que tenha sobrado do CatTube original é ignorado; pode apagá-lo se não precisar mais dele.
 - **Sem comentários, chat ao vivo nem contagem de dislikes:** o player não tem mais os botões Comentários e Chat, e o menu do vídeo não consulta mais o Return YouTube Dislike.
 - **Sem controle pelo celular:** o app do YouTube no celular não pareia nem transmite mais para o CatTubeLite. Saíram a opção Vincular celular, a variável `CATTUBE_CAST_ENABLED_FILE` e o serviço `--remote`; `--remote`, `--tv-code` e `--pair` agora saem com código 2 sem abrir janela. Um `~/.config/cattube/remote.conf` que tenha sobrado é ignorado.
+- **Sem árabe:** a interface fica em inglês ou em português do Brasil, e um `language = ar` que tenha sobrado no `settings.conf` abre em inglês. O suporte a árabe saiu por completo: a fonte embutida Noto Sans Arabic, o reshaping e o layout da direita para a esquerda, e o layout árabe do teclado. Títulos em árabe podem aparecer como quadrados ou com as letras na ordem errada. Na escolha do idioma das legendas, o português ocupa o lugar do árabe.
 - **O que continua:** Início (transmissões ao vivo e tópicos populares do YouTube), Histórico (guardado na TV), Busca, páginas de canais e playlists, SponsorBlock e Próximo vídeo.
 
 ## Recursos
@@ -60,7 +61,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 
 ## Idiomas
 
-Em **Settings → Playback → Interface language** é possível escolher **Português (Brasil)** ou **العربية** (árabe). Os controles sobre o vídeo continuam em inglês. Títulos e buscas em árabe também funcionam corretamente com a interface em inglês, e o teclado virtual inclui layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
+Em **Settings → Playback → Interface language** é possível escolher **Português (Brasil)**. Os controles sobre o vídeo continuam em inglês. Este fork não tem suporte a árabe (veja [Menos funções](#menos-funções)). O idioma das legendas é configurado separadamente.
 
 ## Compilação e instalação
 
@@ -161,4 +162,4 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 
 ## Licença
 
-MIT — veja [`LICENSE`](LICENSE). As fontes embutidas Inter e Noto Sans Arabic usam a licença SIL Open Font License (avisos em [`assets/fonts/`](assets/fonts/)). O CatTubeLite não é desenvolvido nem afiliado ao YouTube ou ao Google.
+MIT — veja [`LICENSE`](LICENSE). A fonte embutida Inter usa a licença SIL Open Font License (aviso em [`assets/fonts/`](assets/fonts/)). O CatTubeLite não é desenvolvido nem afiliado ao YouTube ou ao Google.

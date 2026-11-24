@@ -19,7 +19,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets 
 ### Lightweight flat UI & rendering
 - **Pure black flat theme (`FLAT`):** removes animated background glows, blurred video backdrops, translucent glass layers, soft shadows, specular sheens, redundant overdraw fills, and toast fade animations to avoid expensive alpha-blended passes on GPUs such as Mali-450.
 - **OpenGL (`glow`) default on `low_power`:** defaults to `glow` instead of `wgpu` on low-power devices, with automatic fallback between `glow` and `wgpu` unless `CATTUBE_RENDERER` is explicitly set.
-- **Faster text & list layout:** adds a bounded thread-local text measurement cache (`fit` / `two_lines` using binary search), an ASCII fast path that skips Unicode BiDi/shaping work, reduced corner tessellation in reduced-motion mode, vertical culling in Settings, and eliminates per-frame filesystem checks and input-driven `Page` clones.
+- **Faster text & list layout:** adds a bounded thread-local text measurement cache (`fit` / `two_lines` using binary search), reduced corner tessellation in reduced-motion mode, vertical culling in Settings, and eliminates per-frame filesystem checks and input-driven `Page` clones.
 
 ### ARM64 & low-power playback
 - **Automatic low-power profile (`CATTUBE_LOW_POWER`):** enabled automatically with up to 3 GiB of RAM, on Mali-400/450 or VideoCore IV GPUs, and on ARM machines below 6 GiB (overrideable with `CATTUBE_LOW_POWER=1` or `0`). Fresh configurations default to **720p SDR**, **H.264**, and a **64 MiB** forward demuxer buffer without overwriting existing saved settings.
@@ -45,6 +45,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets 
 - **No sign-in:** CatTubeLite never signs in to YouTube and keeps no tokens. The sign-in screen, accounts, Subscriptions, Playlists and Channels tabs, and the Like / Dislike / Subscribe / Watch later actions are gone. A leftover `~/.config/cattube/accounts.conf` from upstream CatTube is ignored; delete it if you no longer need it.
 - **No comments, live chat or dislike counts:** the player has no Comments or Chat buttons, and the video menu no longer asks Return YouTube Dislike for counts.
 - **No phone remote:** the YouTube app on a phone can no longer pair with or cast to CatTubeLite. The Link a phone setting, `CATTUBE_CAST_ENABLED_FILE` and the `--remote` service are gone; `--remote`, `--tv-code` and `--pair` now exit with code 2 without opening a window. A leftover `~/.config/cattube/remote.conf` is ignored.
+- **No Arabic:** the interface comes in English or Brazilian Portuguese, and a `language = ar` left in `settings.conf` opens in English. Arabic support is gone entirely: the bundled Noto Sans Arabic font, Arabic shaping and right-to-left layout, and the Arabic keyboard layout. Arabic titles may show as boxes or with letters in the wrong order. In the subtitle language choice, Portuguese takes Arabic's place.
 - **What stays:** Home (YouTube's live streams and popular topics), History (kept on this TV), Search, channel and playlist pages, SponsorBlock and Up next.
 
 ## What it does
@@ -60,7 +61,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets 
 
 ## Languages
 
-Choose **Settings → Playback → Interface language** for **Português (Brasil)** or **العربية** (Arabic). The player's on-screen controls stay in English. Arabic titles and search text also display properly in the English interface, and the on-screen keyboard includes an Arabic layout (**ABC → العربية**). Subtitle language is configured separately.
+Choose **Settings → Playback → Interface language** for **Português (Brasil)**. The player's on-screen controls stay in English. This fork has no Arabic support (see [Fewer features](#fewer-features)). Subtitle language is configured separately.
 
 ## Build & install
 
@@ -161,4 +162,4 @@ To see hardware decoding, dropped frames and memory over the video, turn on **Se
 
 ## License
 
-MIT, see [`LICENSE`](LICENSE). Bundled Inter and Noto Sans Arabic fonts use the SIL Open Font License; their notices are in [`assets/fonts/`](assets/fonts/). CatTubeLite is not affiliated with YouTube or Google.
+MIT, see [`LICENSE`](LICENSE). The bundled Inter font uses the SIL Open Font License; its notice is in [`assets/fonts/`](assets/fonts/). CatTubeLite is not affiliated with YouTube or Google.

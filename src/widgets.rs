@@ -618,16 +618,10 @@ pub fn text_field<H: Copy>(
         caret(c, tx - 2.0);
     } else {
         let fitted = c.fit(&shown, w - (tx - x) - 40.0, size, Weight::Medium);
-        let rtl = crate::i18n::is_rtl(&shown);
-        let edge = if rtl { x + w - 24.0 } else { tx };
         c.text(
-            edge,
+            tx,
             cy,
-            if rtl {
-                Align2::RIGHT_CENTER
-            } else {
-                Align2::LEFT_CENTER
-            },
+            Align2::LEFT_CENTER,
             &fitted,
             size,
             theme::text(),
@@ -638,13 +632,8 @@ pub fn text_field<H: Copy>(
         let fitted_chars = fitted.chars().count();
         let shown_before: String = before.chars().take(fitted_chars).collect();
         let advance = c.text_width(&shown_before, size, Weight::Medium);
-        let cx = if rtl {
-            edge - advance - 2.0
-        } else {
-            tx + advance + 2.0
-        };
         let _ = after;
-        caret(c, cx);
+        caret(c, tx + advance + 2.0);
     }
 }
 
