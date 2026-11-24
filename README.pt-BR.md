@@ -46,7 +46,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne quatro frentes de mudanças volt
 
 - **Seu YouTube.** Início, Inscrições, Histórico, Playlists e Canais. Login no estilo TV via `google.com/device` no celular, com suporte a múltiplas contas. Sem login, a tela inicial exibe transmissões ao vivo e tópicos populares.
 - **Busca** com sugestões com debounce enquanto digita e buscas recentes quando o campo está vazio, exibindo canais correspondentes e grade paginada de vídeos.
-- **Player feito para controle remoto.** OK abre os controles, Esquerda/Direita pulam 10 s e Cima vai para a barra de progresso. Velocidade, qualidade, legendas e faixas de áudio ficam acessíveis no OSD sem perder o ponto do vídeo.
+- **Player feito para controle remoto.** OK abre os controles, Esquerda/Direita pulam 10 s e Cima vai para a barra de progresso. Qualidade, legendas e faixas de áudio ficam acessíveis no OSD sem perder o ponto do vídeo. Neste fork os vídeos tocam sempre na velocidade normal, e o player fecha com Voltar (não há botão Parar).
 - **SponsorBlock.** Pula e marca na barra segmentos de patrocínio, intros, encerramentos e demais categorias escolhidas.
 - **Dislikes** via Return YouTube Dislike. Segure OK em um vídeo para curtir/descurtir, inscrever-se, salvar em Assistir mais tarde ou abrir o canal.
 - **Comentários e chat ao vivo** ao lado do vídeo.

@@ -240,7 +240,6 @@ pub fn format_string(max_h: u32, codec: Codec, hdr: bool, low_power: bool) -> St
     format!("(bv*{cap}{preferred}+ba/b{cap}{preferred})/bv*{cap}+ba/b{cap}/{general}")
 }
 
-/// Playback speeds the player offers.
 /// Buffer sizes offered (MiB): small for little memory, large for shaky
 /// connections.
 pub const BUFFERS: [u32; 3] = [64, 256, 768];
@@ -249,8 +248,6 @@ pub const BUFFERS: [u32; 3] = [64, 256, 768];
 pub const REGIONS: [&str; 16] = [
     "US", "GB", "IN", "CA", "AU", "DE", "FR", "ES", "IT", "NL", "BR", "MX", "JP", "KR", "PL", "TR",
 ];
-
-pub const SPEEDS: [f64; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
 
 // ------------------------------------------------------------------ mpv
 
@@ -263,7 +260,6 @@ pub struct PlayOptions {
     pub video_id: String,
     pub title: String,
     pub start: f64,
-    pub speed: f64,
     pub max_height: u32,
     pub codec: Codec,
     pub hdr: bool,
@@ -399,7 +395,8 @@ pub fn mpv_argv(
     } else {
         "--sid=no".into()
     });
-    v.push(format!("--speed={}", o.speed.clamp(0.25, 4.0)));
+    // Always normal speed, even when a user mpv.conf sets another.
+    v.push("--speed=1".into());
     let title: String = o
         .title
         .chars()
@@ -655,7 +652,6 @@ mod tests {
             video_id: "WhWc3b3KhnY".into(),
             title: "Spring\n".into(),
             start: 61.4,
-            speed: 1.5,
             max_height: 2160,
             codec: Codec::Vp9,
             hdr: true,
@@ -694,7 +690,7 @@ mod tests {
             .contains(&"--start=0.500".to_string())
         );
         assert!(v.contains(&"--resume-playback=no".to_string()));
-        assert!(v.contains(&"--speed=1.5".to_string()));
+        assert!(v.contains(&"--speed=1".to_string()));
         assert!(v.contains(&"--force-media-title=Spring".to_string()));
         assert!(v.contains(&"--script-opts=ytdl_hook-ytdl_path=/d/yt-dlp,ytdl_hook-try_ytdl_first=yes,cattube_osd-accent=7c6cf0,cattube_osd-position_dir=/d/positions".to_string()));
         assert!(v.contains(&"--ytdl-raw-options=js-runtimes=deno:/d/deno,sub-langs=\"en,en-(?-i:[A-Z]).*,en-orig\",write-subs=,write-auto-subs=".to_string()));

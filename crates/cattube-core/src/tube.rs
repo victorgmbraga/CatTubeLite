@@ -124,7 +124,6 @@ pub enum SettingRow {
     Quality,
     Codec,
     Hdr,
-    Speed,
     Subtitles,
     SubtitleLanguage,
     Language,
@@ -182,8 +181,7 @@ pub fn group_of(row: SettingRow) -> SettingGroup {
     match row {
         SettingRow::Account(_) | SettingRow::AddAccount => SettingGroup::Accounts,
         SettingRow::Quality | SettingRow::Codec | SettingRow::Hdr => SettingGroup::Video,
-        SettingRow::Speed
-        | SettingRow::Subtitles
+        SettingRow::Subtitles
         | SettingRow::SubtitleLanguage
         | SettingRow::Language
         | SettingRow::Autoplay
@@ -215,7 +213,6 @@ pub fn setting_rows(accounts: usize, sponsorblock: bool) -> Vec<SettingRow> {
         SettingRow::Quality,
         SettingRow::Codec,
         SettingRow::Hdr,
-        SettingRow::Speed,
         SettingRow::Subtitles,
         SettingRow::SubtitleLanguage,
         SettingRow::Autoplay,
@@ -902,7 +899,6 @@ impl Tube {
                         Some(
                             r @ (SettingRow::Quality
                             | SettingRow::Codec
-                            | SettingRow::Speed
                             | SettingRow::SubtitleLanguage
                             | SettingRow::Language
                             | SettingRow::Autoplay

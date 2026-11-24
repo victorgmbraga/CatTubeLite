@@ -88,8 +88,6 @@ fn arabic(text: &str) -> &str {
             "يناسب VP9 معظم الأجهزة، ويحتاج AV1 إلى بطاقة أحدث"
         }
         "When the video and the TV have it" => "عندما يدعمه الفيديو والتلفزيون",
-        "Speed" => "السرعة",
-        "Also changed in the player, and kept" => "يمكن تغييرها في المشغل أيضاً",
         "Subtitles" => "الترجمة",
         "Subtitle language" => "لغة الترجمة",
         "Interface language" => "لغة الواجهة",
@@ -258,7 +256,7 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix('"')?.split_once("\" =>"))
             .map(|(key, _)| key)
             .collect();
-        assert!(keys.len() > 100);
+        assert!(keys.len() > 90);
         let same_in_both = ["Playlists", "Buffer", "Shorts", "Short"];
         for key in keys {
             assert!(

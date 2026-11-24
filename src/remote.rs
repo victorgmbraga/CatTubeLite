@@ -681,7 +681,6 @@ impl Remote {
             video_id: id.clone(),
             title: String::new(),
             start,
-            speed: p.speed,
             max_height: p.max_height,
             codec: p.codec,
             hdr: p.hdr,

@@ -1,10 +1,10 @@
 //! CatTube's settings (`settings.conf` in the config folder): the video
-//! preset (highest resolution, codec, HDR), speed, subtitles, what plays
+//! preset (highest resolution, codec, HDR), subtitles, what plays
 //! after a video, SponsorBlock, and the accent colour (one of the names in
 //! `theme::ACCENTS`).
 
 use cattube_core::community;
-use cattube_core::player::{Codec, RESOLUTIONS, SPEEDS};
+use cattube_core::player::{Codec, RESOLUTIONS};
 use std::path::{Path, PathBuf};
 
 /// What happens when a video ends.
@@ -47,7 +47,6 @@ pub struct Prefs {
     pub max_height: u32,
     pub codec: Codec,
     pub hdr: bool,
-    pub speed: f64,
     pub subs_on: bool,
     pub sub_lang: String,
     pub autoplay: Autoplay,
@@ -69,7 +68,6 @@ impl Default for Prefs {
             max_height: 2160,
             codec: Codec::Vp9,
             hdr: true,
-            speed: 1.0,
             subs_on: false,
             sub_lang: "en".into(),
             autoplay: Autoplay::Next,
@@ -123,13 +121,6 @@ impl Prefs {
                     }
                 }
                 "hdr" => p.hdr = v != "false",
-                "speed" => {
-                    if let Ok(s) = v.parse::<f64>()
-                        && SPEEDS.iter().any(|x| (x - s).abs() < 1e-6)
-                    {
-                        p.speed = s;
-                    }
-                }
                 "subtitles" => p.subs_on = v == "true",
                 "subtitle_language"
                     if !v.is_empty()
@@ -175,13 +166,12 @@ impl Prefs {
 
     pub fn to_conf(&self) -> String {
         format!(
-            "# CatTube settings\nlanguage = {}\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nspeed = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\nplayer_stats = {}\n",
+            "# CatTube settings\nlanguage = {}\naccent = {}\nmax_height = {}\ncodec = {}\nhdr = {}\nsubtitles = {}\nsubtitle_language = {}\nautoplay = {}\nsponsorblock = {}\nsponsorblock_categories = {}\nbuffer = {}\nregion = {}\nplayer_stats = {}\n",
             self.language.key(),
             self.accent,
             self.max_height,
             self.codec.key(),
             self.hdr,
-            self.speed,
             self.subs_on,
             self.sub_lang,
             self.autoplay.key(),
@@ -233,7 +223,6 @@ mod tests {
             max_height: 1080,
             codec: Codec::Av1,
             hdr: false,
-            speed: 1.5,
             subs_on: true,
             sub_lang: "de".into(),
             autoplay: Autoplay::Loop,
@@ -249,12 +238,8 @@ mod tests {
             "max_height = 999\nspeed = 7\ncodec = xyz\nsponsorblock_categories = sponsor,evil\n",
             false,
         );
-        assert_eq!(
-            (junk.max_height, junk.speed, junk.codec),
-            (2160, 1.0, Codec::Vp9)
-        );
+        assert_eq!((junk.max_height, junk.codec), (2160, Codec::Vp9));
         assert_eq!(junk.sb_categories, vec!["sponsor".to_string()]);
-        assert_eq!(cycle(&SPEEDS, 1.0, 1), 1.25);
         assert_eq!(cycle(&RESOLUTIONS, 480, 1), 0);
     }
 
