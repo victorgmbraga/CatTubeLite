@@ -746,42 +746,27 @@ pub fn keyboard<H: Copy>(
     keys(c, osk, x, y + 68.0, w, focused, id, key_hit);
 }
 
-/// Material 3 Expressive–style indeterminate indicator centred on (x, y):
-/// a "snake" arc whose head races ahead and tail catches up while the
-/// whole thing rotates, drawn as a gentle wave around the circle.
+/// Loading indicator centred on (x, y): a faint track and an arc in the
+/// accent colour that turns while it grows and shrinks (the same as the
+/// player's, in `cattube-osd.lua`).
 pub fn spinner<H: Copy>(c: &Canvas<H>, x: f32, y: f32, r: f32, now: f64) {
     use std::f32::consts::TAU;
     use std::time::Duration;
     let interval = if c.reduce_motion { 100 } else { 33 };
     c.ctx.request_repaint_after(Duration::from_millis(interval));
-    let period = 1.6_f64;
-    let cycle = (now / period).floor() as f32;
-    let p = ((now % period) / period) as f32;
-    let ease = |t: f32| {
-        let t = t.clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
-    let span = 0.72 * TAU; // how far the head runs ahead per cycle
-    let base = cycle * span + now as f32 * TAU * 0.22;
-    let head = base + ease(p * 2.0) * span;
-    let tail = base + ease(p * 2.0 - 1.0) * span;
-    let (a0, a1) = (tail, head + 0.12 * TAU);
+    let t = now as f32;
     let stroke = (r * 0.2).max(2.5);
-    let amp = r * 0.07;
-    let waves = 9.0;
-    let steps = if c.reduce_motion { 16 } else { 48 };
+    let spin = (t * 5.2) % TAU;
+    let len = 1.2 + 1.8 * (0.5 + 0.5 * (t * 2.6).sin());
+    let steps = if c.reduce_motion { 16 } else { 40 };
     let pts: Vec<(f32, f32)> = (0..=steps)
         .map(|i| {
-            let a = a0 + (a1 - a0) * i as f32 / steps as f32;
-            let rr = r + amp * (a * waves - now as f32 * 6.0).sin();
-            (x + rr * a.cos(), y + rr * a.sin())
+            let a = spin + len * i as f32 / steps as f32;
+            (x + r * a.cos(), y + r * a.sin())
         })
         .collect();
-    c.ring(x, y, r, stroke * 0.55, theme::rgba(theme::WHITE, 16));
+    c.ring(x, y, r, stroke, theme::rgba(theme::WHITE, 25));
     c.polyline(&pts, stroke, theme::accent());
-    for &(px, py) in [pts[0], pts[pts.len() - 1]].iter() {
-        c.circle(px, py, stroke / 2.0, theme::accent());
-    }
 }
 
 /// A status line with a small spinner in front while `busy`.
