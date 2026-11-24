@@ -11,7 +11,7 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-fn xdg(var: &str, fallback: &str) -> PathBuf {
+pub fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

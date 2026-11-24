@@ -604,6 +604,13 @@ impl App {
             buffer_mib: self.prefs.buffer,
             hide_on_back: on_catostv() && !self.quit_after_play,
             stats: self.prefs.player_stats,
+            hwdec: player::hwdec_choice(
+                std::env::var("CATTUBE_HWDEC").ok().as_deref(),
+                player::mpv_conf_paths().iter().any(|p| {
+                    std::fs::read_to_string(p).is_ok_and(|t| player::mpv_conf_sets_hwdec(&t))
+                }),
+                self.low_power,
+            ),
         };
         if !self.yt_dlp_ready && !player::yt_dlp_path(&self.data).is_file() {
             return self.toast(ctx, "Getting the player ready, try again in a moment");
