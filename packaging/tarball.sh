@@ -37,6 +37,7 @@ install -Dm644 README.md "$D/README.md"
 install -Dm644 README.pt-BR.md "$D/README.pt-BR.md"
 install -Dm644 LICENSE "$D/LICENSE"
 install -Dm644 assets/fonts/LICENSE-Inter.txt "$D/LICENSE-Inter.txt"
+install -Dm644 assets/fonts/LICENSE-NotoEmoji.txt "$D/LICENSE-NotoEmoji.txt"
 tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
 rm -rf "dist/$NAME"
 (cd dist && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
