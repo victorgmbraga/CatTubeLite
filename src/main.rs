@@ -463,7 +463,7 @@ impl App {
                 self.prefs.buffer = prefs::cycle(&player::BUFFERS, self.prefs.buffer, d)
             }
             SettingRow::SubtitleLanguage => {
-                let languages = ["en", "ar", "de", "fr", "es", "hi"];
+                let languages = ["en", "pt", "de", "fr", "es", "hi"];
                 let cur = languages
                     .iter()
                     .copied()

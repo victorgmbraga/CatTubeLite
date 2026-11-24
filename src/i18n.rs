@@ -1,11 +1,8 @@
-//! Interface language and bidirectional text layout.
+//! Interface language and text layout.
 
 use eframe::egui;
-use std::borrow::Cow;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, LazyLock};
-use unicode_bidi::BidiInfo;
-use unicode_segmentation::UnicodeSegmentation;
 
 static LANGUAGE: AtomicU8 = AtomicU8::new(Language::English as u8);
 
@@ -51,67 +48,14 @@ pub fn tr(text: &str) -> &str {
     }
 }
 
-pub fn is_rtl(text: &str) -> bool {
-    if text.is_ascii() {
-        return false;
-    }
-    BidiInfo::new(text, None)
-        .paragraphs
-        .first()
-        .is_some_and(|p| p.level.is_rtl())
-}
-
-static SHAPER: LazyLock<arabic_reshaper::ArabicReshaper<'static>> = LazyLock::new(|| {
-    let mut shaper = arabic_reshaper::ArabicReshaper::new();
-    shaper.configuration.insert("delete_harakat", false);
-    shaper.configuration.insert("shift_harakat_position", true);
-    shaper
-});
-
-fn display(text: &str) -> Cow<'_, str> {
-    if text.is_ascii() || !BidiInfo::new(text, None).has_rtl() {
-        return Cow::Borrowed(text);
-    }
-    let mut visual = String::new();
-    for line in text.split_inclusive('\n') {
-        let content = line.strip_suffix('\n').unwrap_or(line);
-        let shaped = SHAPER.reshape(content);
-        let bidi = BidiInfo::new(&shaped, None);
-        for paragraph in &bidi.paragraphs {
-            visual.push_str(&bidi.reorder_line(paragraph, paragraph.range.clone()));
-        }
-        if line.ends_with('\n') {
-            visual.push('\n');
-        }
-    }
-    Cow::Owned(visual)
-}
-
-/// Keep model text logical; shape and reorder only at the drawing boundary.
+/// Lay out one line of text for drawing.
 pub fn layout(
     painter: &egui::Painter,
     text: &str,
     font: egui::FontId,
     color: egui::Color32,
 ) -> Arc<egui::Galley> {
-    let visual = display(text);
-    if matches!(visual, Cow::Borrowed(_)) {
-        return painter.layout_no_wrap(text.to_owned(), font, color);
-    }
-    let mut job = egui::text::LayoutJob::default();
-    let format = egui::TextFormat::simple(font, color);
-    // The renderer assumes ascending clusters. Isolate visual graphemes so
-    // its shaper cannot reverse a run that has already been reordered.
-    for grapheme in visual.graphemes(true) {
-        let start = job.text.len();
-        job.text.push_str(grapheme);
-        job.sections.push(egui::text::LayoutSection {
-            leading_space: 0.0,
-            byte_range: start.into()..job.text.len().into(),
-            format: format.clone(),
-        });
-    }
-    painter.layout_job(job)
+    painter.layout_no_wrap(text.to_owned(), font, color)
 }
 
 #[cfg(test)]
@@ -205,40 +149,5 @@ mod tests {
             assert_eq!(Language::from_key(language.key()), language);
         }
         assert_eq!(Language::from_key("xx"), Language::English);
-    }
-
-    #[test]
-    fn rendered_arabic_and_mixed_text_follow_visual_order() {
-        let ctx = egui::Context::default();
-        crate::theme::setup(&ctx);
-        ctx.run_ui(egui::RawInput::default(), |ui| {
-            let font = egui::FontId::proportional(24.0);
-            let logical = "بحث YouTube 2026";
-            let galley = layout(ui.painter(), logical, font.clone(), egui::Color32::WHITE);
-            let visible: String = galley.rows[0]
-                .glyphs
-                .iter()
-                .filter(|g| !g.chr.is_control() && g.chr != '\u{200f}')
-                .map(|g| g.chr)
-                .collect();
-            assert!(visible.starts_with("YouTube 2026"), "{visible:?}");
-            assert_eq!(visible, display(logical), "{visible:?}");
-            assert!(
-                visible
-                    .chars()
-                    .any(|c| ('\u{fe70}'..='\u{feff}').contains(&c))
-            );
-            assert_eq!(logical, "بحث YouTube 2026");
-            let marked = layout(ui.painter(), "مَرْحَبًا\nالعربية", font, egui::Color32::WHITE);
-            assert_eq!(marked.rows.len(), 2);
-            assert!(marked.rows.iter().all(|r| !r.glyphs.is_empty()));
-            assert!(!is_rtl("YouTube 2026"));
-            assert!(is_rtl("بحث YouTube 2026"));
-            assert!(matches!(
-                display("YouTube 2026"),
-                Cow::Borrowed("YouTube 2026")
-            ));
-        })
-        .drop_without_applying_deltas();
     }
 }
