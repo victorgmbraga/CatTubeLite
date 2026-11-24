@@ -91,13 +91,27 @@ On `aarch64` the package is built without the `wgpu` renderer (`--no-default-fea
 
 ### Your own name and logo
 
-For a build made only for yourself, two variables change the app's name and logo at build time. They apply to the window title, the header, Settings, the desktop entry and the icon:
+For a build made only for yourself, two build-time variables change the app's name and logo. Without them nothing changes, and the released packages built by CI always keep CatTube's own name and mark.
+
+| Variable | What it changes |
+|---|---|
+| `CATTUBE_NAME` | The name in the window title, the header, Settings and the desktop entry (menus and launchers) |
+| `CATTUBE_LOGO` | A PNG drawn in place of the cat mark (in the header and on the channel and Settings screens), also installed as the desktop icon |
+
+Build the package with them and install it as usual (on the TV box too, for `aarch64`):
 
 ```sh
 CATTUBE_NAME="My Tube" CATTUBE_LOGO=/path/to/logo.png packaging/tarball.sh
+tar -xzf dist/cattube-*-"$(uname -m)".tar.gz -C dist
+dist/cattube-*-"$(uname -m)"/install.sh
 ```
 
-`CATTUBE_LOGO` must be a PNG. Use one that is square or wider, with a transparent background, and at least 256 px tall. In the app it is drawn at the height of the original mark, and it also becomes the desktop icon. The same variables work with a plain `cargo build`, but then only the app changes. The released packages always keep CatTube's own name and mark. Do not redistribute a build that carries another company's name or logo.
+- **The logo:** it must be a PNG (SVG is not accepted), square or wider than tall, with a transparent background and at least 256 px tall. In the app it is drawn at the height of the original mark, keeping its proportions. If the file is missing or is not a PNG, the build stops with an error.
+- **Installing over an earlier install:** `install.sh` copies only the icon the package has (`share/pixmaps/io.github.coderastic.CatTube.png` for a logo, the cat SVG otherwise) and removes the other one left by an earlier install.
+- **A plain `cargo build`:** it reads the same variables, but then only the app changes. The desktop entry and the icon come from `packaging/tarball.sh`.
+- **What stays the same:** the `cattube` command, the `~/.config/cattube` and `~/.local/share/cattube` folders, and the internal id `io.github.coderastic.CatTube` (window app id and desktop file name). Settings, history and CatosTV keep working as before.
+
+The logo file is yours to supply: this repository ships no third-party logo. Do not redistribute a build that carries another company's name or logo.
 
 The package does not bundle `mpv`, `curl` or Python 3, so they must be installed on the device.
 
