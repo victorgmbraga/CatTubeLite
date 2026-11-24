@@ -13,16 +13,14 @@ static LANGUAGE: AtomicU8 = AtomicU8::new(Language::English as u8);
 pub enum Language {
     #[default]
     English,
-    Arabic,
     Portuguese,
 }
 
 impl Language {
-    pub const ALL: [Self; 3] = [Self::English, Self::Portuguese, Self::Arabic];
+    pub const ALL: [Self; 2] = [Self::English, Self::Portuguese];
     pub fn key(self) -> &'static str {
         match self {
             Self::English => "en",
-            Self::Arabic => "ar",
             // YouTube's language code for Brazilian Portuguese.
             Self::Portuguese => "pt",
         }
@@ -30,13 +28,11 @@ impl Language {
     pub fn label(self) -> &'static str {
         match self {
             Self::English => "English",
-            Self::Arabic => "العربية",
             Self::Portuguese => "Português (Brasil)",
         }
     }
     pub fn from_key(key: &str) -> Self {
         match key {
-            "ar" => Self::Arabic,
             "pt" => Self::Portuguese,
             _ => Self::English,
         }
@@ -48,88 +44,9 @@ pub fn set_language(language: Language) {
 }
 
 pub fn tr(text: &str) -> &str {
-    const ARABIC: u8 = Language::Arabic as u8;
     const PORTUGUESE: u8 = Language::Portuguese as u8;
     match LANGUAGE.load(Ordering::Relaxed) {
-        ARABIC => arabic(text),
         PORTUGUESE => crate::i18n_pt::translate(text),
-        _ => text,
-    }
-}
-
-fn arabic(text: &str) -> &str {
-    match text {
-        "Home" => "الرئيسية",
-        "History" => "السجل",
-        "Channels" => "القنوات",
-        "Search" => "بحث",
-        "Settings" => "الإعدادات",
-        "Video" => "الفيديو",
-        "Videos" => "الفيديوهات",
-        "Playback" => "التشغيل",
-        "About" => "حول التطبيق",
-        "Highest quality" => "أعلى جودة",
-        "Lower plays smoother on slow connections" => "الجودة الأقل تناسب الاتصال البطيء",
-        "Preferred codec" => "ترميز الفيديو المفضل",
-        "VP9 suits most TVs; AV1 needs newer graphics" => {
-            "يناسب VP9 معظم الأجهزة، ويحتاج AV1 إلى بطاقة أحدث"
-        }
-        "When the video and the TV have it" => "عندما يدعمه الفيديو والتلفزيون",
-        "Subtitles" => "الترجمة",
-        "Subtitle language" => "لغة الترجمة",
-        "Interface language" => "لغة الواجهة",
-        "When a video ends" => "عند انتهاء الفيديو",
-        "Play the next video" => "تشغيل الفيديو التالي",
-        "Play it again" => "إعادة التشغيل",
-        "Stop" => "إيقاف",
-        "Buffer" => "التخزين المؤقت",
-        "Bigger rides out a shaky connection, smaller uses less memory" => {
-            "الحجم الأكبر يناسب الاتصال غير المستقر"
-        }
-        "Small" => "صغير",
-        "Medium" => "متوسط",
-        "Large" => "كبير",
-        "Country" => "البلد",
-        "For recommendations, trending and news" => "للاقتراحات والمحتوى الرائج والأخبار",
-        "Skip sponsors and more" => "تخطي الرعاية والمقاطع الأخرى",
-        "Segments marked by SponsorBlock viewers" => "مقاطع حددها مستخدمو SponsorBlock",
-        "Player statistics" => "إحصاءات المشغل",
-        "Decoder, dropped frames and memory over the video" => {
-            "عرض وحدة فك الترميز والإطارات المفقودة والذاكرة"
-        }
-        "Update the player" => "تحديث المشغل",
-        "Updating…" => "جارٍ التحديث…",
-        "Now playing" => "قيد التشغيل الآن",
-        "Return to video" => "العودة إلى الفيديو",
-        "Playing" => "قيد التشغيل",
-        "Play" => "تشغيل",
-        "Start over" => "التشغيل من البداية",
-        "Go to channel" => "الانتقال إلى القناة",
-        "No channel for this one" => "لا توجد قناة لهذا الفيديو",
-        "For you" => "مقترح لك",
-        "People also watched" => "شاهد الآخرون أيضاً",
-        "Shorts" => "فيديوهات قصيرة",
-        "Recent searches" => "عمليات البحث الأخيرة",
-        "Search YouTube" => "البحث في YouTube",
-        "Search to get started" => "ابحث للبدء",
-        "Nothing found" => "لا توجد نتائج",
-        "Nothing here yet" => "لا يوجد محتوى بعد",
-        "Down for results" => "اضغط لأسفل لعرض النتائج",
-        "Press OK to try again" => "اضغط موافق للمحاولة مجدداً",
-        "Getting the player ready (first start)…" => "جارٍ إعداد المشغل للتشغيل الأول…",
-        "space" => "مسافة",
-        "delete" => "حذف",
-        "LIVE" => "مباشر",
-        "Short" => "قصير",
-        "Sponsor" => "رعاية",
-        "Unpaid or self promotion" => "ترويج شخصي أو غير مدفوع",
-        "Reminder to subscribe" => "تذكير بالاشتراك",
-        "Intro" => "مقدمة",
-        "Credits and end cards" => "تترات وشاشات النهاية",
-        "Preview or recap" => "معاينة أو ملخص",
-        "Non-music part in a music video" => "جزء غير موسيقي في فيديو موسيقي",
-        "Off-topic filler" => "محتوى خارج الموضوع",
-        "Hook or greeting" => "افتتاحية أو تحية",
         _ => text,
     }
 }
@@ -201,19 +118,80 @@ pub fn layout(
 mod tests {
     use super::*;
 
+    /// Every text the interface passes through [`tr`].
+    const INTERFACE_TEXTS: &[&str] = &[
+        "Home",
+        "History",
+        "Channels",
+        "Search",
+        "Settings",
+        "Video",
+        "Videos",
+        "Playback",
+        "About",
+        "Highest quality",
+        "Lower plays smoother on slow connections",
+        "Preferred codec",
+        "VP9 suits most TVs; AV1 needs newer graphics",
+        "When the video and the TV have it",
+        "Subtitles",
+        "Subtitle language",
+        "Interface language",
+        "When a video ends",
+        "Play the next video",
+        "Play it again",
+        "Stop",
+        "Buffer",
+        "Bigger rides out a shaky connection, smaller uses less memory",
+        "Small",
+        "Medium",
+        "Large",
+        "Country",
+        "For recommendations, trending and news",
+        "Skip sponsors and more",
+        "Segments marked by SponsorBlock viewers",
+        "Player statistics",
+        "Decoder, dropped frames and memory over the video",
+        "Update the player",
+        "Updating…",
+        "Now playing",
+        "Return to video",
+        "Playing",
+        "Play",
+        "Start over",
+        "Go to channel",
+        "No channel for this one",
+        "For you",
+        "People also watched",
+        "Shorts",
+        "Recent searches",
+        "Search YouTube",
+        "Search to get started",
+        "Nothing found",
+        "Nothing here yet",
+        "Down for results",
+        "Press OK to try again",
+        "Getting the player ready (first start)…",
+        "space",
+        "delete",
+        "LIVE",
+        "Short",
+        "Sponsor",
+        "Unpaid or self promotion",
+        "Reminder to subscribe",
+        "Intro",
+        "Credits and end cards",
+        "Preview or recap",
+        "Non-music part in a music video",
+        "Off-topic filler",
+        "Hook or greeting",
+    ];
+
     #[test]
     fn portuguese_covers_every_interface_text() {
-        let source = include_str!("i18n.rs");
-        let start = source.find("fn arabic(text").unwrap();
-        let end = start + source[start..].find("_ => text,").unwrap();
-        let keys: Vec<&str> = source[start..end]
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix('"')?.split_once("\" =>"))
-            .map(|(key, _)| key)
-            .collect();
-        assert!(keys.len() > 40);
+        let keys = INTERFACE_TEXTS;
         let same_in_both = ["Buffer", "Shorts", "Short"];
-        for key in keys {
+        for &key in keys {
             assert!(
                 crate::i18n_pt::translate(key) != key || same_in_both.contains(&key),
                 "no Portuguese for {key:?}"

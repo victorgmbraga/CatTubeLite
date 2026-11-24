@@ -45,6 +45,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 - **Sem login:** o CatTubeLite nunca entra numa conta do YouTube e não guarda tokens. Saíram a tela de login, as contas, as abas Inscrições, Playlists e Canais e as ações Curtir / Não curtir / Inscrever-se / Assistir mais tarde. Um `~/.config/cattube/accounts.conf` que tenha sobrado do CatTube original é ignorado; pode apagá-lo se não precisar mais dele.
 - **Sem comentários, chat ao vivo nem contagem de dislikes:** o player não tem mais os botões Comentários e Chat, e o menu do vídeo não consulta mais o Return YouTube Dislike.
 - **Sem controle pelo celular:** o app do YouTube no celular não pareia nem transmite mais para o CatTubeLite. Saíram a opção Vincular celular, a variável `CATTUBE_CAST_ENABLED_FILE` e o serviço `--remote`; `--remote`, `--tv-code` e `--pair` agora saem com código 2 sem abrir janela. Um `~/.config/cattube/remote.conf` que tenha sobrado é ignorado.
+- **Sem interface em árabe:** a interface fica em inglês ou em português do Brasil. Um `language = ar` que tenha sobrado no `settings.conf` abre em inglês. Títulos, buscas e o layout árabe do teclado continuam funcionando.
 - **O que continua:** Início (transmissões ao vivo e tópicos populares do YouTube), Histórico (guardado na TV), Busca, páginas de canais e playlists, SponsorBlock e Próximo vídeo.
 
 ## Recursos
@@ -60,7 +61,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 
 ## Idiomas
 
-Em **Settings → Playback → Interface language** é possível escolher **Português (Brasil)** ou **العربية** (árabe). Os controles sobre o vídeo continuam em inglês. Títulos e buscas em árabe também funcionam corretamente com a interface em inglês, e o teclado virtual inclui layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
+Em **Settings → Playback → Interface language** é possível escolher **Português (Brasil)**. Os controles sobre o vídeo continuam em inglês. Este fork não tem interface em árabe; títulos e buscas em árabe continuam sendo exibidos corretamente, e o teclado virtual mantém o layout árabe (**ABC → العربية**). O idioma das legendas é configurado separadamente.
 
 ## Compilação e instalação
 

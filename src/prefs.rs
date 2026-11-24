@@ -219,7 +219,7 @@ mod tests {
     fn round_trip() {
         let p = Prefs {
             accent: "teal".into(),
-            language: crate::i18n::Language::Arabic,
+            language: crate::i18n::Language::Portuguese,
             max_height: 1080,
             codec: Codec::Av1,
             hdr: false,

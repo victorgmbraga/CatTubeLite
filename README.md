@@ -45,6 +45,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets 
 - **No sign-in:** CatTubeLite never signs in to YouTube and keeps no tokens. The sign-in screen, accounts, Subscriptions, Playlists and Channels tabs, and the Like / Dislike / Subscribe / Watch later actions are gone. A leftover `~/.config/cattube/accounts.conf` from upstream CatTube is ignored; delete it if you no longer need it.
 - **No comments, live chat or dislike counts:** the player has no Comments or Chat buttons, and the video menu no longer asks Return YouTube Dislike for counts.
 - **No phone remote:** the YouTube app on a phone can no longer pair with or cast to CatTubeLite. The Link a phone setting, `CATTUBE_CAST_ENABLED_FILE` and the `--remote` service are gone; `--remote`, `--tv-code` and `--pair` now exit with code 2 without opening a window. A leftover `~/.config/cattube/remote.conf` is ignored.
+- **No Arabic interface:** the interface comes in English or Brazilian Portuguese. A `language = ar` left in `settings.conf` opens in English. Arabic titles, search text and the Arabic keyboard layout still work.
 - **What stays:** Home (YouTube's live streams and popular topics), History (kept on this TV), Search, channel and playlist pages, SponsorBlock and Up next.
 
 ## What it does
@@ -60,7 +61,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets 
 
 ## Languages
 
-Choose **Settings → Playback → Interface language** for **Português (Brasil)** or **العربية** (Arabic). The player's on-screen controls stay in English. Arabic titles and search text also display properly in the English interface, and the on-screen keyboard includes an Arabic layout (**ABC → العربية**). Subtitle language is configured separately.
+Choose **Settings → Playback → Interface language** for **Português (Brasil)**. The player's on-screen controls stay in English. This fork has no Arabic interface; Arabic titles and search text still display properly, and the on-screen keyboard keeps its Arabic layout (**ABC → العربية**). Subtitle language is configured separately.
 
 ## Build & install
 

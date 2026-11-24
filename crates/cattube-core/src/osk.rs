@@ -81,14 +81,12 @@ pub struct Osk {
     pub masked: bool,
     /// Label for the Done key ("Connect", "Search", ...).
     pub done_label: String,
-    language_configured: bool,
 }
 
 impl Osk {
     pub fn new(masked: bool, done_label: impl Into<String>) -> Self {
         Self {
             page: Page::Lower,
-            language_configured: false,
             row: 1,
             col: 0,
             text: String::new(),
@@ -97,15 +95,6 @@ impl Osk {
             max_len: 63, // WPA2 passphrase maximum
             masked,
             done_label: done_label.into(),
-        }
-    }
-
-    pub fn configure_arabic(&mut self, arabic: bool) {
-        if !self.language_configured {
-            self.language_configured = true;
-            if arabic {
-                self.page = Page::Arabic;
-            }
         }
     }
 
@@ -392,8 +381,7 @@ mod tests {
     #[test]
     fn arabic_keyboard_keeps_logical_queries_and_can_switch_to_latin() {
         let mut osk = Osk::new(false, "Search");
-        osk.configure_arabic(true);
-        assert_eq!(osk.page(), Page::Arabic);
+        osk.page = Page::Arabic;
         for row in osk.rows() {
             assert_eq!(row.iter().map(|k| k.width).sum::<u8>(), ROW_UNITS);
         }
@@ -407,12 +395,6 @@ mod tests {
         osk.set_focus(4, 0);
         osk.handle(Action::Ok);
         assert_eq!(osk.page(), Page::Lower);
-        osk.configure_arabic(true);
-        assert_eq!(
-            osk.page(),
-            Page::Lower,
-            "a manual alphabet choice survives frames"
-        );
         osk.handle(Action::Char('ع'));
         assert!(osk.text().ends_with('ع'));
     }
