@@ -46,7 +46,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces four main sets o
 
 - **Your YouTube.** Home, Subscriptions, History, Playlists and Channels. You sign in the TV way: CatTubeLite shows a code and you enter it at `google.com/device` on your phone. Multiple accounts are supported. Signed out, Home shows live streams and popular topics.
 - **Search** with debounced suggestions as you type and recent searches when the box is empty. Results show matching channels first, followed by a paginated grid of videos.
-- **A player made for the remote.** OK shows the controls, Left and Right skip 10 seconds, Up goes to the progress bar. Speed, quality, subtitles and audio tracks are a button away, chapters show on the bar, and changing quality keeps your position.
+- **A player made for the remote.** OK shows the controls, Left and Right skip 10 seconds, Up goes to the progress bar. Quality, subtitles and audio tracks are a button away; in this fork videos always play at normal speed and Back closes the player (there is no Stop button), chapters show on the bar, and changing quality keeps your position.
 - **SponsorBlock.** Sponsor segments, intros, outros, reminders and other chosen categories are skipped and marked on the progress bar.
 - **Dislikes** via Return YouTube Dislike. Hold OK on a video to like/dislike it, subscribe, save to Watch later or open the channel.
 - **Comments and live chat** next to the video.

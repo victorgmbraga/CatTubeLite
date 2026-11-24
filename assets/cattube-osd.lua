@@ -111,8 +111,6 @@ end
 -- Three groups: episodes on the left, playback in the middle, tracks on
 -- the right. The episode buttons show only when there is one
 -- (`cattube-episodes PREV NEXT`, each "yes" or "no").
--- Its label carries the speed when it is not normal ("Speed 1.5×").
-local speed_button = { label = "Speed", group = "track", act = function() open_menu("speed") end }
 -- Shown for a live video with a chat (`cattube-chat-available yes`).
 local chat_button = { label = "Chat", group = "track", hidden = true, act = function() toggle_chat() end }
 local pause_button = { label = "Pause", group = "play", act = function() mp.commandv("cycle", "pause") end }
@@ -122,7 +120,6 @@ local buttons = {
     { label = "−10 s",            group = "play", act = function() seek(-10) end },
     pause_button,
     { label = "+10 s",            group = "play", act = function() seek(10) end },
-    speed_button,
     { label = "Quality",          group = "track", act = function() open_menu("quality") end },
     { label = "Comments",         group = "track", act = function() open_comments() end },
     chat_button,
@@ -327,8 +324,7 @@ local function render()
         a:new_event()
         a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\b1\\1c&H4444FF&\\1a&H00&}● LIVE")
     elseif dur > 0 then
-        local speed = mp.get_property_number("speed", 1)
-        local ends = os.time() + math.max(0, dur - pos) / (speed > 0 and speed or 1)
+        local ends = os.time() + math.max(0, dur - pos)
         a:new_event()
         a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\1c&HFFFFFF&\\1a&H40&}Ends at " .. os.date("%H:%M", math.floor(ends)))
     end
@@ -394,7 +390,7 @@ local function render()
     -- Buttons: episodes from the left edge, playback centred, tracks to
     -- the right edge.
     -- Smaller when they would not fit side by side (both video buttons,
-    -- a long speed label).
+    -- the chat button).
     local size, pad, gap, bh = 28, 40, 16, 60
     local shown_buttons = visible_buttons()
     local widths, group_w
@@ -465,9 +461,8 @@ local function track_label(t, external_n)
     return label
 end
 
--- Speeds and the highest qualities offered; a quality change reloads the
+-- The highest qualities offered; a quality change reloads the
 -- video where it is (CatTube does that).
-local SPEEDS = { 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 3 }
 local QUALITIES = { { "Best", 0 }, { "4K", 2160 }, { "1440p", 1440 }, { "1080p", 1080 }, { "720p", 720 }, { "480p", 480 } }
 
 -- What YouTube would call the picture playing: by its width for wide
@@ -487,12 +482,7 @@ end
 local function build_menu(kind)
     local items = {}
     local title = nil
-    if kind == "speed" then
-        local cur = mp.get_property_number("speed", 1)
-        for _, sp in ipairs(SPEEDS) do
-            items[#items + 1] = { label = (sp == 1 and "Normal" or (tostring(sp) .. "×")), id = tostring(sp), selected = math.abs(sp - cur) < 0.001 }
-        end
-    elseif kind == "quality" then
+    if kind == "quality" then
         -- The cap in use, from the format CatTube asked yt-dlp for.
         local cap = tonumber((mp.get_property("ytdl-format", "")):match("height<=(%d+)")) or 0
         for _, q in ipairs(QUALITIES) do
@@ -501,7 +491,7 @@ local function build_menu(kind)
         local now = quality_class()
         title = "Quality" .. (now > 0 and (" · now " .. tostring(now) .. "p") or "")
     end
-    if kind == "speed" or kind == "quality" then
+    if kind == "quality" then
         local index = 1
         for i, it in ipairs(items) do
             if it.selected then index = i end
@@ -545,9 +535,7 @@ local function menu_pick()
     if menu.kind == "comments" then return end
     local it = menu.items[menu.index]
     if not it then menu = nil; render(); return end
-    if menu.kind == "speed" then
-        mp.set_property("speed", it.id)
-    elseif menu.kind == "quality" then
+    if menu.kind == "quality" then
         mp.commandv("script-message", "cattube-quality", it.id)
     elseif menu.kind == "sub" then
         mp.set_property("sid", it.id)
@@ -783,7 +771,7 @@ render_menu = function(a)
     a:draw_stop()
     a:new_event()
     a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs34\\b1\\1c&HFFFFFF&\\1a&H00&}%s",
-        px + 32, py + 28, menu.title or ({ sub = "Subtitles", audio = "Audio", speed = "Speed", quality = "Quality" })[menu.kind] or ""))
+        px + 32, py + 28, menu.title or ({ sub = "Subtitles", audio = "Audio", quality = "Quality" })[menu.kind] or ""))
     for row = 0, shown_n - 1 do
         local i = first + row
         local it = menu.items[i]
@@ -1574,14 +1562,6 @@ mp.observe_property("pause", "native", function(_, paused)
         if paused then show() elseif shown then arm_hide() end
     end
     render()
-end)
-
-mp.observe_property("speed", "number", function(_, sp)
-    if sp and math.abs(sp - 1) > 0.001 then
-        speed_button.label = string.format("Speed %g×", sp)
-    else
-        speed_button.label = "Speed"
-    end
 end)
 
 -- Loading: from the moment the player opens (and for each next video)

@@ -1378,7 +1378,6 @@ pub struct Session {
 pub struct Ended {
     /// (video, position, duration) for every video that played.
     pub positions: Vec<(String, f64, Option<f64>)>,
-    pub speed: Option<f64>,
 }
 
 fn osd(conn: &mut mpv::IpcConn, text: &str) {
@@ -1952,8 +1951,8 @@ fn wait_for_video(conn: &mut mpv::IpcConn, player: &PlayerHandle, id: &str) -> b
     true
 }
 
-/// Watch the player until it goes away: SponsorBlock skips, the speed the
-/// viewer picked, quality changes from the control bar, and what plays
+/// Watch the player until it goes away: SponsorBlock skips, quality
+/// changes from the control bar, and what plays
 /// next (an "Up next" card counting down, a loop, or nothing). Runs on
 /// its own thread; `done` is called when the player has gone.
 pub fn spawn_watcher(
@@ -2115,9 +2114,6 @@ pub fn spawn_watcher(
                     let dur = conn.get_f64("duration").filter(|d| *d > 0.0);
                     if let Some(p) = pos {
                         last = (p, dur);
-                    }
-                    if let Some(sp) = conn.get_f64("speed") {
-                        ended.speed = Some(sp);
                     }
                     // SponsorBlock: jump over the segment once.
                     if let Some(p) = pos {

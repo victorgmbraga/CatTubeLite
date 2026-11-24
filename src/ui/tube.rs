@@ -1507,7 +1507,6 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
     let scroll = c.anim(("tube-settings-scroll", shown), target);
     let list = c.clipped(330.0, 204.0, 898.0, 480.0);
     let p = v.prefs;
-    let speed = format!("{}×", p.speed);
     let quality = player::resolution_label(p.max_height);
     let tools = match v.tools {
         Scan::Done(s) => s.first().cloned().unwrap_or_default(),
@@ -1587,13 +1586,6 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 p.region.clone(),
                 RowKind::Choice,
                 "home",
-            ),
-            SettingRow::Speed => (
-                tr("Speed").into(),
-                tr("Also changed in the player, and kept").into(),
-                speed.clone(),
-                RowKind::Choice,
-                "play",
             ),
             SettingRow::Language => (
                 tr("Interface language").into(),

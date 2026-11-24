@@ -31,8 +31,6 @@ pub fn translate(text: &str) -> &str {
             "VP9 serve na maioria das TVs; AV1 exige GPU mais nova"
         }
         "When the video and the TV have it" => "Quando o vídeo e a TV tiverem suporte",
-        "Speed" => "Velocidade",
-        "Also changed in the player, and kept" => "Também muda no player e fica salva",
         "Subtitles" => "Legendas",
         "Subtitle language" => "Idioma das legendas",
         "Interface language" => "Idioma da interface",

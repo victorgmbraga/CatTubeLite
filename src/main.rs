@@ -25,7 +25,7 @@ mod yt;
 use canvas::Canvas;
 use cattube_core::account::{self, Accounts};
 use cattube_core::input::{Action, InputMapper};
-use cattube_core::player::{self, Codec, PlayOptions, RESOLUTIONS, SPEEDS};
+use cattube_core::player::{self, Codec, PlayOptions, RESOLUTIONS};
 use cattube_core::scan::Scan;
 use cattube_core::tube::{Ctx, Effect, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{self as ytc, Details, Page, Tile};
@@ -55,8 +55,8 @@ enum Msg {
     Quiet,
     Images(Vec<(String, Option<egui::ColorImage>)>),
     Tools(Result<String, String>),
-    /// A player ended: its number (see `App::player_seq`) and what it saw.
-    PlaybackDone(u64, yt::Ended),
+    /// A player ended: its number (see `App::player_seq`).
+    PlaybackDone(u64),
     /// That player's current video was hidden behind the browser.
     PlayerHidden(u64, Tile),
     PlayerChanged(u64, Tile),
@@ -623,7 +623,6 @@ impl App {
             }
             SettingRow::Codec => self.prefs.codec = prefs::cycle(&Codec::ALL, self.prefs.codec, d),
             SettingRow::Hdr => self.prefs.hdr = !self.prefs.hdr,
-            SettingRow::Speed => self.prefs.speed = prefs::cycle(&SPEEDS, self.prefs.speed, d),
             SettingRow::Subtitles => self.prefs.subs_on = !self.prefs.subs_on,
             SettingRow::Buffer => {
                 self.prefs.buffer = prefs::cycle(&player::BUFFERS, self.prefs.buffer, d)
@@ -728,7 +727,6 @@ impl App {
             video_id: tile.id.clone(),
             title: tile.title.clone(),
             start,
-            speed: self.prefs.speed,
             max_height: self.prefs.max_height,
             codec: self.prefs.codec,
             hdr: self.prefs.hdr,
@@ -777,9 +775,7 @@ impl App {
                         hctx.request_repaint();
                     })),
                 };
-                let (data, config, quit) =
-                    (self.data.clone(), self.config.clone(), self.quit_after_play);
-                let mut prefs_for_quit = self.prefs.clone();
+                let (data, quit) = (self.data.clone(), self.quit_after_play);
                 yt::spawn_watcher(tile, watcher_player, s, move |ended| {
                     // Where it stopped is saved right here: CatTube's window
                     // may be hidden (behind the TV's own screen), and a hidden
@@ -787,17 +783,10 @@ impl App {
                     save_positions(&data, &ended.positions);
                     // Opened to play this one video: done, close now.
                     if quit {
-                        if let Some(sp) = ended.speed
-                            && SPEEDS.iter().any(|x| (x - sp).abs() < 1e-6)
-                            && (sp - prefs_for_quit.speed).abs() > 1e-6
-                        {
-                            prefs_for_quit.speed = sp;
-                            let _ = prefs::save(&config, &prefs_for_quit);
-                        }
                         let _ = hand_back_screen();
                         std::process::exit(0);
                     }
-                    let _ = tx.send(Msg::PlaybackDone(seq, ended));
+                    let _ = tx.send(Msg::PlaybackDone(seq));
                     rctx.request_repaint();
                 });
             }
@@ -949,7 +938,7 @@ impl App {
                     }
                 }
             }
-            Msg::PlaybackDone(seq, ended) => {
+            Msg::PlaybackDone(seq) => {
                 // An older player (replaced by a newer one): only where it
                 // stopped counts. Its end must not bring CatTube over the
                 // video playing now, or wait for that one to end.
@@ -963,14 +952,6 @@ impl App {
                 let data = self.data.clone();
                 self.jobs
                     .spawn(move || Msg::Positions(player::load_positions(&data)));
-                // The speed picked in the player is kept for the next video.
-                if let Some(sp) = ended.speed
-                    && SPEEDS.iter().any(|x| (x - sp).abs() < 1e-6)
-                    && (sp - self.prefs.speed).abs() > 1e-6
-                {
-                    self.prefs.speed = sp;
-                    self.save_prefs(ctx);
-                }
                 if !current {
                     return;
                 }
