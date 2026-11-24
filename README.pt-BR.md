@@ -89,6 +89,16 @@ dist/cattube-*-"$(uname -m)"/install.sh
 
 Em `aarch64`, o pacote é compilado sem o renderizador `wgpu` (`--no-default-features`), o que deixa o binário cerca de 31% menor. Nesse caso, ele sempre desenha com OpenGL.
 
+### Nome e logo próprios
+
+Para uma compilação só sua, duas variáveis trocam o nome e o logo do app na hora de compilar. Elas valem para o título da janela, o cabeçalho, as Configurações, o atalho e o ícone:
+
+```sh
+CATTUBE_NAME="Meu Tube" CATTUBE_LOGO=/caminho/do/logo.png packaging/tarball.sh
+```
+
+O `CATTUBE_LOGO` precisa ser um PNG. Use um quadrado ou mais largo que alto, com fundo transparente e pelo menos 256 px de altura. No app, ele aparece na altura da marca original e também vira o ícone do atalho. As mesmas variáveis funcionam num `cargo build` comum, mas aí só o app muda. Os pacotes publicados mantêm sempre o nome e a marca do CatTube. Não redistribua uma compilação com o nome ou o logo de outra empresa.
+
 O pacote não inclui `mpv`, `curl` nem Python 3, que precisam estar instalados no aparelho.
 
 Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](https://github.com/yt-dlp/yt-dlp) e do [Deno](https://deno.com) (usando o binário nativo ARM64 em `aarch64`) em `~/.local/share/cattube`, verifica os arquivos e os mantém atualizados automaticamente.
