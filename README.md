@@ -124,8 +124,8 @@ On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.co
 
 | Environment variable | Values | Effect |
 |---|---|---|
-| `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (detected from RAM, GPU and architecture when unset). Among other things, low-power cards use YouTube's 320×180 video pictures (`mqdefault`) instead of the 480×360 letterboxed ones: a third of the pixels to decode, a smaller download, and a sharper card |
 | `CATTUBE_HWDEC` | an mpv `--hwdec` value (`v4l2m2m-copy`, `vaapi`, `no`…) | Forces the video decoder. Unset, a `hwdec=` in your `mpv.conf` (`~/.config/mpv/` or `/etc/mpv/`) is used as is; with neither, low-power devices get `auto-safe` and others mpv's default. `auto-safe` leaves out `v4l2m2m-copy`, which some TV boxes need: set it in `mpv.conf` or here |
+| `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (detected from RAM, GPU and architecture when unset). Among other things, low-power cards use YouTube's 320×180 video pictures (`mqdefault`) instead of the 480×360 letterboxed ones: a third of the pixels to decode, a smaller download, and a sharper card |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Forces UI renderer (defaults to `glow` in `low_power`, `wgpu` otherwise, with automatic fallback when unset) |
 
 To see hardware decoding, dropped frames and memory over the video, turn on **Settings → About → Player statistics**. You can also query `mpv`'s IPC socket at `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` without it) for `hwdec-current` and `frame-drop-count`.

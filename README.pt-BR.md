@@ -124,8 +124,8 @@ Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](http
 
 | Variável de ambiente | Valores | Efeito |
 |---|---|---|
-| `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido). Entre outras coisas, no baixo desempenho os cards usam as imagens de 320×180 do YouTube (`mqdefault`) em vez das de 480×360 com faixas pretas: um terço dos pixels para decodificar, download menor e card mais nítido |
 | `CATTUBE_HWDEC` | um valor de `--hwdec` do mpv (`v4l2m2m-copy`, `vaapi`, `no`…) | Força o decodificador de vídeo. Sem ela, um `hwdec=` no seu `mpv.conf` (`~/.config/mpv/` ou `/etc/mpv/`) é usado como está; sem nenhum dos dois, aparelhos de baixo desempenho recebem `auto-safe` e os demais o padrão do mpv. O `auto-safe` não inclui o `v4l2m2m-copy`, que alguns TV boxes precisam: defina-o no `mpv.conf` ou aqui |
+| `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido). Entre outras coisas, no baixo desempenho os cards usam as imagens de 320×180 do YouTube (`mqdefault`) em vez das de 480×360 com faixas pretas: um terço dos pixels para decodificar, download menor e card mais nítido |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface (padrão `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido) |
 
 Para ver decodificação por hardware, quadros descartados e memória sobre o vídeo, ative **Settings → About → Player statistics**. Também é possível consultar as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` sem essa variável).
