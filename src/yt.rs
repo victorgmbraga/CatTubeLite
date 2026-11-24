@@ -44,36 +44,6 @@ pub fn friendly(t: &str) -> String {
     }
 }
 
-/// Request headers in a private file (0600) for `curl -H @file`.
-fn header_file() -> Result<PathBuf, String> {
-    let h = format!(
-        "Content-Type: application/json\nUser-Agent: {}\nX-YouTube-Client-Name: {}\nX-YouTube-Client-Version: {}\nOrigin: https://www.youtube.com\nReferer: https://www.youtube.com/tv\n",
-        yt::USER_AGENT,
-        yt::CLIENT_NUMBER,
-        yt::CLIENT_VERSION
-    );
-    private_file("headers", &h)
-}
-
-/// A file only this user can read, for what must not be on a command line.
-fn private_file(kind: &str, text: &str) -> Result<PathBuf, String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = cattube_core::env::runtime_dir();
-    let path = dir.join(format!("cattube-{kind}-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("CatTube could not prepare the request ({e})"))?;
-    f.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
 /// Quote a string for `curl -K` config syntax so paths and URLs cannot inject
 /// additional options.
 fn curl_quote(s: &str) -> String {
@@ -90,29 +60,44 @@ fn curl_quote(s: &str) -> String {
     out
 }
 
-/// One request; the header file is removed afterwards.
+/// Connections to YouTube kept open between requests: a new `curl` for
+/// each one paid a process start and a TLS handshake every time (about
+/// 0.1 s on a desktop, more on a TV box).
+static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(TIMEOUT)
+        .max_idle_connections_per_host(4)
+        .user_agent(yt::USER_AGENT)
+        .build()
+});
+
+/// One request to YouTube (or SponsorBlock): a POST of JSON when there is
+/// a `body`, else a GET. The answer's text, or a sentence for the TV.
 fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
-    let h = header_file()?;
-    let mut args: Vec<String> = vec![
-        "-sS".into(),
-        "--compressed".into(),
-        "--fail-with-body".into(),
-        "-m".into(),
-        TIMEOUT.as_secs().to_string(),
-        "-H".into(),
-        format!("@{}", h.display()),
-    ];
-    if let Some(b) = body {
-        args.push("--data-binary".into());
-        args.push(b.into());
+    let request = |method: &str| {
+        AGENT
+            .request(method, url)
+            .set("X-YouTube-Client-Name", yt::CLIENT_NUMBER)
+            .set("X-YouTube-Client-Version", yt::CLIENT_VERSION)
+            .set("Origin", "https://www.youtube.com")
+            .set("Referer", "https://www.youtube.com/tv")
+    };
+    let reply = match body {
+        Some(b) => request("POST")
+            .set("Content-Type", "application/json")
+            .send_string(b),
+        None => request("GET").call(),
+    };
+    match reply {
+        Ok(r) => r.into_string().map_err(|e| friendly(&e.to_string())),
+        Err(ureq::Error::Status(code, _)) => Err(friendly(&format!("http {code}"))),
+        Err(ureq::Error::Transport(t)) => Err(friendly(&match t.kind() {
+            ureq::ErrorKind::Dns => "could not resolve".to_string(),
+            ureq::ErrorKind::ConnectionFailed => "failed to connect".to_string(),
+            _ => t.to_string(),
+        })),
     }
-    args.push("--".into());
-    args.push(url.into());
-    let r = run(&Cmd::new("curl")
-        .args(args)
-        .timeout(TIMEOUT + Duration::from_secs(5)));
-    let _ = std::fs::remove_file(&h);
-    r
 }
 
 // --------------------------------------------------------------- lists
