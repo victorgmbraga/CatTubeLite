@@ -152,7 +152,9 @@ To see hardware decoding, dropped frames and memory over the video, turn on **Se
 
 - `~/.config/cattube/` — settings.
 - `~/.local/share/cattube/` — `yt-dlp`, `deno`, watch history, playback checkpoints, `positions.conf` and recent searches.
-- `~/.cache/cattube/` — cached thumbnails (auto-pruned) and `home.txt`, the last Home: it shows at once on the next start (if under a week old and for the same language and country) while a fresh one loads, and stays if that fails.
+- `~/.cache/cattube/` — cached thumbnails (auto-pruned).
+
+The cache folder also keeps `home.txt`, the last Home: it shows at once on the next start (if under a week old and for the same language and country) while a fresh one loads, and stays if that fails.
 
 ## Credits & thanks
 

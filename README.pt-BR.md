@@ -152,7 +152,9 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 
 - `~/.config/cattube/` — preferências.
 - `~/.local/share/cattube/` — `yt-dlp`, `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes.
-- `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente) e `home.txt`, a última página inicial: ela aparece na hora na próxima abertura (se tiver menos de uma semana e for do mesmo idioma e país) enquanto a nova carrega, e continua na tela se a nova falhar.
+- `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente).
+
+A pasta de cache também guarda `home.txt`, a última página inicial: ela aparece na hora na próxima abertura (se tiver menos de uma semana e for do mesmo idioma e país) enquanto a nova carrega, e continua na tela se a nova falhar.
 
 ## Créditos e agradecimentos
 
