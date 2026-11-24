@@ -116,7 +116,7 @@ O arquivo do logo fica por sua conta: este repositório não traz nenhum logo de
 
 O pacote não inclui `mpv`, `curl` nem Python 3, que precisam estar instalados no aparelho.
 
-Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](https://github.com/yt-dlp/yt-dlp) e do [Deno](https://deno.com) (usando o binário nativo ARM64 em `aarch64`) em `~/.local/share/cattube`, verifica os arquivos e os mantém atualizados automaticamente.
+Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](https://github.com/yt-dlp/yt-dlp) e do [Deno](https://deno.com) (usando o binário nativo ARM64 em `aarch64`) em `~/.local/share/cattube`, verifica os arquivos e os mantém atualizados automaticamente. O yt-dlp também é descompactado ao lado do arquivo único (`yt-dlp.d`, cerca de 16 MB), para que o Python guarde os módulos compilados em vez de compilá-los de novo a cada vídeo; cada vídeo abre mais rápido, cerca de 0,6 s num PC e mais num aparelho de TV.
 
 > Este fork não distribui pacotes Flatpak nem AppImage. Para esses formatos, veja o projeto original, [coderastic/CatTube](https://github.com/coderastic/CatTube).
 
@@ -151,7 +151,7 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 ## Arquivos locais
 
 - `~/.config/cattube/` — preferências.
-- `~/.local/share/cattube/` — `yt-dlp`, `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes.
+- `~/.local/share/cattube/` — `yt-dlp` (e sua cópia descompactada `yt-dlp.d`, com o lançador `yt-dlp-unpacked`), `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes.
 - `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente).
 
 ## Créditos e agradecimentos

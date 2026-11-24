@@ -469,6 +469,7 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
             Err(_) => {}
         }
     }
+    unpack_yt_dlp(data);
     let find = |n: &str| cattube_core::process::find_executable(n);
     if player::js_runtime(data, &find).is_none() {
         // A Deno that cannot run on this device is not fetched again for a day.
@@ -484,6 +485,74 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
         refresh_deno(data, force_update);
     }
     Ok(ytdlp_version(data))
+}
+
+/// Which single-file yt-dlp an unpacked copy came from (kept in it).
+const YT_DLP_SOURCE: &str = ".cattube-source";
+
+/// The single file's size and change time: it changes when yt-dlp updates.
+fn yt_dlp_stamp(zipapp: &Path) -> Option<String> {
+    let meta = std::fs::metadata(zipapp).ok()?;
+    let t = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(format!(
+        "{} {}.{:09}",
+        meta.len(),
+        t.as_secs(),
+        t.subsec_nanos()
+    ))
+}
+
+/// Keep an unpacked copy of yt-dlp next to the single file, made again
+/// when that changes (see [`player::yt_dlp_dir`]). It is unpacked and
+/// tried away from its place and then swapped in; on any failure mpv
+/// simply keeps running the single file.
+fn unpack_yt_dlp(data: &Path) {
+    let zipapp = player::yt_dlp_path(data);
+    let Some(stamp) = yt_dlp_stamp(&zipapp) else {
+        return;
+    };
+    let dir = player::yt_dlp_dir(data);
+    let launcher = player::yt_dlp_launcher(data);
+    let script = player::yt_dlp_launcher_script(data);
+    let current = std::fs::read_to_string(dir.join(YT_DLP_SOURCE)).is_ok_and(|s| s == stamp);
+    if !current {
+        let new = cattube_core::util::unique_tmp_path(&dir, "dir");
+        let ready = std::fs::create_dir(&new).is_ok()
+            && run(&player::unzip_all_cmd(&zipapp, &new)).is_ok()
+            && new.join("__main__.py").is_file()
+            && run(&player::warm_yt_dlp_cmd(&new)).is_ok()
+            && std::fs::write(new.join(YT_DLP_SOURCE), &stamp).is_ok();
+        if !ready {
+            eprintln!("cattube: could not unpack yt-dlp; using the single file");
+            let _ = std::fs::remove_dir_all(&new);
+            return;
+        }
+        let old = cattube_core::util::unique_tmp_path(&dir, "old");
+        let moved_old = dir.exists() && std::fs::rename(&dir, &old).is_ok();
+        if std::fs::rename(&new, &dir).is_err() {
+            if moved_old {
+                let _ = std::fs::rename(&old, &dir);
+            }
+            let _ = std::fs::remove_dir_all(&new);
+            return;
+        }
+        if moved_old {
+            let _ = std::fs::remove_dir_all(&old);
+        }
+    }
+    if std::fs::read_to_string(&launcher).ok().as_deref() != Some(script.as_str()) {
+        let tmp = cattube_core::util::unique_tmp_path(&launcher, "tmp");
+        if std::fs::write(&tmp, &script).is_ok() {
+            set_exec(&tmp);
+            if std::fs::rename(&tmp, &launcher).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
 }
 
 const DENO_CHECKED: &str = "deno.checked";

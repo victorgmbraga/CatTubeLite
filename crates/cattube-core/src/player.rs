@@ -64,6 +64,68 @@ pub fn yt_dlp_path(data: &Path) -> PathBuf {
     data.join("yt-dlp")
 }
 
+/// yt-dlp unpacked from its single-file release. Run from a zip, Python
+/// compiles every module it imports again on each run (about 0.6 s on a
+/// desktop, seconds on a TV box); from a folder it keeps them compiled in
+/// `__pycache__`. The single file stays: it is what updates itself (`-U`).
+pub fn yt_dlp_dir(data: &Path) -> PathBuf {
+    data.join("yt-dlp.d")
+}
+
+/// The script that runs [`yt_dlp_dir`] (mpv needs one program to run).
+pub fn yt_dlp_launcher(data: &Path) -> PathBuf {
+    data.join("yt-dlp-unpacked")
+}
+
+/// The launcher's text: Python running the unpacked folder.
+pub fn yt_dlp_launcher_script(data: &Path) -> String {
+    let dir = yt_dlp_dir(data)
+        .display()
+        .to_string()
+        .replace('\'', "'\\''");
+    format!(
+        "#!/bin/sh\n# yt-dlp unpacked by CatTube, so Python keeps its compiled modules.\nexec python3 '{dir}' \"$@\"\n"
+    )
+}
+
+/// What mpv runs as yt-dlp: the unpacked copy once it is in place, else
+/// the single file.
+pub fn yt_dlp_runner(data: &Path) -> PathBuf {
+    let launcher = yt_dlp_launcher(data);
+    if launcher.is_file() && yt_dlp_dir(data).join("__main__.py").is_file() {
+        launcher
+    } else {
+        yt_dlp_path(data)
+    }
+}
+
+/// Unpack the single-file yt-dlp (a zip) into `dir`.
+pub fn unzip_all_cmd(zip: &Path, dir: &Path) -> Cmd {
+    Cmd::new("python3")
+        .args([
+            "-I".to_string(),
+            "-c".to_string(),
+            "import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])".to_string(),
+            zip.display().to_string(),
+            dir.display().to_string(),
+        ])
+        .timeout(Duration::from_secs(120))
+}
+
+/// Import what playing a YouTube video needs from an unpacked yt-dlp, so
+/// Python compiles it now (in the background) rather than at the first
+/// video. Fails when that copy cannot run.
+pub fn warm_yt_dlp_cmd(dir: &Path) -> Cmd {
+    Cmd::new("python3")
+        .args([
+            "-c".to_string(),
+            "import sys\nsys.path.insert(0, sys.argv[1])\nimport yt_dlp\ntry:\n  yt_dlp.YoutubeDL({'quiet': True}).get_info_extractor('Youtube')\nexcept Exception:\n  pass\nprint(yt_dlp.version.__version__)"
+                .to_string(),
+            dir.display().to_string(),
+        ])
+        .timeout(Duration::from_secs(180))
+}
+
 pub fn own_deno_path(data: &Path) -> PathBuf {
     data.join("deno")
 }
@@ -342,7 +404,7 @@ pub fn mpv_argv(
         .take(6)
         .collect();
     let mut opts = vec![
-        format!("ytdl_hook-ytdl_path={}", yt_dlp_path(data).display()),
+        format!("ytdl_hook-ytdl_path={}", yt_dlp_runner(data).display()),
         "ytdl_hook-try_ytdl_first=yes".to_string(),
     ];
     if accent.len() == 6 {
@@ -759,6 +821,27 @@ mod tests {
             Some(format!("deno:{}", deno.display()))
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mpv_runs_the_unpacked_yt_dlp_once_it_is_in_place() {
+        let root = std::env::temp_dir().join(format!("cattube-ytu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(yt_dlp_runner(&root), yt_dlp_path(&root));
+        std::fs::write(yt_dlp_launcher(&root), yt_dlp_launcher_script(&root)).unwrap();
+        // A launcher without its folder (an interrupted unpack) is not used.
+        assert_eq!(yt_dlp_runner(&root), yt_dlp_path(&root));
+        std::fs::create_dir_all(yt_dlp_dir(&root)).unwrap();
+        std::fs::write(yt_dlp_dir(&root).join("__main__.py"), "").unwrap();
+        assert_eq!(yt_dlp_runner(&root), yt_dlp_launcher(&root));
+        let _ = std::fs::remove_dir_all(root);
+        // The folder is quoted for the shell, even with a quote in it.
+        let s = yt_dlp_launcher_script(Path::new("/home/o'neil/d"));
+        assert!(
+            s.ends_with("exec python3 '/home/o'\\''neil/d/yt-dlp.d' \"$@\"\n"),
+            "{s}"
+        );
     }
 
     #[test]

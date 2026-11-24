@@ -116,7 +116,7 @@ The logo file is yours to supply: this repository ships no third-party logo. Do 
 
 The package does not bundle `mpv`, `curl` or Python 3, so they must be installed on the device.
 
-On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [Deno](https://deno.com) (using the native ARM64 build on `aarch64`) into `~/.local/share/cattube`, verifies them, and keeps them updated automatically.
+On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [Deno](https://deno.com) (using the native ARM64 build on `aarch64`) into `~/.local/share/cattube`, verifies them, and keeps them updated automatically. yt-dlp is also unpacked next to its single-file release (`yt-dlp.d`, about 16 MB), so Python keeps its modules compiled instead of compiling them again for every video; this makes each video start faster, by about 0.6 s on a desktop and by more on a TV box.
 
 > This fork does not ship Flatpak or AppImage packages. For those, see the original project, [coderastic/CatTube](https://github.com/coderastic/CatTube).
 
@@ -151,7 +151,7 @@ To see hardware decoding, dropped frames and memory over the video, turn on **Se
 ## Your files
 
 - `~/.config/cattube/` — settings.
-- `~/.local/share/cattube/` — `yt-dlp`, `deno`, watch history, playback checkpoints, `positions.conf` and recent searches.
+- `~/.local/share/cattube/` — `yt-dlp` (and its unpacked copy `yt-dlp.d` with the `yt-dlp-unpacked` launcher), `deno`, watch history, playback checkpoints, `positions.conf` and recent searches.
 - `~/.cache/cattube/` — cached thumbnails (auto-pruned).
 
 ## Credits & thanks
