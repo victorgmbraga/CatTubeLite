@@ -124,7 +124,7 @@ On first start, CatTubeLite downloads its own copy of [yt-dlp](https://github.co
 
 | Environment variable | Values | Effect |
 |---|---|---|
-| `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (detected from RAM, GPU and architecture when unset) |
+| `CATTUBE_LOW_POWER` | `1` / `0` | Forces low-power or standard profile (detected from RAM, GPU and architecture when unset). Among other things, low-power cards use YouTube's 320×180 video pictures (`mqdefault`) instead of the 480×360 letterboxed ones: a third of the pixels to decode, a smaller download, and a sharper card |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Forces UI renderer (defaults to `glow` in `low_power`, `wgpu` otherwise, with automatic fallback when unset) |
 
 To see hardware decoding, dropped frames and memory over the video, turn on **Settings → About → Player statistics**. You can also query `mpv`'s IPC socket at `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` without it) for `hwdec-current` and `frame-drop-count`.

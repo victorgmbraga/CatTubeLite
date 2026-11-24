@@ -186,10 +186,35 @@ fn best_thumb(v: Option<&Json>) -> String {
     }
 }
 
-/// `i.ytimg.com` pictures are JPEG and WebP; the same picture as a plain
-/// medium JPEG (what the tiles draw), without the signed resizing query.
+/// Smaller video pictures for TV boxes (`low_power`), set at start.
+static SMALL_PICTURES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Draw cards from the smaller video pictures (see [`video_thumb`]).
+pub fn use_small_pictures(on: bool) {
+    SMALL_PICTURES.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A video's picture for its card: a plain JPEG from `i.ytimg.com`,
+/// without the signed resizing query. `hqdefault` (480×360, the video
+/// letterboxed in it); with small pictures `mqdefault` (320×180, no bars),
+/// which a TV box draws sharper (its cards take pictures up to 320 px, so
+/// hqdefault is halved) from a third of the pixels and a smaller download.
 pub fn video_thumb(id: &str) -> String {
-    format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg")
+    video_thumb_sized(
+        id,
+        SMALL_PICTURES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// [`video_thumb`] at the larger size, whatever the device (the player's
+/// row of related videos draws them bigger than the cards).
+pub fn video_thumb_hq(id: &str) -> String {
+    video_thumb_sized(id, false)
+}
+
+fn video_thumb_sized(id: &str, small: bool) -> String {
+    let name = if small { "mqdefault" } else { "hqdefault" };
+    format!("https://i.ytimg.com/vi/{id}/{name}.jpg")
 }
 
 pub fn is_video_id(s: &str) -> bool {
@@ -839,6 +864,22 @@ mod tests {
     fn fixture(name: &str) -> String {
         let p = format!("{}/testdata/{name}.json", env!("CARGO_MANIFEST_DIR"));
         std::fs::read_to_string(p).expect("fixture")
+    }
+
+    #[test]
+    fn small_pictures_are_the_plain_16_9_jpeg() {
+        assert_eq!(
+            video_thumb_sized("dQw4w9WgXcQ", false),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg"
+        );
+        assert_eq!(
+            video_thumb_sized("dQw4w9WgXcQ", true),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+        );
+        assert_eq!(
+            video_thumb_hq("dQw4w9WgXcQ"),
+            video_thumb_sized("dQw4w9WgXcQ", false)
+        );
     }
 
     #[test]
