@@ -87,7 +87,8 @@ pub const ACCENTS: &[(&str, Rgb)] = &[
     ("green", (74, 222, 128)),
     ("amber", (251, 191, 36)),
     ("rose", (251, 113, 133)),
-    ("red", (248, 102, 102)),
+    // The red of YouTube's own logo (#FF0000).
+    ("red", (255, 0, 0)),
     ("silver", (214, 220, 232)),
 ];
 
