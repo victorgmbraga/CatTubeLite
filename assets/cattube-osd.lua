@@ -14,8 +14,8 @@
 --   controls shown:   Left / Right    move over the buttons: Previous /
 --                                     Next video on the left (when there
 --                                     is one), −10 s / Pause / +10 s in the
---                                     middle, Quality / Comments /
---                                     Subtitles / Audio right
+--                                     middle, Quality / Subtitles /
+--                                     Audio right
 --                     OK              press the button (Pause first)
 --                     Up              focus the seek bar: Left / Right scrub
 --                                     (10 s, 60 s when held), Down returns
@@ -99,9 +99,6 @@ local function seek(secs)
 end
 
 local open_menu -- defined below (the buttons table refers to it)
-local open_comments -- likewise
-local toggle_chat -- likewise
-local chat_on = false -- a live video's chat shows on the right
 
 local function episode(which)
     checkpoint(true, false)
@@ -111,8 +108,6 @@ end
 -- Three groups: episodes on the left, playback in the middle, tracks on
 -- the right. The episode buttons show only when there is one
 -- (`cattube-episodes PREV NEXT`, each "yes" or "no").
--- Shown for a live video with a chat (`cattube-chat-available yes`).
-local chat_button = { label = "Chat", group = "track", hidden = true, act = function() toggle_chat() end }
 local pause_button = { label = "Pause", group = "play", act = function() mp.commandv("cycle", "pause") end }
 local buttons = {
     { label = "Previous video",   group = "ep", hidden = true, act = function() episode("prev") end },
@@ -121,8 +116,6 @@ local buttons = {
     pause_button,
     { label = "+10 s",            group = "play", act = function() seek(10) end },
     { label = "Quality",          group = "track", act = function() open_menu("quality") end },
-    { label = "Comments",         group = "track", act = function() open_comments() end },
-    chat_button,
     { label = "Subtitles",        group = "track", act = function() open_menu("sub") end },
     { label = "Audio",            group = "track", act = function() open_menu("audio") end },
 }
@@ -182,19 +175,13 @@ local function text_width(label, size)
     return #label * size * 0.52
 end
 
-local render_menu, render_card, render_chat, render_related, render_volume -- below
+local render_menu, render_card, render_related, render_volume -- below
 local vol = nil
 local related = nil -- related browser: { items, index, loading, request }
 
 -- Everything drawn goes through here, so the Up next card is drawn
 -- over whatever else shows.
 local function set_osd(text)
-    -- The chat goes under everything else, and steps aside for a menu.
-    if chat_on and render_chat and not menu and not related then
-        local c = assdraw.ass_new()
-        render_chat(c)
-        text = c.text .. (text ~= "" and ("\n" .. text) or "")
-    end
     if related and render_related then
         local c = assdraw.ass_new()
         render_related(c)
@@ -389,8 +376,7 @@ local function render()
     a:append(string.format("{\\an9\\pos(1800,898)\\bord0\\shad0\\fs30\\1c&HFFFFFF&\\1a&H30&}%s", clock(dur)))
     -- Buttons: episodes from the left edge, playback centred, tracks to
     -- the right edge.
-    -- Smaller when they would not fit side by side (both video buttons,
-    -- the chat button).
+    -- Smaller when they would not fit side by side (both video buttons).
     local size, pad, gap, bh = 28, 40, 16, 60
     local shown_buttons = visible_buttons()
     local widths, group_w
@@ -532,7 +518,6 @@ open_menu = function(kind)
 end
 
 local function menu_pick()
-    if menu.kind == "comments" then return end
     local it = menu.items[menu.index]
     if not it then menu = nil; render(); return end
     if menu.kind == "quality" then
@@ -547,52 +532,6 @@ local function menu_pick()
     end
     menu = nil
     render()
-end
-
--- ------------------------------------------------------------ comments
-
--- A video's comments, fetched by CatTube page by page ("cattube-comments
--- first|<token>" → "cattube-comments-data <json>").
-
-local comments = { path = nil, items = {}, more = "", loading = false, error = nil }
-
-local function comments_request(arg)
-    comments.loading = true
-    mp.commandv("script-message", "cattube-comments", arg)
-end
-
-mp.register_script_message("cattube-comments-data", function(json)
-    comments.loading = false
-    local d = utils.parse_json(json or "")
-    if not d then
-        comments.error = "YouTube didn't answer properly"
-    elseif d.error then
-        comments.error = d.error
-    else
-        for _, c in ipairs(d.list or {}) do
-            comments.items[#comments.items + 1] = c
-        end
-        comments.more = d.more or ""
-        comments.error = nil
-    end
-    if menu and menu.kind == "comments" then render() end
-end)
-
-open_comments = function()
-    local path = mp.get_property("path", "")
-    if comments.path ~= path then
-        comments = { path = path, items = {}, more = "", loading = false, error = nil }
-        comments_request("first")
-    end
-    menu = { kind = "comments", items = comments.items, index = 1 }
-    render()
-end
-
--- Near the end of the list: the next page.
-local function comments_moved()
-    if menu.index >= #menu.items - 2 and comments.more ~= "" and not comments.loading then
-        comments_request(comments.more)
-    end
 end
 
 -- Characters on screen (UTF-8 continuation bytes do not count).
@@ -627,136 +566,8 @@ local function wrap(t, size, width, max)
     return out
 end
 
-local function render_comments(a)
-    local px, py, pw, ph = 1160, 60, 700, 740
-    a:new_event()
-    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H101018&\\1a&H20&}")
-    a:draw_start()
-    rect(a, px, py, pw, ph, 22)
-    a:draw_stop()
-    a:new_event()
-    a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs34\\b1\\1c&HFFFFFF&\\1a&H00&}Comments", px + 32, py + 28))
-    local n = #menu.items
-    local function note(text)
-        a:new_event()
-        a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs26\\1c&HFFFFFF&\\1a&H50&}%s", px + 32, py + 100, text))
-    end
-    if n == 0 then
-        note(comments.error and comments.error:gsub("[{}\\]", "") or "Loading comments…")
-        return
-    end
-    a:new_event()
-    a:append(string.format("{\\an9\\pos(%d,%d)\\bord0\\shad0\\fs22\\1c&HFFFFFF&\\1a&H60&}%d / %d%s",
-        px + pw - 28, py + 40, menu.index, n, comments.more ~= "" and "+" or ""))
-    local y, bottom = py + 96, py + ph - 24
-    local tw = pw - 88
-    for i = menu.index, n do
-        local c = menu.items[i]
-        local text = (c.t or ""):gsub("[{}\\]", "")
-        local lines = wrap(text, 24, tw, i == menu.index and 9 or 4)
-        local h = 36 + #lines * 32 + 22
-        if y + h > bottom and i > menu.index then break end
-        if i == menu.index then
-            a:new_event()
-            a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c" .. ACCENT .. "\\1a&H00&}")
-            a:draw_start()
-            rect(a, px + 24, y + 2, 6, h - 24, 3)
-            a:draw_stop()
-        end
-        local meta = (c.p or "")
-        if c.l and c.l ~= "" then meta = meta .. "  ·  " .. c.l .. " likes" end
-        if c.r and c.r > 0 then meta = meta .. "  ·  " .. c.r .. (c.r == 1 and " reply" or " replies") end
-        a:new_event()
-        a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs24\\b1\\1c&HFFFFFF&\\1a&H00&}%s{\\b0\\1a&H70&}   %s",
-            px + 48, y, (c.a or ""):gsub("[{}\\]", ""), meta:gsub("[{}\\]", "")))
-        for li, line in ipairs(lines) do
-            a:new_event()
-            a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs24\\1c&HFFFFFF&\\1a&H%s&}%s",
-                px + 48, y + 4 + li * 32, i == menu.index and "00" or "40", line))
-        end
-        y = y + h
-        if y > bottom then break end
-    end
-    if comments.loading then
-        a:new_event()
-        a:append(string.format("{\\an1\\pos(%d,%d)\\bord0\\shad0\\fs22\\1c&HFFFFFF&\\1a&H60&}Loading more…", px + 48, py + ph - 12))
-    end
-end
-
--- ------------------------------------------------------------ live chat
-
--- Messages arrive from CatTube while the chat is on
--- ("cattube-chat-data [{a, t, p}]"), newest last.
-local chat_messages = {}
-
-mp.register_script_message("cattube-chat-available", function(yes)
-    chat_button.hidden = yes ~= "yes"
-    if yes ~= "yes" then
-        chat_on = false
-        chat_button.label = "Chat"
-        chat_messages = {}
-    end
-    render()
-end)
-
-mp.register_script_message("cattube-chat-data", function(json)
-    for _, m in ipairs(utils.parse_json(json or "") or {}) do
-        chat_messages[#chat_messages + 1] = m
-    end
-    while #chat_messages > 60 do table.remove(chat_messages, 1) end
-    if chat_on then render() end
-end)
-
-toggle_chat = function()
-    chat_on = not chat_on
-    chat_button.label = chat_on and "Hide chat" or "Chat"
-    mp.commandv("script-message", "cattube-chat", chat_on and "on" or "off")
-    render()
-end
-
-render_chat = function(a)
-    local px, pw, top = 1400, 460, 80
-    local bottom = shown and 740 or 1010
-    -- Newest at the bottom: lay out from the end upwards.
-    local blocks, y = {}, bottom - 20
-    for i = #chat_messages, 1, -1 do
-        local m = chat_messages[i]
-        local author = (m.a or ""):gsub("[{}\\]", "")
-        local paid = (m.p or "") ~= "" and ("  " .. m.p:gsub("[{}\\]", "")) or ""
-        local lines = wrap(author .. paid .. "  " .. (m.t or ""):gsub("[{}\\]", ""), 22, pw - 48, 3)
-        local h = #lines * 30 + 10
-        if y - h < top + 20 then break end
-        y = y - h
-        blocks[#blocks + 1] = { y = y, lines = lines, author = author .. paid }
-    end
-    a:new_event()
-    a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H101018&\\1a&H50&}")
-    a:draw_start()
-    rect(a, px, top, pw, bottom - top, 20)
-    a:draw_stop()
-    if #blocks == 0 then
-        a:new_event()
-        a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs22\\1c&HFFFFFF&\\1a&H60&}Waiting for the chat…", px + 24, top + 24))
-        return
-    end
-    for _, b in ipairs(blocks) do
-        for li, line in ipairs(b.lines) do
-            a:new_event()
-            if li == 1 and line:sub(1, #b.author) == b.author then
-                -- The author in the accent colour, the message in white.
-                a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs22\\b1\\1c%s\\1a&H00&}%s{\\b0\\1c&HFFFFFF&}%s",
-                    px + 24, b.y + (li - 1) * 30, ACCENT, b.author, line:sub(#b.author + 1)))
-            else
-                a:append(string.format("{\\an7\\pos(%d,%d)\\bord0\\shad0\\fs22\\1c&HFFFFFF&\\1a&H00&}%s",
-                    px + 24, b.y + (li - 1) * 30, line))
-            end
-        end
-    end
-end
-
 -- The list panel on the right (drawn over the bar).
 render_menu = function(a)
-    if menu.kind == "comments" then return render_comments(a) end
     local px, py, pw = 1300, 140, 540
     local rh, visible = 66, 9
     local n = #menu.items
@@ -1475,11 +1286,6 @@ local function on_up()
     notify()
     if card then return end
     if related_key("up") then return end
-    if menu and menu.kind == "comments" then
-        menu.index = math.max(1, menu.index - 1)
-        render()
-        return
-    end
     if menu then
         menu.index = math.max(1, menu.index - 1)
         render()
@@ -1503,12 +1309,6 @@ local function on_down()
     notify()
     if card then return end
     if related_key("down") then return end
-    if menu and menu.kind == "comments" then
-        menu.index = math.max(1, math.min(#menu.items, menu.index + 1))
-        comments_moved()
-        render()
-        return
-    end
     if menu then
         menu.index = math.min(#menu.items, menu.index + 1)
         render()

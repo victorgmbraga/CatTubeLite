@@ -22,7 +22,6 @@ use cattube_core::scan::Scan;
 use cattube_core::tube::{self, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{Kind, Page, Tile};
 use eframe::egui::{self, Align2, Color32, Rect};
-use std::collections::HashMap;
 
 type C = Canvas<Target>;
 
@@ -52,7 +51,6 @@ pub struct View<'a> {
     pub prefs: &'a Prefs,
     pub pics: &'a Images,
     pub positions: &'a [(String, f64)],
-    pub votes: &'a HashMap<String, (u64, u64)>,
     pub tools: &'a Scan<String>,
     pub yt_dlp_ready: bool,
     pub now: f64,
@@ -128,7 +126,6 @@ pub fn draw(c: &C, v: &View) {
             let panel = c.opacity(menu_t).translated(0.0, 14.0 * (1.0 - menu_t));
             draw_menu(&panel, v, tile, details, *index);
         }
-        Some(Screen::TvCode { code }) => draw_tv_code(c, v, code),
         Some(Screen::Settings { index, groups }) => draw_settings(c, v, *index, *groups),
     }
     if matches!(
@@ -1077,13 +1074,6 @@ fn draw_menu(
             facts.push(d.date.clone());
         }
     }
-    if let Some((likes, dislikes)) = v.votes.get(&tile.id) {
-        facts.push(format!(
-            "👍 {}  👎 {}",
-            community::short_count(*likes),
-            community::short_count(*dislikes)
-        ));
-    }
     c.text(
         mx + 244.0,
         my + 112.0,
@@ -1111,121 +1101,6 @@ fn draw_menu(
         c.hit(r, Target::Tube(0, i));
         y += 56.0;
     }
-}
-
-/// The phone remote's "Link with TV code" screen: where to type the code
-/// on the phone, and the code in four groups of three.
-fn draw_tv_code(c: &C, v: &View, code: &Scan<String>) {
-    backdrop(c, v, None);
-    let panel = c.r(220.0, 90.0, 840.0, 540.0);
-    c.glass(panel, 32.0);
-    let k = ease(c, "tube-tv-code", 0.4);
-    icons::draw(c, "phone", 640.0, 150.0, 40.0, theme::accent());
-    c.text(
-        640.0,
-        204.0,
-        Align2::CENTER_CENTER,
-        tr("Link your phone"),
-        28.0,
-        theme::text(),
-        Weight::Semibold,
-    );
-    match code {
-        Scan::Done(codes) if !codes.is_empty() => {
-            c.text(
-                640.0,
-                252.0,
-                Align2::CENTER_CENTER,
-                tr("In the YouTube app on your phone, open Settings → Watch on TV"),
-                18.0,
-                theme::text2(),
-                Weight::Regular,
-            );
-            c.text(
-                640.0,
-                280.0,
-                Align2::CENTER_CENTER,
-                tr("→ Link with TV code, and enter"),
-                18.0,
-                theme::text2(),
-                Weight::Regular,
-            );
-            let digits: Vec<char> = codes[0].chars().collect();
-            let (bw, gap, group_gap) = (46.0, 8.0, 26.0);
-            let total = 12.0 * bw + 8.0 * gap + 3.0 * group_gap;
-            let mut x = 640.0 - total / 2.0;
-            for (i, ch) in digits.iter().enumerate() {
-                if i > 0 {
-                    x += if i % 3 == 0 { group_gap } else { gap };
-                }
-                let ki = (k * 1.6 - i as f32 * 0.04).clamp(0.0, 1.0);
-                let r = c.r(x, 330.0 - 12.0 * (1.0 - ki), bw, 70.0);
-                c.fill(r, 14.0, theme::rgba(theme::WHITE, (18.0 * ki) as u8));
-                c.top_highlight(r, 14.0, theme::rgba(theme::WHITE, (140.0 * ki) as u8));
-                c.outline(r, 14.0, 1.0, theme::rgba(theme::WHITE, (40.0 * ki) as u8));
-                let (cx, cy) = c.to_design(r.center());
-                c.text(
-                    cx,
-                    cy,
-                    Align2::CENTER_CENTER,
-                    &ch.to_string(),
-                    34.0,
-                    theme::rgba(theme::INK, (255.0 * ki) as u8),
-                    Weight::Semibold,
-                );
-                x += bw;
-            }
-            c.text(
-                640.0,
-                444.0,
-                Align2::CENTER_CENTER,
-                tr("Then pick a video on the phone: it plays here, and the phone stays in step."),
-                16.0,
-                theme::text3(),
-                Weight::Regular,
-            );
-            c.text(
-                640.0,
-                472.0,
-                Align2::CENTER_CENTER,
-                tr("The code changes every few minutes. A linked phone stays linked."),
-                16.0,
-                theme::text3(),
-                Weight::Regular,
-            );
-        }
-        Scan::Failed(e) => {
-            icons::draw(c, "refresh", 640.0, 360.0, 30.0, theme::text3());
-            c.text(
-                640.0,
-                410.0,
-                Align2::CENTER_CENTER,
-                e,
-                19.0,
-                theme::text2(),
-                Weight::Medium,
-            );
-            c.text(
-                640.0,
-                442.0,
-                Align2::CENTER_CENTER,
-                tr("Press OK to try again"),
-                16.0,
-                theme::text3(),
-                Weight::Regular,
-            );
-        }
-        _ => widgets::busy_line(c, 545.0, 360.0, tr("Getting a code…"), true, v.now),
-    }
-    c.text(
-        640.0,
-        590.0,
-        Align2::CENTER_CENTER,
-        tr("OK for a new code · Back to close"),
-        15.0,
-        theme::text3(),
-        Weight::Regular,
-    );
 }
 
 fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
@@ -1409,13 +1284,6 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                     "",
                 )
             }
-            SettingRow::LinkPhone => (
-                tr("Link a phone").into(),
-                tr("Pick and control videos from the YouTube app").into(),
-                String::new(),
-                RowKind::Action,
-                "phone",
-            ),
             SettingRow::PlayerStats => (
                 tr("Player statistics").into(),
                 tr("Decoder, dropped frames and memory over the video").into(),

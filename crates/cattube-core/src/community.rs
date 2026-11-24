@@ -1,11 +1,9 @@
 //! Community data next to YouTube's own: SponsorBlock
-//! (segments to skip: sponsors, intros, …) and Return YouTube Dislike
-//! (the dislike count YouTube no longer shows).
+//! (segments to skip: sponsors, intros, …).
 //!
 //! | What | Request |
 //! |---|---|
 //! | segments | `GET https://sponsor.ajay.app/api/skipSegments?videoID=…&categories=[…]` (404 = none) |
-//! | votes | `GET https://returnyoutubedislikeapi.com/votes?videoId=…` |
 
 use crate::mpv::{Json, parse_json};
 
@@ -117,38 +115,6 @@ pub fn skip_at(
         .map(|s| (s.end, s.category.clone()))
 }
 
-pub fn votes_url(video_id: &str) -> String {
-    format!("https://returnyoutubedislikeapi.com/votes?videoId={video_id}")
-}
-
-/// (likes, dislikes).
-pub fn parse_votes(body: &str) -> Option<(u64, u64)> {
-    let v = parse_json(body.trim())?;
-    Some((
-        v.get("likes")?.as_f64()? as u64,
-        v.get("dislikes")?.as_f64()? as u64,
-    ))
-}
-
-/// "1.2K", "34M".
-pub fn short_count(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => trim_one(n as f64 / 1e3, "K"),
-        1_000_000..1_000_000_000 => trim_one(n as f64 / 1e6, "M"),
-        _ => trim_one(n as f64 / 1e9, "B"),
-    }
-}
-
-fn trim_one(x: f64, unit: &str) -> String {
-    if x >= 10.0 {
-        format!("{}{unit}", x.floor() as u64)
-    } else {
-        let s = format!("{:.1}", (x * 10.0).floor() / 10.0);
-        format!("{}{unit}", s.trim_end_matches(".0"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,18 +154,5 @@ mod tests {
         assert_eq!(skip_at(&s, 89.8, Some(90.5), &[]), None);
         assert!(parse_segments("Not Found").is_empty());
         assert_eq!(category_label("selfpromo"), "Unpaid or self promotion");
-    }
-
-    #[test]
-    fn votes_and_counts() {
-        assert_eq!(
-            parse_votes(r#"{"id":"x","likes":12345,"dislikes":678,"rating":4.8,"viewCount":1}"#),
-            Some((12345, 678))
-        );
-        assert_eq!(short_count(999), "999");
-        assert_eq!(short_count(1_234), "1.2K");
-        assert_eq!(short_count(1_000), "1K");
-        assert_eq!(short_count(45_600), "45K");
-        assert_eq!(short_count(3_400_000), "3.4M");
     }
 }
