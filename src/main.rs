@@ -59,6 +59,9 @@ enum Msg {
 const SUGGEST_DEBOUNCE: Duration = Duration::from_millis(200);
 /// Shown when a background job crashed instead of answering.
 const JOB_FAILED: &str = "Something went wrong, try again";
+/// The longest the app shows its own "opening" screen for a video: the
+/// player's window normally covers it well before.
+const OPENING_MAX: Duration = Duration::from_secs(10);
 
 enum PendingSuggest {
     Ready(String),
@@ -79,6 +82,11 @@ struct App {
     pointer_at: Option<egui::Pos2>,
     /// Fading out before handing the screen back to CatosTV.
     closing: Option<Instant>,
+    /// A video is opening: since when. The player (mpv) takes a moment to
+    /// start and show its window, its own spinner on black; until then the
+    /// app shows the same, so OK answers at once. Ends when the player's
+    /// window takes the focus, the player goes, or after [`OPENING_MAX`].
+    opening: Option<Instant>,
     hits: Vec<(egui::Rect, Target)>,
     images: images::Images,
     fetching: HashSet<String>,
@@ -142,6 +150,7 @@ impl App {
             pointer: pointer::Pointer::new(),
             pointer_at: None,
             closing: None,
+            opening: None,
             hits: Vec::new(),
             images: images::Images::new(low_power),
             fetching: HashSet::new(),
@@ -565,6 +574,8 @@ impl App {
         self.yt_dlp_ready = true;
         match yt::start_player(&o, &self.data) {
             Ok(child) => {
+                self.opening = Some(Instant::now());
+                ctx.request_repaint();
                 let watcher_player = child.clone();
                 self.player = Some(child);
                 self.player_seq += 1;
@@ -695,6 +706,7 @@ impl App {
             }
             Msg::PlayerHidden(seq, tile) => {
                 if seq == self.player_seq && self.player.is_some() {
+                    self.opening = None;
                     let data = self.data.clone();
                     self.jobs
                         .spawn(move || Msg::Positions(player::load_positions(&data)));
@@ -712,6 +724,9 @@ impl App {
                 // stopped counts. Its end must not bring CatTube over the
                 // video playing now, or wait for that one to end.
                 let current = seq == self.player_seq;
+                if current {
+                    self.opening = None;
+                }
                 if current && let Some(p) = self.player.take() {
                     p.reap_or_kill(Duration::from_millis(200));
                     self.now_playing = None;
@@ -860,11 +875,19 @@ impl eframe::App for App {
             self.mapper.reset();
         }
         self.was_focused = focused;
+        // The player's window is up (it has the focus now), or it never
+        // came: the list shows again.
+        if self
+            .opening
+            .is_some_and(|since| !focused || since.elapsed() > OPENING_MAX)
+        {
+            self.opening = None;
+        }
         let now = keys::now(&ctx);
         let events = keys::collect(&ctx);
         let mut actions = self.mapper.map(&events, now, self.tube.text_mode());
         let mut p = self.pointer.collect(&ctx);
-        if self.closing.is_some() {
+        if self.closing.is_some() || self.opening.is_some() {
             actions.clear();
             p = Default::default();
         }
@@ -961,6 +984,20 @@ impl eframe::App for App {
                 left.min(0.016)
             };
             ctx.request_repaint_after(Duration::from_secs_f32(next));
+        }
+        if let Some(since) = self.opening {
+            // The player's loading screen, as `cattube-osd.lua` draws it
+            // (1080p arc of radius 31, width 6, in the 720p design space),
+            // timed from the same start, so the handover does not show.
+            ui.painter()
+                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            widgets::spinner(
+                &canvas,
+                640.0,
+                360.0,
+                31.0 * 2.0 / 3.0,
+                since.elapsed().as_secs_f64(),
+            );
         }
         self.hits = canvas.take_hits();
         self.images.trim();
