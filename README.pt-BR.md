@@ -10,7 +10,7 @@
 
 Um fork leve do [CatTube](https://github.com/coderastic/CatTube) — aplicativo nativo de YouTube para Linux feito para TVs e controles remotos — otimizado para TV boxes Linux ARM64 com hardware limitado (como o BTV9 com GPU Mali-450 e 1–2 GiB de RAM), mantendo compatibilidade total com desktops Linux.
 
-Assim como o CatTube original, abre em tela cheia, funciona com setas, OK e Voltar no controle remoto ou teclado (e controles de videogame no CatosTV), não exibe anúncios e reproduz vídeos via `mpv` com SponsorBlock, Return YouTube Dislike, pareamento pelo celular, comentários e chat ao vivo.
+Assim como o CatTube original, abre em tela cheia, funciona com setas, OK e Voltar no controle remoto ou teclado (e controles de videogame no CatosTV), não exibe anúncios e reproduz vídeos via `mpv` com SponsorBlock. Este fork tira o que depende de conta do YouTube ou do celular: login, comentários, chat ao vivo, contagem de dislikes e controle pelo celular.
 
 ## O que mudou neste fork
 
@@ -32,19 +32,20 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 - **Pool limitado de workers:** substitui a criação ilimitada de threads por tarefa por um pool fixo (`4` workers em `low_power`, `8` padrão).
 - **Download de thumbnails em lote:** baixa thumbnails ausentes em lote com `curl --parallel`, reaproveitando conexões HTTP/2 + TLS.
 - **Debounce real na busca e E/S não bloqueante:** debounce real de 200 ms no timer de UI com cancelamento por geração nas sugestões de busca; carregamento assíncrono de Histórico e posições fora da thread de UI com merge de checkpoints em `O(N)`; e substituição do polling de 10 ms em subprocessos por espera orientada a EOF com limite de buffer e proteção contra descritores herdados por processos filhos.
-- **Daemon `--remote` mais econômico:** intervalo de 1 s (em vez de 200 ms) quando o casting está desativado, verificação de atualização do `yt-dlp` em segundo plano quando já instalado e throttle de 1 Hz no polling de estado do `mpv`.
 
 ### Estabilidade, compatibilidade e persistência atômica
-- **Ciclo de vida e IPC do `mpv` endurecidos:** `PlayerHandle` compartilhado com detecção precoce de saída e `reap_or_kill` com limite de tempo, correção de leituras parciais e EOF no `IpcConn`, fallbacks para versões mais antigas do `mpv` (`loadfile` `< 0.38` e `overlay-add` `< 0.39`), escape ASS e truncamento UTF-8 seguro no OSD, correção da largura da miniatura de *Up Next* (`256 px`) e guardas de geração para chat ao vivo e comentários.
+- **Ciclo de vida e IPC do `mpv` endurecidos:** `PlayerHandle` compartilhado com detecção precoce de saída e `reap_or_kill` com limite de tempo, correção de leituras parciais e EOF no `IpcConn`, fallbacks para versões mais antigas do `mpv` (`loadfile` `< 0.38` e `overlay-add` `< 0.39`), escape ASS e truncamento UTF-8 seguro no OSD e correção da largura da miniatura de *Up Next* (`256 px`).
 - **Correções de bugs:** elimina panics ao encolher sugestões de busca ou redimensionar thumbnails com proporções extremas, evita travar o teclado em buscas vazias, corrige o pulo de outros do SponsorBlock no fim do vídeo, corrige a primeira execução com `--play` e salvamento de velocidade ao sair, evita sobrescrita de contas reais ao atualizar perfil, corrige arredondamento em `views_text` e completa traduções do menu de vídeo, selo `LIVE` e idioma das sugestões.
-- **Escritas atômicas:** grava pareamento remoto, checkpoints, `positions.conf` mesclado, histórico de buscas, backdrops borrados e downloads de ferramentas usando arquivos temporários únicos e `rename` atômico. Configurações e pareamento remoto também são forçados para o disco e resistem a uma queda de energia.
-- **Um player por vez:** o app e o daemon `--remote` se coordenam pelo socket do `mpv`. Quem inicia um vídeo salva a posição atual e fecha antes o player do outro.
+- **Escritas atômicas:** grava checkpoints, `positions.conf` mesclado, histórico de buscas, backdrops borrados e downloads de ferramentas usando arquivos temporários únicos e `rename` atômico. As configurações também são forçadas para o disco e resistem a uma queda de energia.
+- **Um player por vez:** os processos do CatTube (o app, `--play`) se coordenam pelo socket do `mpv`. Quem inicia um vídeo salva a posição atual e fecha antes o player do outro.
 - **Ferramentas verificadas:** `yt-dlp` e Deno são conferidos com o SHA-256 publicado antes do uso. O Deno é instalado de forma atômica, testado antes de ser ativado, reparado após uma instalação interrompida e verificado para atualização a cada 30 dias.
 - **Tarefas em segundo plano resilientes:** uma tarefa que falha não derruba mais o worker, e a tela que a aguardava mostra um erro em vez de ficar carregando para sempre.
 
-### Sem conta do YouTube
+### Menos funções
 - **Sem login:** o CatTubeLite nunca entra numa conta do YouTube e não guarda tokens. Saíram a tela de login, as contas, as abas Inscrições, Playlists e Canais e as ações Curtir / Não curtir / Inscrever-se / Assistir mais tarde. Um `~/.config/cattube/accounts.conf` que tenha sobrado do CatTube original é ignorado; pode apagá-lo se não precisar mais dele.
-- **O que continua:** Início (transmissões ao vivo e tópicos populares do YouTube), Histórico (guardado na TV), Busca, páginas de canais e playlists, comentários, chat ao vivo, SponsorBlock, contagem do Return YouTube Dislike e transmissão pelo celular, nada disso precisa de conta.
+- **Sem comentários, chat ao vivo nem contagem de dislikes:** o player não tem mais os botões Comentários e Chat, e o menu do vídeo não consulta mais o Return YouTube Dislike.
+- **Sem controle pelo celular:** o app do YouTube no celular não pareia nem transmite mais para o CatTubeLite. Saíram a opção Vincular celular, a variável `CATTUBE_CAST_ENABLED_FILE` e o serviço `--remote`; `--remote`, `--tv-code` e `--pair` agora saem com código 2 sem abrir janela. Um `~/.config/cattube/remote.conf` que tenha sobrado é ignorado.
+- **O que continua:** Início (transmissões ao vivo e tópicos populares do YouTube), Histórico (guardado na TV), Busca, páginas de canais e playlists, SponsorBlock e Próximo vídeo.
 
 ## Recursos
 
@@ -52,10 +53,8 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 - **Busca** com sugestões com debounce enquanto digita e buscas recentes quando o campo está vazio, exibindo canais correspondentes e grade paginada de vídeos.
 - **Player feito para controle remoto.** OK abre os controles, Esquerda/Direita pulam 10 s e Cima vai para a barra de progresso. Qualidade, legendas e faixas de áudio ficam acessíveis no OSD sem perder o ponto do vídeo. Neste fork os vídeos tocam sempre na velocidade normal, e o player fecha com Voltar (não há botão Parar).
 - **SponsorBlock.** Pula e marca na barra segmentos de patrocínio, intros, encerramentos e demais categorias escolhidas.
-- **Dislikes** via Return YouTube Dislike. Segure OK em um vídeo para ver as contagens, recomeçar ou abrir o canal.
-- **Comentários e chat ao vivo** ao lado do vídeo.
+- **Menu do vídeo.** Segure OK em um vídeo para ver visualizações e data, recomeçar ou abrir o canal.
 - **Próximo vídeo (Up next).** Inicia o próximo vídeo após contagem regressiva, repete ou para, conforme configurado.
-- **Celular como controle remoto.** No app do YouTube no celular, vá em Configurações → Assistir na TV → Vincular com código da TV e digite o código exibido nas Configurações do CatTubeLite.
 - **Histórico e retomada.** Registra vídeos assistidos e retoma do ponto onde parou.
 - **Suporte a mouse.** Aponte para focar e clique para abrir.
 
@@ -102,7 +101,6 @@ Na primeira execução, o CatTubeLite baixa sua própria cópia do [yt-dlp](http
 |---|---|---|
 | `CATTUBE_LOW_POWER` | `1` / `0` | Força o perfil de baixo desempenho ou padrão (detectado por RAM, GPU e arquitetura quando não definido) |
 | `CATTUBE_RENDERER` | `glow` / `wgpu` | Força o renderer da interface (padrão `glow` em `low_power` e `wgpu` nos demais, com fallback automático se não definido) |
-| `CATTUBE_CAST_ENABLED_FILE` | caminho | Arquivo opcional contendo `cast_enabled = true` ou `false` para ativar/desativar casting em tempo real |
 
 Para ver decodificação por hardware, quadros descartados e memória sobre o vídeo, ative **Settings → About → Player statistics**. Também é possível consultar as propriedades `hwdec-current` e `frame-drop-count` no socket IPC do `mpv` em `$XDG_RUNTIME_DIR/cattube-mpv.sock` (`/tmp/cattube-$(id -u)/cattube-mpv.sock` sem essa variável).
 
@@ -115,33 +113,27 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 | Segurar OK, F2 | menu do vídeo | menu de legendas (fallback) |
 | Voltar, Esc, `GO_BACK` | voltar | ocultar controles e depois parar |
 
-## Chave compartilhada de casting
-
-No CatosTV, a opção **Cast to this TV** também controla a conexão de pareamento com o celular. Desligá-la encerra o casting e bloqueia novos pareamentos mantendo a navegação e reprodução locais disponíveis. Outros shells podem definir `CATTUBE_CAST_ENABLED_FILE` apontando para um arquivo com `cast_enabled = true` ou `cast_enabled = false`; a mudança entra em vigor com o app rodando.
-
 ## Linha de comando
 
 | Opção | O que faz |
 |---|---|
 | `--section NOME` | abre em `home`, `history` ou `search` |
 | `--play VIDEO_ID` | reproduz um vídeo e fecha ao terminar |
-| `--remote` | fica online em segundo plano para o app do celular, sem abrir janela |
-| `--tv-code` | imprime o código para "Vincular com código da TV" |
 | `--feed home` | imprime os vídeos do Início (para a tela inicial da TV); outras listas saem com código 2 |
+| `--stop` | fecha o player |
 | `--windowed` | inicia em janela em vez de tela cheia |
 
 ## Arquivos locais
 
-- `~/.config/cattube/` — preferências e pareamento do controle remoto (`0600`).
+- `~/.config/cattube/` — preferências.
 - `~/.local/share/cattube/` — `yt-dlp`, `deno`, histórico de assistidos, checkpoints, `positions.conf` e buscas recentes.
-- `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente) e metadados do cliente YouTube.
+- `~/.cache/cattube/` — cache de miniaturas (limpo automaticamente).
 
 ## Créditos e agradecimentos
 
 - Fork baseado no [CatTube](https://github.com/coderastic/CatTube), criado por [coderastic](https://github.com/coderastic).
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp), [Deno](https://deno.com) e [mpv](https://mpv.io) fazem a extração e reprodução dos vídeos.
-- [SponsorBlock](https://sponsor.ajay.app) e [Return YouTube Dislike](https://returnyoutubedislike.com) fornecem os dados comunitários.
-- [yt-cast-receiver](https://github.com/patrickkfkan/yt-cast-receiver) serviu de referência para o protocolo de controle remoto do YouTube.
+- [SponsorBlock](https://sponsor.ajay.app) fornece os trechos a pular.
 
 ## Licença
 

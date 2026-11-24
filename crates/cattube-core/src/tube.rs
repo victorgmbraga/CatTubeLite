@@ -9,8 +9,7 @@
 //! Page       a channel or a playlist, rows of tiles
 //! Search     keyboard and suggestions, then result rows
 //! Menu       a video's options: Play, Start over, Go to channel
-//! TvCode     the code for the phone's "Link with TV code" (phone remote)
-//! Settings   quality, playback, SponsorBlock, phone remote
+//! Settings   quality, playback, SponsorBlock, about
 //! ```
 
 use crate::input::Action;
@@ -91,8 +90,6 @@ pub enum SettingRow {
     SponsorBlock,
     /// One SponsorBlock category (index into `community::CATEGORIES`).
     Category(usize),
-    /// The phone remote: shows the "Link with TV code" code.
-    LinkPhone,
     /// Decoder, dropped frames and memory over the video.
     PlayerStats,
     UpdateYtDlp,
@@ -105,7 +102,6 @@ pub enum SettingGroup {
     Video,
     Playback,
     SponsorBlock,
-    Phone,
     About,
 }
 
@@ -115,7 +111,6 @@ impl SettingGroup {
             Self::Video => "Video",
             Self::Playback => "Playback",
             Self::SponsorBlock => "SponsorBlock",
-            Self::Phone => "Phone remote",
             Self::About => "About",
         }
     }
@@ -125,7 +120,6 @@ impl SettingGroup {
             Self::Video => "display",
             Self::Playback => "play",
             Self::SponsorBlock => "check",
-            Self::Phone => "phone",
             Self::About => "download",
         }
     }
@@ -141,7 +135,6 @@ pub fn group_of(row: SettingRow) -> SettingGroup {
         | SettingRow::Buffer
         | SettingRow::Region => SettingGroup::Playback,
         SettingRow::SponsorBlock | SettingRow::Category(_) => SettingGroup::SponsorBlock,
-        SettingRow::LinkPhone => SettingGroup::Phone,
         SettingRow::PlayerStats | SettingRow::UpdateYtDlp => SettingGroup::About,
     }
 }
@@ -175,7 +168,6 @@ pub fn setting_rows(sponsorblock: bool) -> Vec<SettingRow> {
     if sponsorblock {
         v.extend((0..crate::community::CATEGORIES.len()).map(SettingRow::Category));
     }
-    v.push(SettingRow::LinkPhone);
     v.push(SettingRow::PlayerStats);
     v.push(SettingRow::UpdateYtDlp);
     v
@@ -214,10 +206,6 @@ pub enum Screen {
         details: Scan<Details>,
         index: usize,
     },
-    /// The 12-digit code (shown "123 456 789 012").
-    TvCode {
-        code: Scan<String>,
-    },
     Settings {
         /// The focused row (in `setting_rows`); its group is the one shown.
         index: usize,
@@ -243,8 +231,6 @@ pub enum Effect {
         tile: Box<Tile>,
         from_start: bool,
     },
-    /// Fetch a code for the phone's "Link with TV code".
-    TvCode,
     /// A setting row changed by `delta` (−1, +1; OK = +1).
     Setting(SettingRow, i32),
     Close,
@@ -714,14 +700,6 @@ impl Tube {
                     _ => vec![],
                 }
             }
-            Screen::TvCode { code } => match action {
-                Action::Back => self.back(),
-                Action::Ok => {
-                    *code = Scan::Busy;
-                    vec![Effect::TvCode]
-                }
-                _ => vec![],
-            },
             Screen::Settings { index, groups } => {
                 let rows = setting_rows(ctx.sponsorblock);
                 let row = rows.get(*index).copied();
@@ -747,8 +725,7 @@ impl Tube {
                     (Action::Back, _)
                         | (
                             Action::Left,
-                            Some(SettingRow::LinkPhone)
-                                | Some(SettingRow::PlayerStats)
+                            Some(SettingRow::PlayerStats)
                                 | Some(SettingRow::UpdateYtDlp)
                                 | Some(SettingRow::Hdr)
                                 | Some(SettingRow::Subtitles)
@@ -773,10 +750,6 @@ impl Tube {
                             *index += 1;
                         }
                         vec![]
-                    }
-                    (Action::Ok, Some(SettingRow::LinkPhone)) => {
-                        self.stack.push(Screen::TvCode { code: Scan::Busy });
-                        vec![Effect::TvCode]
                     }
                     (Action::Ok, Some(r)) => vec![Effect::Setting(r, 1)],
                     (
@@ -1138,16 +1111,6 @@ impl Tube {
                     Err(e) => Scan::Failed(e.clone()),
                 };
             }
-        }
-    }
-
-    /// The phone code to show (a new one replaces the old).
-    pub fn on_tv_code(&mut self, result: Result<String, String>) {
-        if let Some(Screen::TvCode { code }) = self.stack.last_mut() {
-            *code = match result {
-                Ok(c) => Scan::Done(vec![c]),
-                Err(e) => Scan::Failed(e),
-            };
         }
     }
 }
@@ -1763,24 +1726,6 @@ mod tests {
         let all = setting_rows(true);
         assert!(all.contains(&SettingRow::Category(0)));
         assert_eq!(*all.last().unwrap(), SettingRow::UpdateYtDlp);
-        // The phone code: OK opens it, OK again asks for a fresh one.
-        let (mut p, _) = Tube::open();
-        let at = setting_rows(IN.sponsorblock)
-            .iter()
-            .position(|r| *r == SettingRow::LinkPhone)
-            .unwrap();
-        p.stack.push(Screen::Settings {
-            index: at,
-            groups: false,
-        });
-        assert_eq!(p.handle(Action::Ok, IN, &no), vec![Effect::TvCode]);
-        p.on_tv_code(Result::Ok("961234567890".into()));
-        assert!(
-            matches!(p.stack.last(), Some(Screen::TvCode { code: Scan::Done(c) }) if c[0] == "961234567890")
-        );
-        assert_eq!(p.handle(Action::Ok, IN, &no), vec![Effect::TvCode]);
-        p.handle(Back, IN, &no);
-        assert!(matches!(p.stack.last(), Some(Screen::Settings { .. })));
         let (mut t, _) = Tube::open();
         t.stack.push(Screen::Settings {
             index: 0,
@@ -1806,7 +1751,6 @@ mod tests {
                 SettingGroup::Video,
                 SettingGroup::Playback,
                 SettingGroup::SponsorBlock,
-                SettingGroup::Phone,
                 SettingGroup::About
             ]
         );

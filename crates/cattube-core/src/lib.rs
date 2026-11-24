@@ -6,7 +6,6 @@ pub mod community;
 pub mod env;
 pub mod error;
 pub mod input;
-pub mod lounge;
 pub mod mpv;
 pub mod net;
 pub mod osk;

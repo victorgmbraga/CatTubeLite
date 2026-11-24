@@ -45,22 +45,13 @@ pub fn friendly(t: &str) -> String {
 }
 
 /// Request headers in a private file (0600) for `curl -H @file`.
-/// `web`: the web client's headers (live chat comes only through it).
-fn header_file(web: bool) -> Result<PathBuf, String> {
-    let h = if web {
-        format!(
-            "Content-Type: application/json\nUser-Agent: {}\nX-YouTube-Client-Name: 1\nX-YouTube-Client-Version: {}\nOrigin: https://www.youtube.com\n",
-            yt::WEB_USER_AGENT,
-            yt::WEB_CLIENT_VERSION
-        )
-    } else {
-        format!(
-            "Content-Type: application/json\nUser-Agent: {}\nX-YouTube-Client-Name: {}\nX-YouTube-Client-Version: {}\nOrigin: https://www.youtube.com\nReferer: https://www.youtube.com/tv\n",
-            yt::USER_AGENT,
-            yt::CLIENT_NUMBER,
-            yt::CLIENT_VERSION
-        )
-    };
+fn header_file() -> Result<PathBuf, String> {
+    let h = format!(
+        "Content-Type: application/json\nUser-Agent: {}\nX-YouTube-Client-Name: {}\nX-YouTube-Client-Version: {}\nOrigin: https://www.youtube.com\nReferer: https://www.youtube.com/tv\n",
+        yt::USER_AGENT,
+        yt::CLIENT_NUMBER,
+        yt::CLIENT_VERSION
+    );
     private_file("headers", &h)
 }
 
@@ -101,11 +92,7 @@ fn curl_quote(s: &str) -> String {
 
 /// One request; the header file is removed afterwards.
 fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
-    curl_as(url, body, false)
-}
-
-fn curl_as(url: &str, body: Option<&str>, web: bool) -> Result<String, String> {
-    let h = header_file(web)?;
+    let h = header_file()?;
     let mut args: Vec<String> = vec![
         "-sS".into(),
         "--compressed".into(),
@@ -137,143 +124,6 @@ pub fn page(ctx: &str, browse_id: &str) -> Result<Page, String> {
     let body = yt::browse_body(ctx, browse_id).ok_or("That can't be opened")?;
     let reply = curl(&yt::endpoint_url("browse"), Some(&body))?;
     yt::parse_page(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
-}
-
-/// A page of a video's comments: the first (`token` empty) or the next.
-pub fn comments(ctx: &str, id: &str, token_: &str) -> Result<yt::Comments, String> {
-    let first;
-    let token_ = if token_.is_empty() {
-        let body = yt::next_body(ctx, id).ok_or("not a video")?;
-        let reply = curl(&yt::endpoint_url("next"), Some(&body))?;
-        first = yt::comments_token(&reply).ok_or("Comments are turned off")?;
-        first.as_str()
-    } else {
-        token_
-    };
-    let body = yt::continuation_body(ctx, token_).ok_or("bad continuation")?;
-    let reply = curl(&yt::endpoint_url("next"), Some(&body))?;
-    yt::parse_comments(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
-}
-
-/// A live video's chat token (None: not live, or no chat).
-pub fn live_chat_token(id: &str, region: &str) -> Option<String> {
-    let ctx = yt::web_context("en", region);
-    let body = yt::next_body(&ctx, id)?;
-    let reply = curl_as(&yt::endpoint_url("next"), Some(&body), true).ok()?;
-    yt::live_chat_token(&reply)
-}
-
-/// The chat messages since `token` (and the next token).
-pub fn live_chat(token_: &str, region: &str) -> Result<yt::Chat, String> {
-    let ctx = yt::web_context("en", region);
-    let body = yt::continuation_body(&ctx, token_).ok_or("bad continuation")?;
-    let reply = curl_as(
-        &yt::endpoint_url("live_chat/get_live_chat"),
-        Some(&body),
-        true,
-    )?;
-    yt::parse_live_chat(&reply).ok_or_else(|| "The chat has ended".into())
-}
-
-/// Chat messages for the control bar, as JSON: `[{"a","t","p"}]`.
-fn chat_json(msgs: &[yt::ChatMessage]) -> String {
-    let items: Vec<String> = msgs
-        .iter()
-        .map(|m| {
-            format!(
-                "{{\"a\":{},\"t\":{},\"p\":{}}}",
-                mpv::json_string(&m.author),
-                mpv::json_string(&m.text),
-                mpv::json_string(&m.paid)
-            )
-        })
-        .collect();
-    format!("[{}]", items.join(","))
-}
-
-/// Follow a live chat into the control bar while `on` stays set.
-fn follow_chat(first: String, region: String, on: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    use std::sync::atomic::Ordering;
-    std::thread::spawn(move || {
-        let socket = player::player_socket();
-        let mut token = first;
-        let mut seen: std::collections::VecDeque<String> = Default::default();
-        while on.load(Ordering::SeqCst) {
-            let (wait, next) = match live_chat(&token, &region) {
-                Ok(c) => {
-                    let fresh: Vec<yt::ChatMessage> = c
-                        .messages
-                        .into_iter()
-                        .filter(|m| m.id.is_empty() || !seen.contains(&m.id))
-                        .collect();
-                    for m in &fresh {
-                        if !m.id.is_empty() {
-                            seen.push_back(m.id.clone());
-                            if seen.len() > 500 {
-                                seen.pop_front();
-                            }
-                        }
-                    }
-                    if !fresh.is_empty() && on.load(Ordering::SeqCst) {
-                        let json = chat_json(&fresh);
-                        if mpv::ipc_request(
-                            &socket,
-                            &[
-                                Arg::Str("script-message"),
-                                Arg::Str("cattube-chat-data"),
-                                Arg::Str(&json),
-                            ],
-                        )
-                        .is_err()
-                        {
-                            return; // the player is gone
-                        }
-                    }
-                    match c.next {
-                        Some((t, ms)) => (Duration::from_millis(ms), Some(t)),
-                        None => (Duration::ZERO, None),
-                    }
-                }
-                Err(_) => (Duration::from_secs(10), Some(token.clone())),
-            };
-            let Some(next) = next else { return };
-            token = next;
-            // Sleep in short steps so turning chat off is quick.
-            let until = Instant::now() + wait;
-            while Instant::now() < until && on.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-        }
-    });
-}
-
-/// Comments for the control bar, as JSON: `{"list":[{"a","t","p","l","r"}],
-/// "more":"…"}` or `{"error":"…"}`.
-fn comments_json(r: Result<yt::Comments, String>) -> String {
-    match r {
-        Ok(c) => {
-            let list = c
-                .list
-                .iter()
-                .map(|x| {
-                    format!(
-                        "{{\"a\":{},\"t\":{},\"p\":{},\"l\":{},\"r\":{}}}",
-                        mpv::json_string(&x.author),
-                        mpv::json_string(&x.text),
-                        mpv::json_string(&x.published),
-                        mpv::json_string(&x.likes),
-                        x.replies
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "{{\"list\":[{list}],\"more\":{}}}",
-                mpv::json_string(c.more.as_deref().unwrap_or(""))
-            )
-        }
-        Err(e) => format!("{{\"error\":{}}}", mpv::json_string(&e)),
-    }
 }
 
 /// Home: YouTube's topic channels, fetched side by side.
@@ -329,13 +179,6 @@ pub fn details(ctx: &str, id: &str) -> Result<Details, String> {
     let body = yt::next_body(ctx, id).ok_or("not a video")?;
     let reply = curl(&yt::endpoint_url("next"), Some(&body))?;
     yt::parse_details(&reply).ok_or_else(|| "YouTube didn't answer properly".into())
-}
-
-/// Like and dislike counts (Return YouTube Dislike).
-pub fn votes(id: &str) -> Option<(u64, u64)> {
-    curl(&community::votes_url(id), None)
-        .ok()
-        .and_then(|b| community::parse_votes(&b))
 }
 
 // ------------------------------------------------------------- pictures
@@ -585,11 +428,6 @@ fn prune_image_cache_with_age(
 
 static TOOLS_LOCK: Mutex<()> = Mutex::new(());
 
-/// True when `yt-dlp` has not been checked recently and a background check is due.
-pub fn tools_stale(data: &Path) -> bool {
-    stale(&data.join("yt-dlp.checked"))
-}
-
 /// Make sure yt-dlp (and a JavaScript runtime for it) are there, and keep
 /// yt-dlp up to date. Returns a line for Settings.
 pub fn ensure_tools(data: &Path) -> Result<String, String> {
@@ -812,7 +650,7 @@ pub fn checkpoint_player(data: &Path) {
     }
 }
 
-/// Shared handle to a running `mpv` child so both the UI/remote and the
+/// Shared handle to a running `mpv` child so both the UI and the
 /// watcher can check exit status and reap it without hanging.
 #[derive(Clone)]
 pub struct PlayerHandle {
@@ -887,9 +725,9 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
         &player::player_socket(),
         js.as_deref(),
     );
-    // One screen, one player: the app and the phone remote are separate
-    // processes sharing this socket, so whichever starts a video first
-    // closes the other's (keeping its place).
+    // One screen, one player: another CatTube (`--play`, a second window)
+    // shares this socket, so whichever starts a video closes the other's
+    // first (keeping its place).
     checkpoint_player(data);
     if !mpv::quit_and_wait(&player::player_socket(), PLAYER_CLOSE_GRACE) {
         eprintln!("cattube: the previous player did not close in time");
@@ -932,8 +770,6 @@ pub struct Session {
     pub sponsorblock: Option<Vec<String>>,
     pub codec: cattube_core::player::Codec,
     pub hdr: bool,
-    /// For live chat ("US").
-    pub region: String,
     /// Videos after this one (a playlist or a row), in order.
     pub queue: Vec<yt::Tile>,
     /// Back in the player hid the video (`hide_on_back`): told the title
@@ -1318,31 +1154,6 @@ fn spawn_next_lookup(s: &Session, id: String, tx: std::sync::mpsc::Sender<Option
     });
 }
 
-/// Offer live chat on the bar once this stream's token is found.
-fn spawn_chat_lookup(
-    id: String,
-    region: String,
-    slot: std::sync::Arc<Mutex<Option<String>>>,
-    video_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    current_gen: u64,
-) {
-    std::thread::spawn(move || {
-        if let Some(t) = live_chat_token(&id, &region)
-            && video_gen.load(std::sync::atomic::Ordering::SeqCst) == current_gen
-        {
-            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(t);
-            let _ = mpv::ipc_request(
-                &player::player_socket(),
-                &[
-                    Arg::Str("script-message"),
-                    Arg::Str("cattube-chat-available"),
-                    Arg::Str("yes"),
-                ],
-            );
-        }
-    });
-}
-
 fn spawn_segments_lookup(url: String, tx: std::sync::mpsc::Sender<Vec<community::Segment>>) {
     std::thread::spawn(move || {
         let segments = curl(&url, None)
@@ -1410,32 +1221,6 @@ fn change_quality(conn: &mut mpv::IpcConn, s: &Session, cur: &yt::Tile, height: 
     );
 }
 
-/// Comments for the control bar's panel, fetched aside so skipping and the
-/// bar stay on time. `arg`: "first", or the token of the next page.
-fn spawn_comments(
-    s: &Session,
-    id: String,
-    arg: String,
-    video_gen: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    current_gen: u64,
-) {
-    let token = if arg == "first" { String::new() } else { arg };
-    let ctx = s.ctx.clone();
-    std::thread::spawn(move || {
-        let json = comments_json(comments(&ctx, &id, &token));
-        if video_gen.load(std::sync::atomic::Ordering::SeqCst) == current_gen {
-            let _ = mpv::ipc_request(
-                &player::player_socket(),
-                &[
-                    Arg::Str("script-message"),
-                    Arg::Str("cattube-comments-data"),
-                    Arg::Str(&json),
-                ],
-            );
-        }
-    });
-}
-
 /// The newest valid request for the related-videos browser.
 fn related_request(msgs: &[Vec<String>]) -> Option<String> {
     msgs.iter()
@@ -1462,7 +1247,6 @@ fn spawn_related(
         sponsorblock: None,
         codec: s.codec,
         hdr: s.hdr,
-        region: s.region.clone(),
         queue: Vec::new(),
         on_hide: None,
         on_video: None,
@@ -1542,9 +1326,7 @@ pub fn spawn_watcher(
             let mut history: Vec<yt::Tile> = Vec::new();
             let mut cur = first;
             let related_requests = std::sync::Arc::new(RelatedRequests::default());
-            let video_gen = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             'videos: loop {
-                let current_gen = video_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 cattube_core::watched::record(&player::data_home(), &cur);
                 if let Some(on_video) = &s.on_video {
                     on_video(cur.clone());
@@ -1582,34 +1364,6 @@ pub fn spawn_watcher(
                         "no"
                     }),
                 ]);
-                // Live chat: offered on the bar when this is a stream with one.
-                let chat_on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let chat_token: std::sync::Arc<Mutex<Option<String>>> = Default::default();
-                let _ = conn.command(&[
-                    Arg::Str("script-message"),
-                    Arg::Str("cattube-chat-available"),
-                    Arg::Str("no"),
-                ]);
-                // yt-dlp marks streams in the file's metadata.
-                let is_live = conn
-                    .command(&[
-                        Arg::Str("get_property"),
-                        Arg::Str("metadata/by-key/ytdl_is_live"),
-                    ])
-                    .ok()
-                    .and_then(|j| j.as_str().map(|s| s == "true"))
-                    .unwrap_or(false);
-                if is_live || cur.kind == yt::Kind::Live {
-                    spawn_chat_lookup(
-                        cur.id.clone(),
-                        s.region.clone(),
-                        chat_token.clone(),
-                        video_gen.clone(),
-                        current_gen,
-                    );
-                }
-                // The chat stops with the video.
-                let stop_chat = || chat_on.store(false, std::sync::atomic::Ordering::SeqCst);
                 let (segments_tx, segments_rx) = std::sync::mpsc::channel();
                 if let Some(url) = s
                     .sponsorblock
@@ -1675,7 +1429,6 @@ pub fn spawn_watcher(
                     let msgs = conn.messages(Duration::from_millis(400));
                     if conn.closed() || player.exited() {
                         ended.positions.push((cur.id.clone(), last.0, last.1));
-                        stop_chat();
                         break 'videos;
                     }
                     let pos = conn.get_f64("time-pos");
@@ -1715,23 +1468,6 @@ pub fn spawn_watcher(
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
                         change_quality(&mut conn, &s, &cur, h, last.0);
-                    }
-                    match want("cattube-chat").as_deref() {
-                        Some("on") => {
-                            let t = chat_token.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            if let Some(t) = t
-                                && !chat_on.swap(true, std::sync::atomic::Ordering::SeqCst)
-                            {
-                                follow_chat(t, s.region.clone(), chat_on.clone());
-                            }
-                        }
-                        Some("off") => chat_on.store(false, std::sync::atomic::Ordering::SeqCst),
-                        _ => {}
-                    }
-                    // Comments for the control bar's panel, fetched aside
-                    // so skipping and the bar stay on time.
-                    if let Some(arg) = want("cattube-comments") {
-                        spawn_comments(&s, cur.id.clone(), arg, video_gen.clone(), current_gen);
                     }
                     // A new request supersedes prior work, including replies from
                     // the previous video. The Lua browser preserves its focus as
@@ -1788,7 +1524,6 @@ pub fn spawn_watcher(
                     if let Some(n) = go_next {
                         card(&mut conn, &["hide"]);
                         ended.positions.push((cur.id.clone(), last.0, last.1));
-                        stop_chat();
                         let backwards = want("cattube-episode").as_deref() == Some("prev");
                         if !backwards {
                             history.push(cur.clone());

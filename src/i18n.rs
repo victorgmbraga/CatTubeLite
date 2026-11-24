@@ -68,7 +68,6 @@ fn arabic(text: &str) -> &str {
         "Videos" => "الفيديوهات",
         "Playback" => "التشغيل",
         "About" => "حول التطبيق",
-        "Phone remote" => "التحكم بالهاتف",
         "Highest quality" => "أعلى جودة",
         "Lower plays smoother on slow connections" => "الجودة الأقل تناسب الاتصال البطيء",
         "Preferred codec" => "ترميز الفيديو المفضل",
@@ -94,10 +93,6 @@ fn arabic(text: &str) -> &str {
         "For recommendations, trending and news" => "للاقتراحات والمحتوى الرائج والأخبار",
         "Skip sponsors and more" => "تخطي الرعاية والمقاطع الأخرى",
         "Segments marked by SponsorBlock viewers" => "مقاطع حددها مستخدمو SponsorBlock",
-        "Link a phone" => "ربط هاتف",
-        "Pick and control videos from the YouTube app" => {
-            "اختيار الفيديوهات والتحكم بها من تطبيق YouTube"
-        }
         "Player statistics" => "إحصاءات المشغل",
         "Decoder, dropped frames and memory over the video" => {
             "عرض وحدة فك الترميز والإطارات المفقودة والذاكرة"
@@ -121,20 +116,6 @@ fn arabic(text: &str) -> &str {
         "Nothing here yet" => "لا يوجد محتوى بعد",
         "Down for results" => "اضغط لأسفل لعرض النتائج",
         "Press OK to try again" => "اضغط موافق للمحاولة مجدداً",
-        "Getting a code…" => "جارٍ الحصول على رمز…",
-        "Link your phone" => "ربط هاتفك",
-        "Link with TV code" => "الربط برمز التلفزيون",
-        "In the YouTube app on your phone, open Settings → Watch on TV" => {
-            "في تطبيق YouTube على الهاتف، افتح الإعدادات ثم المشاهدة على التلفزيون"
-        }
-        "→ Link with TV code, and enter" => "ثم الربط برمز التلفزيون وأدخل",
-        "The code changes every few minutes. A linked phone stays linked." => {
-            "يتغير الرمز كل بضع دقائق، ويبقى الهاتف المرتبط متصلاً."
-        }
-        "Then pick a video on the phone: it plays here, and the phone stays in step." => {
-            "اختر فيديو من الهاتف لتشغيله هنا والتحكم به."
-        }
-        "OK for a new code · Back to close" => "موافق لرمز جديد، رجوع للإغلاق",
         "Getting the player ready (first start)…" => "جارٍ إعداد المشغل للتشغيل الأول…",
         "space" => "مسافة",
         "delete" => "حذف",
@@ -230,7 +211,7 @@ mod tests {
             .filter_map(|l| l.trim().strip_prefix('"')?.split_once("\" =>"))
             .map(|(key, _)| key)
             .collect();
-        assert!(keys.len() > 60);
+        assert!(keys.len() > 40);
         let same_in_both = ["Buffer", "Shorts", "Short"];
         for key in keys {
             assert!(

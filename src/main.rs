@@ -15,7 +15,6 @@ mod keys;
 mod motion;
 mod pointer;
 mod prefs;
-mod remote;
 mod target;
 mod theme;
 mod ui;
@@ -30,7 +29,7 @@ use cattube_core::tube::{Ctx, Effect, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{self as ytc, Details, Page, Tile};
 use eframe::egui;
 use jobs::Jobs;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use target::Target;
@@ -42,8 +41,6 @@ enum Msg {
     SearchMore(u64, Result<Page, String>),
     Suggestions(u64, String, Vec<String>),
     Details(String, Result<Details, String>),
-    Votes(String, Option<(u64, u64)>),
-    TvCode(Result<String, String>),
     /// A background job with nothing to show.
     Quiet,
     Images(Vec<(String, Option<egui::ColorImage>)>),
@@ -94,13 +91,10 @@ struct App {
     /// Video queued by `--play` while waiting for first-run tool downloads.
     pending_play: Option<Tile>,
     positions: Vec<(String, f64)>,
-    votes: HashMap<String, (u64, u64)>,
     tools: Scan<String>,
     yt_dlp_ready: bool,
     /// Started with `--play`: close when the video ends.
     quit_after_play: bool,
-    /// When the phone code on screen was asked for (a new one every 4 min).
-    tv_code_at: Option<Instant>,
     was_focused: bool,
     search_generation: u64,
     search_query: String,
@@ -157,7 +151,6 @@ impl App {
             now_playing: None,
             pending_play: None,
             positions: Vec::new(),
-            votes: HashMap::new(),
             tools: Scan::Busy,
             yt_dlp_ready,
             quit_after_play: false,
@@ -166,7 +159,6 @@ impl App {
             search_query: String::new(),
             suggest_generation: 0,
             pending_suggest: None,
-            tv_code_at: None,
             page_generation: 0,
             page_requests: HashSet::new(),
         };
@@ -371,9 +363,6 @@ impl App {
                 ctx.request_repaint_after(SUGGEST_DEBOUNCE);
             }
             Effect::Details(id) => {
-                let id2 = id.clone();
-                self.jobs
-                    .spawn(move || Msg::Votes(id2.clone(), yt::votes(&id2)));
                 let failed_id = id.clone();
                 self.jobs.spawn_or(
                     move || {
@@ -387,18 +376,6 @@ impl App {
                 // The rest of the row it came from plays after it.
                 let queue = self.queue_after(&tile);
                 self.play(ctx, *tile, from_start, queue);
-            }
-            Effect::TvCode => {
-                self.tv_code_at = Some(Instant::now());
-                let config = cattube_core::env::config_dir();
-                self.jobs.spawn_or(
-                    move || {
-                        // The service the phone talks to (CatosTV runs it already).
-                        remote::ensure_running();
-                        Msg::TvCode(remote::tv_code(&config))
-                    },
-                    || Msg::TvCode(Err(JOB_FAILED.into())),
-                );
             }
             Effect::Setting(row, d) => self.setting(ctx, row, d),
             Effect::Close => {
@@ -525,8 +502,6 @@ impl App {
                     self.prefs.sb_categories.push(key);
                 }
             }
-            // Opens its own screen (the tube handles it).
-            SettingRow::LinkPhone => {}
             SettingRow::PlayerStats => self.prefs.player_stats = !self.prefs.player_stats,
             SettingRow::UpdateYtDlp => {
                 self.tools = Scan::Busy;
@@ -609,7 +584,6 @@ impl App {
                         .then(|| self.prefs.sb_categories.clone()),
                     codec: self.prefs.codec,
                     hdr: self.prefs.hdr,
-                    region: self.prefs.region.clone(),
                     queue,
                     on_video: Some(Box::new(move |tile| {
                         let _ = vtx.send(Msg::PlayerChanged(seq, tile));
@@ -677,12 +651,6 @@ impl App {
                 }
             }
             Msg::Details(id, r) => self.tube.on_details(&id, r),
-            Msg::Votes(id, v) => {
-                if let Some(v) = v {
-                    self.votes.insert(id, v);
-                }
-            }
-            Msg::TvCode(r) => self.tube.on_tv_code(r),
             Msg::Quiet => {}
             Msg::Images(batch) => {
                 let frame = ctx.cumulative_frame_nr();
@@ -882,15 +850,6 @@ impl eframe::App for App {
             PendingSuggest::Wait(wait) => ctx.request_repaint_after(wait),
             PendingSuggest::None => {}
         }
-        if let Some(Screen::TvCode { code }) = self.tube.screen() {
-            let stale = self
-                .tv_code_at
-                .is_none_or(|t| t.elapsed() > Duration::from_secs(240));
-            if stale && !matches!(code, Scan::Busy) {
-                self.effect(ctx, Effect::TvCode);
-            }
-            ctx.request_repaint_after(Duration::from_secs(5));
-        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -973,7 +932,6 @@ impl eframe::App for App {
             prefs: &self.prefs,
             pics: &self.images,
             positions: &self.positions,
-            votes: &self.votes,
             tools: &self.tools,
             yt_dlp_ready: self.yt_dlp_ready,
             now,
@@ -1073,8 +1031,8 @@ fn hand_back_screen() -> bool {
     asked
 }
 
-/// Add where videos stopped to `positions.conf` (read, merge, write atomically:
-/// the phone-remote service writes it too).
+/// Add where videos stopped to `positions.conf` (read, merge, write
+/// atomically: another CatTube, such as `--play`, may write it too).
 fn save_positions(data: &std::path::Path, ended: &[(String, f64, Option<f64>)]) {
     let _ = player::save_positions_merged(data, ended);
 }
@@ -1145,11 +1103,6 @@ Usage: cattube [--windowed] [--section NAME | --play VIDEO_ID]
 
   --section NAME   open on home, history or search
   --play VIDEO_ID  play one video, then close (--title TITLE names it)
-  --remote         keep this TV online for the YouTube phone app: a phone
-                   paired with 'Link with TV code' (the code is in
-                   Settings, or --tv-code) or by casting picks what plays
-  --tv-code        print the code for the phone's 'Link with TV code'
-  --pair CODE      pair the phone that cast to this TV (its pairing code)
   --stop           close the player
   --feed home      print Home's videos as
                    tab-separated lines: id, title, channel, facts, length,
@@ -1172,33 +1125,21 @@ fn main() -> eframe::Result {
         );
         return Ok(());
     }
-    if args.iter().any(|a| a == "--remote") {
-        std::process::exit(remote::run());
+    // The phone remote is gone from CatTubeLite: its flags must not open
+    // the window (a TV shell may still start `--remote` as a service).
+    if let Some(flag) = args
+        .iter()
+        .find(|a| matches!(a.as_str(), "--remote" | "--tv-code" | "--pair"))
+    {
+        eprintln!("cattube: {flag}: CatTubeLite has no phone remote");
+        std::process::exit(2);
     }
     if args.iter().any(|a| a == "--stop") {
-        // Close the player (a cast was ended from the phone).
+        // Close the player.
         let _ = cattube_core::mpv::ipc_request(
             &cattube_core::player::player_socket(),
             &[cattube_core::mpv::Arg::Str("quit")],
         );
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--tv-code") {
-        match remote::tv_code(&cattube_core::env::config_dir()) {
-            Ok(c) => println!("{}", cattube_core::lounge::format_code(&c)),
-            Err(e) => {
-                eprintln!("cattube: {e}");
-                std::process::exit(1);
-            }
-        }
-        return Ok(());
-    }
-    if let Some(i) = args.iter().position(|a| a == "--pair") {
-        let code = args.get(i + 1).map(String::as_str).unwrap_or("");
-        if let Err(e) = remote::register(&cattube_core::env::config_dir(), code) {
-            eprintln!("cattube: {e}");
-            std::process::exit(1);
-        }
         return Ok(());
     }
     if let Some(i) = args.iter().position(|a| a == "--feed") {

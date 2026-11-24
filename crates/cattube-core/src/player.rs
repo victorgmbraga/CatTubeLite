@@ -291,8 +291,7 @@ pub fn mpv_argv(
         "--idle=no",
         "--keep-open=no",
         // CatTube keeps its own places; a system mpv.conf that saves and
-        // restores them (volume too) would fight the start time and the
-        // phone remote's volume.
+        // restores them (volume too) would fight the start time.
         "--save-position-on-quit=no",
         "--resume-playback=no",
         "--no-terminal",

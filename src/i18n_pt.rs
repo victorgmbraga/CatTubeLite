@@ -11,7 +11,6 @@ pub fn translate(text: &str) -> &str {
         "Videos" => "Vídeos",
         "Playback" => "Reprodução",
         "About" => "Sobre",
-        "Phone remote" => "Celular como controle",
         "Highest quality" => "Qualidade máxima",
         "Lower plays smoother on slow connections" => "Menor fica mais fluida em conexões lentas",
         "Preferred codec" => "Codec preferido",
@@ -39,10 +38,6 @@ pub fn translate(text: &str) -> &str {
         "Segments marked by SponsorBlock viewers" => {
             "Trechos marcados por usuários do SponsorBlock"
         }
-        "Link a phone" => "Vincular celular",
-        "Pick and control videos from the YouTube app" => {
-            "Escolha e controle vídeos pelo app do YouTube"
-        }
         "Player statistics" => "Estatísticas do player",
         "Decoder, dropped frames and memory over the video" => {
             "Decodificador, quadros perdidos e memória sobre o vídeo"
@@ -66,20 +61,6 @@ pub fn translate(text: &str) -> &str {
         "Nothing here yet" => "Nada por aqui ainda",
         "Down for results" => "Para baixo para ver os resultados",
         "Press OK to try again" => "Pressione OK para tentar de novo",
-        "Getting a code…" => "Obtendo um código…",
-        "Link your phone" => "Vincule seu celular",
-        "Link with TV code" => "Vincular com código da TV",
-        "In the YouTube app on your phone, open Settings → Watch on TV" => {
-            "No app do YouTube no celular, abra Configurações → Assistir na TV"
-        }
-        "→ Link with TV code, and enter" => "→ Vincular com código da TV e digite",
-        "The code changes every few minutes. A linked phone stays linked." => {
-            "O código muda a cada poucos minutos. O celular vinculado continua vinculado."
-        }
-        "Then pick a video on the phone: it plays here, and the phone stays in step." => {
-            "Depois escolha um vídeo no celular: ele toca aqui e os dois ficam em sincronia."
-        }
-        "OK for a new code · Back to close" => "OK para novo código · Voltar para fechar",
         "Getting the player ready (first start)…" => "Preparando o player (primeiro uso)…",
         "space" => "espaço",
         "delete" => "apagar",
