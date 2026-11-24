@@ -36,12 +36,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
-      - name: Lint without wgpu
-        run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
+      - name: Lint with wgpu
+        run: cargo clippy --locked --workspace --all-targets --features wgpu -- -D warnings
       - name: Test
         run: cargo test --locked --workspace
-      - name: Test without wgpu
-        run: cargo test --locked --workspace --no-default-features
+      - name: Test with wgpu
+        run: cargo test --locked --workspace --features wgpu
       - name: Package
         run: bash packaging/tarball.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
