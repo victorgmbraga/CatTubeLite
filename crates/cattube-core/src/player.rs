@@ -335,6 +335,57 @@ pub struct PlayOptions {
     pub hide_on_back: bool,
     /// Show the performance readout over the video.
     pub stats: bool,
+    /// `--hwdec` to pass, if any (see [`hwdec_choice`]).
+    pub hwdec: Option<String>,
+}
+
+/// Does this `mpv.conf` choose a video decoder (`hwdec=` outside a
+/// profile, or in `[default]`)?
+pub fn mpv_conf_sets_hwdec(text: &str) -> bool {
+    let mut top = true;
+    text.lines().map(str::trim).any(|line| {
+        if let Some(section) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            top = section.trim() == "default";
+            return false;
+        }
+        let line = line.strip_prefix("--").unwrap_or(line);
+        top && !line.starts_with('#')
+            && line
+                .split_once('=')
+                .is_some_and(|(k, v)| k.trim() == "hwdec" && !v.trim().is_empty())
+    })
+}
+
+/// The `mpv.conf` files mpv reads: the user's (`$MPV_HOME`, else
+/// `~/.config/mpv`) and the system's.
+pub fn mpv_conf_paths() -> Vec<PathBuf> {
+    let user = std::env::var_os("MPV_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| crate::env::xdg("XDG_CONFIG_HOME", ".config").join("mpv"));
+    vec![user.join("mpv.conf"), PathBuf::from("/etc/mpv/mpv.conf")]
+}
+
+/// The `--hwdec` CatTube passes, in order: `CATTUBE_HWDEC` (forces one,
+/// "no" for the CPU); nothing when an `mpv.conf` already chooses (a TV box
+/// may need `v4l2m2m-copy`, which mpv's safe list leaves out, and the
+/// command line would override the file); `auto-safe` on a low-power
+/// device; else nothing (mpv's own default).
+pub fn hwdec_choice(env: Option<&str>, conf_sets: bool, low_power: bool) -> Option<String> {
+    let forced: String = env
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ','))
+        .take(64)
+        .collect();
+    if !forced.is_empty() {
+        Some(forced)
+    } else if conf_sets {
+        None
+    } else {
+        low_power.then(|| "auto-safe".to_string())
+    }
 }
 
 /// mpv's command line for a video. `data` holds yt-dlp, `ui` the control
@@ -371,7 +422,6 @@ pub fn mpv_argv(
     if o.low_power {
         v.extend(
             [
-                "--hwdec=auto-safe",
                 "--profile=fast",
                 "--scale=bilinear",
                 "--cscale=bilinear",
@@ -382,6 +432,9 @@ pub fn mpv_argv(
             .into_iter()
             .map(str::to_string),
         );
+    }
+    if let Some(h) = &o.hwdec {
+        v.push(format!("--hwdec={h}"));
     }
     v.push(format!(
         "--demuxer-max-bytes={}MiB",
@@ -678,6 +731,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hwdec_follows_the_env_then_mpv_conf_then_the_device() {
+        assert_eq!(
+            hwdec_choice(Some("v4l2m2m-copy"), true, true).as_deref(),
+            Some("v4l2m2m-copy")
+        );
+        assert_eq!(
+            hwdec_choice(Some(" no "), false, false).as_deref(),
+            Some("no")
+        );
+        // Only a decoder name gets through, never another option.
+        assert_eq!(
+            hwdec_choice(Some("vaapi --vo=x"), false, false).as_deref(),
+            Some("vaapi--vox")
+        );
+        assert_eq!(hwdec_choice(Some(""), true, true), None);
+        assert_eq!(hwdec_choice(None, true, true), None);
+        assert_eq!(
+            hwdec_choice(None, false, true).as_deref(),
+            Some("auto-safe")
+        );
+        assert_eq!(hwdec_choice(None, false, false), None);
+    }
+
+    #[test]
+    fn mpv_conf_hwdec_counts_outside_profiles_only() {
+        assert!(mpv_conf_sets_hwdec("vo=gpu\nhwdec=v4l2m2m-copy\n"));
+        assert!(mpv_conf_sets_hwdec("  hwdec = auto  "));
+        assert!(mpv_conf_sets_hwdec("--hwdec=vaapi"));
+        assert!(mpv_conf_sets_hwdec("[tv]\nfs=yes\n[default]\nhwdec=drm"));
+        assert!(!mpv_conf_sets_hwdec("# hwdec=vaapi\nhwdec-codecs=all"));
+        assert!(!mpv_conf_sets_hwdec("[fast]\nhwdec=vaapi"));
+        assert!(!mpv_conf_sets_hwdec("hwdec="));
+    }
+
+    #[test]
     fn formats() {
         assert_eq!(
             format_string(1080, Codec::Avc, false, false),
@@ -721,6 +809,7 @@ mod tests {
             accent: "7c6cf0".into(),
             hide_on_back: false,
             stats: false,
+            hwdec: None,
         };
         let v = mpv_argv(
             &o,
@@ -764,6 +853,7 @@ mod tests {
             sub_langs: String::new(),
             low_power: true,
             stats: true,
+            hwdec: hwdec_choice(None, false, true),
             ..o
         };
         let v2 = mpv_argv(
