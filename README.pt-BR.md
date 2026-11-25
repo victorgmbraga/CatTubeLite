@@ -52,7 +52,7 @@ O CatTubeLite parte do CatTube `1.0.4` e reúne estas frentes de mudanças volta
 
 - **YouTube sem conta.** O Início mostra transmissões ao vivo e tópicos populares, o Histórico lista o que foi assistido na TV e a Busca encontra o resto. Páginas de canais e playlists abrem a partir de qualquer vídeo.
 - **Busca** com sugestões com debounce enquanto digita e buscas recentes quando o campo está vazio, exibindo canais correspondentes e grade paginada de vídeos.
-- **Player feito para controle remoto.** OK abre os controles, Esquerda/Direita pulam 10 s e Cima vai para a barra de progresso. Qualidade, legendas e faixas de áudio ficam acessíveis no OSD sem perder o ponto do vídeo. Neste fork os vídeos tocam sempre na velocidade normal, e o player fecha com Voltar (não há botão Parar).
+- **Player feito para controle remoto.** OK abre os controles, Esquerda/Direita pulam 10 s e Cima vai para a barra de progresso. Qualidade, legendas e faixas de áudio ficam acessíveis no OSD sem perder o ponto do vídeo. Neste fork os vídeos tocam sempre na velocidade normal, e o player fecha com Voltar (não há botão Parar). Só esses controles agem no player: as teclas próprias do `mpv` (volume, números, roda do mouse etc.) ficam desligadas.
 - **SponsorBlock.** Pula e marca na barra segmentos de patrocínio, intros, encerramentos e demais categorias escolhidas.
 - **Menu do vídeo.** Segure OK em um vídeo para ver visualizações e data, recomeçar ou abrir o canal.
 - **Próximo vídeo (Up next).** Inicia o próximo vídeo após contagem regressiva, repete ou para, conforme configurado.
@@ -137,7 +137,7 @@ Para ver decodificação por hardware, quadros descartados e memória sobre o v�
 | Setas | navegar | Esquerda / Direita pulam 10 s (com os controles escondidos, a barra de progresso aparece sozinha por um instante); Cima / Baixo alternam barra, botões e vídeos relacionados |
 | Retroceder / Avançar, Anterior / Próximo | | pulam 30 s / 90 s, com a mesma barra de progresso |
 | OK, Enter | abrir, reproduzir | mostrar controles, acionar botão focado |
-| Segurar OK, F2 | menu do vídeo | menu de legendas (fallback) |
+| Segurar OK | menu do vídeo | |
 | Voltar, Esc, `GO_BACK` | voltar | ocultar controles e depois parar |
 
 ## Linha de comando

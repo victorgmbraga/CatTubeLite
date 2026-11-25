@@ -410,6 +410,10 @@ pub fn mpv_argv(
         "--no-terminal",
         "--wayland-app-id=cattube-player",
         "--osc=no",
+        // Only CatTube's keys: mpv's built-in ones (volume, the number
+        // keys, mouse wheel, stats, ...) would change things the
+        // controls don't offer.
+        "--no-input-default-bindings",
         "--cache=yes",
         // YouTube's video addresses only work a few seconds after they are
         // handed out (yt-dlp's "available_at"); until then they answer
@@ -847,6 +851,7 @@ mod tests {
         assert!(v.contains(&"--sid=no".to_string()));
         assert!(v.contains(&"--demuxer-max-bytes=256MiB".to_string()));
         assert!(v.contains(&"--input-ipc-server=/run/s.sock".to_string()));
+        assert!(v.contains(&"--no-input-default-bindings".to_string()));
         // Zero starts normally; every positive saved position is passed.
         let o2 = PlayOptions {
             start: 0.0,
