@@ -16,9 +16,8 @@
 --                                     --script-opts=cattube_osd-hide=yes)
 --   controls shown:   Left / Right    move over the buttons: Previous /
 --                                     Next video on the left (when there
---                                     is one), −10 s / Pause / +10 s in the
---                                     middle, Quality / Subtitles /
---                                     Audio right
+--                                     is one), Pause in the middle,
+--                                     Quality / Subtitles / Audio right
 --                     OK              press the button (Pause first)
 --                     Up              focus the seek bar: Left / Right scrub
 --                                     (10 s, 60 s when held), Down returns
@@ -120,9 +119,7 @@ local pause_button = { label = "Pause", group = "play", act = function() mp.comm
 local buttons = {
     { label = "Previous video",   group = "ep", hidden = true, act = function() episode("prev") end },
     { label = "Next video",       group = "ep", hidden = true, act = function() episode("next") end },
-    { label = "−10 s",            group = "play", act = function() seek(-10) end },
     pause_button,
-    { label = "+10 s",            group = "play", act = function() seek(10) end },
     { label = "Quality",          group = "track", act = function() open_menu("quality") end },
     { label = "Subtitles",        group = "track", act = function() open_menu("sub") end },
     { label = "Audio",            group = "track", act = function() open_menu("audio") end },
