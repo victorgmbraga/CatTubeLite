@@ -52,7 +52,7 @@ CatTubeLite is based on upstream CatTube `1.0.4` and introduces these main sets 
 
 - **YouTube without an account.** Home shows live streams and popular topics, History lists what was watched on this TV, and Search finds the rest. Channel and playlist pages open from any video.
 - **Search** with debounced suggestions as you type and recent searches when the box is empty. Results show matching channels first, followed by a paginated grid of videos.
-- **A player made for the remote.** OK shows the controls, Left and Right skip 10 seconds, Up goes to the progress bar. Quality, subtitles and audio tracks are a button away; in this fork videos always play at normal speed and Back closes the player (there is no Stop button), chapters show on the bar, and changing quality keeps your position.
+- **A player made for the remote.** OK shows the controls, Left and Right skip 10 seconds, Up goes to the progress bar. Quality, subtitles and audio tracks are a button away; in this fork videos always play at normal speed and Back closes the player (there is no Stop button), chapters show on the bar, and changing quality keeps your position. Only these controls act on the player: `mpv`'s own keys (volume, the number keys, mouse wheel, and so on) are turned off.
 - **SponsorBlock.** Sponsor segments, intros, outros, reminders and other chosen categories are skipped and marked on the progress bar.
 - **Video menu.** Hold OK on a video to see its views and date, start over or open the channel.
 - **Up next.** Plays the next video after a short countdown, loops, or stops — configurable in Settings.
@@ -137,7 +137,7 @@ To see hardware decoding, dropped frames and memory over the video, turn on **Se
 | Arrows | move around | Left / Right skip 10 s (with the controls hidden, the progress bar shows alone for a moment), Up / Down between seek bar, controls and related videos |
 | Rewind / Forward, Previous / Next | | skip 30 s / 90 s, with the same progress bar |
 | OK, Enter | open, play | show controls, press focused button |
-| Hold OK, F2 | video menu | subtitle menu (fallback) |
+| Hold OK | video menu | |
 | Back, Esc, `GO_BACK` | back | hide controls, then stop |
 
 ## Command line
