@@ -123,6 +123,14 @@ impl Images {
         }
     }
 
+    /// Drop all cached textures and decoded images to free unified RAM/VRAM
+    /// (e.g. while the fullscreen player runs on a 1 GiB TV box).
+    pub fn clear(&mut self) {
+        self.entries.get_mut().clear();
+        self.wanted.get_mut().clear();
+        self.bytes = 0;
+    }
+
     /// Run after drawing so textures touched in this frame are newest.
     pub fn trim(&mut self) {
         let entries = self.entries.get_mut();
@@ -246,6 +254,10 @@ mod tests {
         assert!(images.get(&ctx, "recent", false).is_some());
         assert!(images.get(&ctx, "new", false).is_some());
         assert_eq!(images.bytes, 8);
+        images.clear();
+        assert_eq!(images.bytes, 0);
+        assert!(images.entries.borrow().is_empty());
+        assert_eq!(images.take_wanted().count(), 0);
     }
 
     #[test]
