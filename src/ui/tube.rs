@@ -181,8 +181,7 @@ fn now_playing_bar(c: &C, tile: &Tile, focused: bool) {
 /// The screen under the video menu.
 fn draw_under(c: &C, v: &View) {
     if theme::FLAT {
-        // A solid cover: nothing to draw beneath it.
-        c.fill(c.screen, 0.0, Color32::BLACK);
+        // The framebuffer is already cleared to pure black: nothing to draw beneath.
         return;
     }
     let below = v.tube.stack.len().saturating_sub(2);
@@ -539,7 +538,9 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
             theme::accent(),
         );
     }
-    c.frost_edge(rect, RADIUS, 0.4);
+    if !theme::FLAT {
+        c.frost_edge(rect, RADIUS, 0.4);
+    }
     widgets::focus_sheen(c, rect, RADIUS, focus);
     // A ring in the accent colour, so the focused card is plain to see
     // over any picture (the lift alone was easy to miss).
@@ -679,12 +680,7 @@ fn rows(
             Align2::LEFT_TOP,
             title,
             18.0,
-            Color32::from_rgba_unmultiplied(
-                theme::INK.0,
-                theme::INK.1,
-                theme::INK.2,
-                ((150.0 + 105.0 * tr) * rise) as u8,
-            ),
+            theme::rgba(theme::INK, ((150.0 + 105.0 * tr) * rise) as u8),
             Weight::Semibold,
         );
         let col = focus
