@@ -619,6 +619,12 @@ impl App {
         self.yt_dlp_ready = true;
         match yt::start_player(&o, &self.data) {
             Ok(child) => {
+                if self.low_power {
+                    // Release decoded GL textures before mpv + Deno allocate
+                    // video buffers on a 1 GiB RAM box; the opening frame
+                    // flushes `glDeleteTextures` right away.
+                    self.images.clear();
+                }
                 self.opening = Some(Instant::now());
                 ctx.request_repaint();
                 let watcher_player = child.clone();
@@ -718,9 +724,13 @@ impl App {
             Msg::Quiet => {}
             Msg::Images(batch) => {
                 let frame = ctx.cumulative_frame_nr();
+                let drop_for_player = self.low_power
+                    && (self.opening.is_some() || (self.player.is_some() && !self.was_focused));
                 for (url, image) in batch {
                     self.fetching.remove(&url);
-                    self.images.complete(url, image, frame);
+                    if !drop_for_player {
+                        self.images.complete(url, image, frame);
+                    }
                 }
             }
             Msg::Tools(r) => {
@@ -999,6 +1009,36 @@ impl eframe::App for App {
 
         let mut canvas: Canvas<Target> = Canvas::new(ui, 0);
         canvas.reduce_motion = self.low_power;
+        // Opening a video: draw only the black loading screen and spinner,
+        // skipping the catalogue underneath and any thumbnail fetches while
+        // mpv + yt-dlp are starting.
+        if let Some(since) = self.opening
+            && self.closing.is_none()
+        {
+            ui.painter()
+                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            widgets::spinner(
+                &canvas,
+                640.0,
+                360.0,
+                31.0 * 2.0 / 3.0,
+                since.elapsed().as_secs_f64(),
+            );
+            self.hits.clear();
+            return;
+        }
+        // Covered by the fullscreen player: do not redraw, animate spinners, or
+        // decode thumbnails in the background. On low-power boxes, also free
+        // any textures left from a temporary return to the browser.
+        if !focused && self.player.is_some() && self.closing.is_none() {
+            if self.low_power {
+                self.images.clear();
+            }
+            ui.painter()
+                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            self.hits.clear();
+            return;
+        }
         canvas.background_at(None, false, now);
         let view = ui::tube::View {
             tube: &self.tube,
@@ -1033,20 +1073,6 @@ impl eframe::App for App {
                 left.min(0.016)
             };
             ctx.request_repaint_after(Duration::from_secs_f32(next));
-        }
-        if let Some(since) = self.opening {
-            // The player's loading screen, as `cattube-osd.lua` draws it
-            // (1080p arc of radius 31, width 6, in the 720p design space),
-            // timed from the same start, so the handover does not show.
-            ui.painter()
-                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
-            widgets::spinner(
-                &canvas,
-                640.0,
-                360.0,
-                31.0 * 2.0 / 3.0,
-                since.elapsed().as_secs_f64(),
-            );
         }
         self.hits = canvas.take_hits();
         self.images.trim();
