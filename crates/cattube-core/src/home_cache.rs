@@ -90,15 +90,22 @@ pub fn parse(ctx: &str, text: &str) -> Option<Page> {
                 if get(2).is_empty() {
                     continue;
                 }
+                let id = get(2).to_string();
+                let raw_thumb = get(8);
+                let thumb = if matches!(kind, Kind::Video | Kind::Short | Kind::Live) {
+                    crate::youtube::normalize_video_thumb(&id, raw_thumb)
+                } else {
+                    raw_thumb.to_string()
+                };
                 shelf.tiles.push(Tile {
                     kind,
-                    id: get(2).to_string(),
+                    id,
                     title: get(3).to_string(),
                     byline: get(4).to_string(),
                     channel_id: get(5).to_string(),
                     meta: get(6).to_string(),
                     badge: get(7).to_string(),
-                    thumb: get(8).to_string(),
+                    thumb,
                     progress: None,
                 });
             }

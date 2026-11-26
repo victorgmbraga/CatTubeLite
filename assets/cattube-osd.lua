@@ -1065,11 +1065,14 @@ local function related_overlays(atlas)
     end
     local dims = mp.get_property_native("osd-dimensions") or {}
     local sx, sy = (dims.w or W) / W, (dims.h or H) / H
-    local offset_y = math.floor(related_scroll * RSTEP + 0.5)
-    local height = math.min(H - 40 - RY, atlas.h - offset_y)
+    local as = atlas.s or 1
+    local offset_y = math.floor(related_scroll * RSTEP * as + 0.5)
+    local vis_h = math.floor((H - 40 - RY) * as + 0.5)
+    local height = math.min(vis_h, atlas.h - offset_y)
     if height <= 0 then return end
     local x, y = math.floor(RX * sx), math.floor(RY * sy)
-    local dw, dh = math.floor(atlas.w * sx), math.floor(height * sy)
+    local dw = math.floor((atlas.w / as) * sx + 0.5)
+    local dh = math.floor((height / as) * sy + 0.5)
     local offset = offset_y * atlas.w * 4
     local key = table.concat({atlas.p, atlas.v or 0, x, y, offset, height, dw, dh}, " ")
     if key ~= related_placed then

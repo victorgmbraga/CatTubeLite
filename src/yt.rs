@@ -295,72 +295,6 @@ pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
     path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
-/// Fetch a batch of pictures into the disk cache in-process over persistent
-/// keep-alive connections (`ureq`), avoiding `curl` subprocess spawns and
-/// repeated TLS handshakes. Returns `(url, Some(local_path))` in the same
-/// order as `urls`.
-pub fn fetch_images_batch(
-    cache: &Path,
-    urls: &[String],
-    low_power: bool,
-) -> Vec<(String, Option<String>)> {
-    let mut seen = std::collections::HashSet::new();
-    let mut missing: Vec<(&str, PathBuf)> = Vec::new();
-    for url in urls {
-        let base = url.strip_suffix("#blur").unwrap_or(url.as_str());
-        if !cattube_core::mpv::is_playable_url(base) {
-            continue;
-        }
-        // If `#blur` itself is already cached, its base doesn't need downloading.
-        if url.ends_with("#blur") && image_path(cache, url).is_file() {
-            continue;
-        }
-        let target = image_path(cache, base);
-        if !target.is_file() && seen.insert(target.clone()) {
-            missing.push((base, target));
-        }
-    }
-
-    if missing.len() == 1 {
-        let _ = download_image_bytes(missing[0].0, &missing[0].1);
-    } else if missing.len() > 1 {
-        let parallel_max = if low_power { 4 } else { 8 };
-        for chunk in missing.chunks(parallel_max) {
-            std::thread::scope(|s| {
-                for (url, target) in chunk {
-                    s.spawn(move || {
-                        let _ = download_image_bytes(url, target);
-                    });
-                }
-            });
-        }
-    }
-
-    urls.iter()
-        .map(|url| {
-            let resolved = if let Some(base) = url.strip_suffix("#blur") {
-                let path = image_path(cache, url);
-                if path.is_file() {
-                    Some(path.to_string_lossy().into_owned())
-                } else {
-                    let src = image_path(cache, base);
-                    if src.is_file() && blur_into(&src, &path).is_some() {
-                        Some(path.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
-            } else if cattube_core::mpv::is_playable_url(url) {
-                let path = image_path(cache, url);
-                path.is_file().then(|| path.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-            (url.clone(), resolved)
-        })
-        .collect()
-}
-
 /// Download a batch of missing pictures in-process (bounded parallelism over
 /// persistent keep-alive connections) and return their bytes in memory so
 /// callers can decode immediately without re-reading from disk.
@@ -896,16 +830,9 @@ fn thumbnail_size(osd_width: f64, width: f64) -> (u32, u32) {
     ((width * scale) as u32, (width * 9.0 / 16.0 * scale) as u32)
 }
 
-/// Decode and scale a thumbnail directly into BGRA bytes in memory.
-fn bgra_thumbnail_pixels(
-    cache: &Path,
-    id: &str,
-    osd_width: f64,
-    width: f64,
-) -> Option<(Vec<u8>, u32, u32)> {
-    let (w, h) = thumbnail_size(osd_width, width);
-    let pic = fetch_image(cache, &yt::video_thumb_hq(id))?;
-    let img = image::load_from_memory(&std::fs::read(pic).ok()?).ok()?;
+/// Decode and scale raw image bytes directly into BGRA pixels in memory.
+fn bgra_from_bytes(bytes: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(bytes).ok()?;
     let mut px = img
         .resize_to_fill(w, h, image::imageops::FilterType::Triangle)
         .to_rgba8()
@@ -916,15 +843,36 @@ fn bgra_thumbnail_pixels(
     Some((px, w, h))
 }
 
+/// Decode and scale a thumbnail directly into BGRA bytes in memory.
+/// Uses `mqdefault` (320×180, no black bars) whenever it already covers the
+/// target slot or in `low_power` mode.
+fn bgra_thumbnail_pixels(
+    cache: &Path,
+    id: &str,
+    osd_width: f64,
+    width: f64,
+    low_power: bool,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let (w, h) = thumbnail_size(osd_width, width);
+    let url = if low_power || w <= 320 {
+        yt::video_thumb_mq(id)
+    } else {
+        yt::video_thumb_hq(id)
+    };
+    let bytes = fetch_image_bytes(cache, &url)?;
+    bgra_from_bytes(&bytes, w, h)
+}
+
 /// Raw thumbnail pixels written once for a player overlay.
 fn bgra_thumbnail(
     cache: &Path,
     id: &str,
     osd_width: f64,
     width: f64,
+    low_power: bool,
     name: &str,
 ) -> Option<(String, u32, u32)> {
-    let (px, w, h) = bgra_thumbnail_pixels(cache, id, osd_width, width)?;
+    let (px, w, h) = bgra_thumbnail_pixels(cache, id, osd_width, width, low_power)?;
     let path = player::player_socket().with_file_name(name);
     std::fs::write(&path, px).ok()?;
     Some((path.to_string_lossy().into_owned(), w, h))
@@ -941,7 +889,18 @@ const RELATED_ATLAS_W: usize = 1680;
 const RELATED_FLUSH_BATCH: usize = 4;
 const RELATED_FLUSH_INTERVAL: Duration = Duration::from_millis(400);
 
-fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize)>) -> String {
+fn related_atlas_geometry(low_power: bool) -> (usize, usize, usize, f64, f64) {
+    let div = if low_power { 2usize } else { 1usize };
+    (
+        RELATED_ATLAS_W / div,
+        RELATED_STEP_X / div,
+        RELATED_STEP_Y / div,
+        RELATED_THUMB_W / div as f64,
+        1.0 / div as f64,
+    )
+}
+
+fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize, f64)>) -> String {
     let list: Vec<_> = tiles
         .iter()
         .map(|t| {
@@ -955,9 +914,9 @@ fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize)>) 
         .collect();
     let atlas = atlas.map_or_else(
         || "null".to_string(),
-        |(p, w, h, v)| {
+        |(p, w, h, v, s)| {
             format!(
-                "{{\"p\":{},\"w\":{w},\"h\":{h},\"v\":{v}}}",
+                "{{\"p\":{},\"w\":{w},\"h\":{h},\"v\":{v},\"s\":{s}}}",
                 mpv::json_string(p)
             )
         },
@@ -1050,9 +1009,12 @@ fn send_related(
     }
     send(&related_json(&tiles, None));
     // One transparent image plane keeps every thumbnail in the same frame.
-    // Its source stays at design resolution even on a 4K screen.
-    let height = tiles.len().div_ceil(4) * RELATED_STEP_Y;
-    let mut pixels = vec![0u8; RELATED_ATLAS_W * height * 4];
+    // On low-power devices (1 GiB RAM TV boxes), build the atlas at half scale
+    // (840x480 = 1.54 MiB instead of 6.15 MiB) and source from mqdefault.
+    let (atlas_w, step_x, step_y, thumb_w, atlas_scale) = related_atlas_geometry(session.low_power);
+    let (tw, th) = thumbnail_size(1920.0, thumb_w);
+    let height = tiles.len().div_ceil(4) * step_y;
+    let mut pixels = vec![0u8; atlas_w * height * 4];
     let safe_id: String = id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
@@ -1069,21 +1031,28 @@ fn send_related(
         if !current() {
             return;
         }
-        let urls: Vec<String> = chunk.iter().map(|t| yt::video_thumb_hq(&t.id)).collect();
-        let _ = fetch_images_batch(&session.cache, &urls, session.low_power);
-        for (offset, tile) in chunk.iter().enumerate() {
+        let urls: Vec<String> = chunk
+            .iter()
+            .map(|t| {
+                if session.low_power {
+                    yt::video_thumb_mq(&t.id)
+                } else {
+                    yt::video_thumb_hq(&t.id)
+                }
+            })
+            .collect();
+        let fetched = fetch_missing_image_bytes(&session.cache, &urls, session.low_power);
+        for (offset, (_, raw)) in fetched.into_iter().enumerate() {
             if !current() {
                 return;
             }
             let i = chunk_idx * RELATED_FLUSH_BATCH + offset;
-            if let Some((bytes, w, h)) =
-                bgra_thumbnail_pixels(&session.cache, &tile.id, 1920.0, RELATED_THUMB_W)
+            if let Some(raw) = raw
+                && let Some((bytes, w, h)) = bgra_from_bytes(&raw, tw, th)
                 && bytes.len() == w as usize * h as usize * 4
             {
                 for row in 0..h as usize {
-                    let dest = ((i / 4 * RELATED_STEP_Y + row) * RELATED_ATLAS_W
-                        + i % 4 * RELATED_STEP_X)
-                        * 4;
+                    let dest = ((i / 4 * step_y + row) * atlas_w + i % 4 * step_x) * 4;
                     let source = row * w as usize * 4;
                     pixels[dest..dest + w as usize * 4]
                         .copy_from_slice(&bytes[source..source + w as usize * 4]);
@@ -1112,7 +1081,7 @@ fn send_related(
                     revision += 1;
                     send(&related_json(
                         &tiles,
-                        Some((&name, RELATED_ATLAS_W, height, revision)),
+                        Some((&name, atlas_w, height, revision, atlas_scale)),
                     ));
                     sent_at = Instant::now();
                     pending = 0;
@@ -1153,6 +1122,7 @@ fn fetch_card_thumbnail(
     cache: PathBuf,
     id: String,
     width: f64,
+    low_power: bool,
 ) -> std::sync::mpsc::Receiver<Option<CardThumbnail>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1164,6 +1134,7 @@ fn fetch_card_thumbnail(
                 &id,
                 width,
                 CARD_THUMB_W,
+                low_power,
                 &format!("cattube-next-{}-{serial}.bgra", std::process::id()),
             )
             .map(CardThumbnail)
@@ -1486,16 +1457,16 @@ pub fn spawn_watcher(
                 let mut skipped_to_end = false;
                 let mut thumb: Option<CardThumbnail> = None;
                 let width = conn.get_f64("osd-width").unwrap_or(1920.0);
-                let mut thumb_job = next_id
-                    .as_ref()
-                    .map(|n| fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width));
+                let mut thumb_job = next_id.as_ref().map(|n| {
+                    fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
+                });
                 loop {
                     if let Ok(next) = next_rx.try_recv() {
                         next_id = next;
                         next_pending = false;
-                        thumb_job = next_id
-                            .as_ref()
-                            .map(|n| fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width));
+                        thumb_job = next_id.as_ref().map(|n| {
+                            fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
+                        });
                         episode_controls(&mut conn, !history.is_empty(), next_id.is_some(), false);
                     }
                     if let Ok(found) = segments_rx.try_recv() {
@@ -1713,6 +1684,12 @@ mod player_tests {
         assert_eq!(thumbnail_size(1920.0, CARD_THUMB_W), (256, 144));
         assert_eq!(thumbnail_size(1280.0, CARD_THUMB_W), (170, 96));
         assert_eq!(thumbnail_size(3840.0, CARD_THUMB_W), (512, 288));
+        // Low-power related atlas is half scale (4x less RAM/I/O) and tiles fit cleanly.
+        let (aw, sx, sy, tw, scale) = related_atlas_geometry(true);
+        assert_eq!((aw, sx, sy, scale), (840, 215, 160, 0.5));
+        let (w, h) = thumbnail_size(1920.0, tw);
+        assert_eq!(3 * sx + w as usize, aw);
+        assert!((h as usize) < sy);
     }
 
     #[test]
@@ -1875,7 +1852,7 @@ mod player_tests {
         img.save_with_format(&cached, image::ImageFormat::Jpeg)
             .unwrap();
 
-        let res = fetch_images_batch(
+        let res = fetch_missing_image_bytes(
             &root,
             &[
                 url.to_string(),
@@ -1885,9 +1862,9 @@ mod player_tests {
             true,
         );
         assert_eq!(res.len(), 3);
-        assert_eq!(res[0].1.as_deref(), Some(cached.to_string_lossy().as_ref()));
-        let blur_path = res[1].1.as_deref().expect("blur image generated");
-        assert!(Path::new(blur_path).is_file());
+        assert!(res[0].1.as_ref().is_some_and(|b| !b.is_empty()));
+        assert!(res[1].1.as_ref().is_some_and(|b| !b.is_empty()));
+        assert!(image_path(&root, &blur_url).is_file());
         assert!(res[2].1.is_none());
         // No leftover .part files.
         let parts: Vec<_> = std::fs::read_dir(root.join("images"))
