@@ -38,7 +38,7 @@ pub fn parse(text: &str) -> Vec<Tile> {
                 byline: get(2),
                 channel_id: get(3),
                 badge: get(4),
-                thumb: get(5),
+                thumb: crate::youtube::normalize_video_thumb(id, &get(5)),
                 ..Tile::default()
             })
         })
@@ -82,7 +82,7 @@ pub fn remember(list: &mut Vec<Tile>, t: &Tile) {
     t.meta.clear();
     // Opened from the TV's home screen: only the id is known.
     if t.thumb.is_empty() {
-        t.thumb = format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", t.id);
+        t.thumb = crate::youtube::video_thumb(&t.id);
     }
     list.retain(|x| x.id != t.id);
     list.insert(0, t);
