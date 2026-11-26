@@ -44,22 +44,6 @@ pub fn friendly(t: &str) -> String {
     }
 }
 
-/// Quote a string for `curl -K` config syntax so paths and URLs cannot inject
-/// additional options.
-fn curl_quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' | '\r' => {}
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Connections to YouTube kept open between requests: a new `curl` for
 /// each one paid a process start and a TLS handshake every time (about
 /// 0.1 s on a desktop, more on a TV box).
@@ -72,8 +56,33 @@ static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
         .build()
 });
 
-/// One request to YouTube (or SponsorBlock): a POST of JSON when there is
-/// a `body`, else a GET. The answer's text, or a sentence for the TV.
+/// Persistent HTTP/TLS pool for thumbnails, avatars and plain GETs (e.g.
+/// SponsorBlock, search suggestions) without YouTube InnerTube headers.
+static PLAIN_AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .max_idle_connections_per_host(4)
+        .build()
+});
+
+/// Maximum accepted thumbnail / avatar download size (8 MiB).
+const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_response_text(reply: Result<ureq::Response, ureq::Error>) -> Result<String, String> {
+    match reply {
+        Ok(r) => r.into_string().map_err(|e| friendly(&e.to_string())),
+        Err(ureq::Error::Status(code, _)) => Err(friendly(&format!("http {code}"))),
+        Err(ureq::Error::Transport(t)) => Err(friendly(&match t.kind() {
+            ureq::ErrorKind::Dns => "could not resolve".to_string(),
+            ureq::ErrorKind::ConnectionFailed => "failed to connect".to_string(),
+            _ => t.to_string(),
+        })),
+    }
+}
+
+/// One InnerTube request to YouTube: a POST of JSON when there is a `body`,
+/// else a GET. The answer's text, or a sentence for the TV.
 fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
     let request = |method: &str| {
         AGENT
@@ -89,15 +98,12 @@ fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
             .send_string(b),
         None => request("GET").call(),
     };
-    match reply {
-        Ok(r) => r.into_string().map_err(|e| friendly(&e.to_string())),
-        Err(ureq::Error::Status(code, _)) => Err(friendly(&format!("http {code}"))),
-        Err(ureq::Error::Transport(t)) => Err(friendly(&match t.kind() {
-            ureq::ErrorKind::Dns => "could not resolve".to_string(),
-            ureq::ErrorKind::ConnectionFailed => "failed to connect".to_string(),
-            _ => t.to_string(),
-        })),
-    }
+    read_response_text(reply)
+}
+
+/// Plain GET without YouTube InnerTube headers (SponsorBlock, suggestions).
+fn get_plain(url: &str) -> Result<String, String> {
+    read_response_text(PLAIN_AGENT.get(url).call())
 }
 
 // --------------------------------------------------------------- lists
@@ -155,7 +161,7 @@ pub fn search(ctx: &str, q: &str) -> Result<Page, String> {
 }
 
 pub fn suggestions(q: &str, hl: &str) -> Vec<String> {
-    curl(&yt::suggest_url_for(q, hl), None)
+    get_plain(&yt::suggest_url_for(q, hl))
         .map(|b| yt::parse_suggestions(&b))
         .unwrap_or_default()
 }
@@ -205,6 +211,67 @@ fn blur_into(src: &Path, out: &Path) -> Option<()> {
     }
 }
 
+/// Existing disk-cache path for `url`, if already downloaded.
+pub fn cached_image_path(cache: &Path, url: &str) -> Option<String> {
+    let base = url.strip_suffix("#blur").unwrap_or(url);
+    if !cattube_core::mpv::is_playable_url(base) {
+        return None;
+    }
+    let path = image_path(cache, url);
+    path.is_file().then(|| path.to_string_lossy().into_owned())
+}
+
+/// Remove a corrupt/undecodable cached image file.
+pub fn remove_cached_image(cache: &Path, url: &str) {
+    let _ = std::fs::remove_file(image_path(cache, url));
+}
+
+/// Download `url` into `target` atomically via persistent HTTP/TLS (`ureq`)
+/// and return the raw bytes so callers can decode directly from memory.
+fn download_image_bytes(url: &str, target: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let resp = PLAIN_AGENT.get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    if let Some(parent) = target.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+    {
+        let tmp = cattube_core::util::unique_tmp_path(target, "part");
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, target).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Some(bytes)
+}
+
+/// Download a picture into the cache; returns its bytes in memory (decoding
+/// directly avoids re-reading from flash right after writing).
+pub fn fetch_image_bytes(cache: &Path, url: &str) -> Option<Vec<u8>> {
+    if let Some(base) = url.strip_suffix("#blur") {
+        let path = image_path(cache, url);
+        if let Ok(bytes) = std::fs::read(&path) {
+            return Some(bytes);
+        }
+        let src = fetch_image(cache, base)?;
+        blur_into(Path::new(&src), &path)?;
+        return std::fs::read(&path).ok();
+    }
+    if !cattube_core::mpv::is_playable_url(url) {
+        return None;
+    }
+    let path = image_path(cache, url);
+    if let Ok(bytes) = std::fs::read(&path) {
+        return Some(bytes);
+    }
+    download_image_bytes(url, &path)
+}
+
 /// Download a picture into the cache; returns its path. An address ending
 /// in `#blur` gives the blurred copy (the picture behind a focused video).
 pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
@@ -224,45 +291,21 @@ pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
     if path.is_file() {
         return Some(path.to_string_lossy().into_owned());
     }
-    let _ = std::fs::create_dir_all(path.parent()?);
-    // Each download its own partial file: the card and the blurred
-    // backdrop can ask for the same picture at once.
-    let tmp = cattube_core::util::unique_tmp_path(&path, "part");
-    let ok = SystemRunner
-        .run(
-            &Cmd::new("curl")
-                .args([
-                    "-sS".to_string(),
-                    "--fail".to_string(),
-                    "-m".to_string(),
-                    "20".to_string(),
-                    "-o".to_string(),
-                    tmp.display().to_string(),
-                    "--".to_string(),
-                    url.to_string(),
-                ])
-                .timeout(Duration::from_secs(25)),
-        )
-        .is_ok_and(|o| o.success())
-        && std::fs::rename(&tmp, &path).is_ok();
-    if ok {
-        Some(path.to_string_lossy().into_owned())
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        None
-    }
+    download_image_bytes(url, &path)?;
+    path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
-/// Fetch a batch of pictures into the disk cache using a single `curl --parallel`
-/// invocation for all cache misses (reusing HTTP/2 + TLS connections). Returns
-/// `(url, Some(local_path))` in the same order as `urls`.
+/// Fetch a batch of pictures into the disk cache in-process over persistent
+/// keep-alive connections (`ureq`), avoiding `curl` subprocess spawns and
+/// repeated TLS handshakes. Returns `(url, Some(local_path))` in the same
+/// order as `urls`.
 pub fn fetch_images_batch(
     cache: &Path,
     urls: &[String],
     low_power: bool,
 ) -> Vec<(String, Option<String>)> {
     let mut seen = std::collections::HashSet::new();
-    let mut missing: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
+    let mut missing: Vec<(&str, PathBuf)> = Vec::new();
     for url in urls {
         let base = url.strip_suffix("#blur").unwrap_or(url.as_str());
         if !cattube_core::mpv::is_playable_url(base) {
@@ -274,60 +317,22 @@ pub fn fetch_images_batch(
         }
         let target = image_path(cache, base);
         if !target.is_file() && seen.insert(target.clone()) {
-            let tmp = cattube_core::util::unique_tmp_path(&target, "part");
-            missing.push((base, target, tmp));
+            missing.push((base, target));
         }
     }
 
     if missing.len() == 1 {
-        let _ = fetch_image(cache, missing[0].0);
+        let _ = download_image_bytes(missing[0].0, &missing[0].1);
     } else if missing.len() > 1 {
-        let img_dir = cache.join("images");
-        if std::fs::create_dir_all(&img_dir).is_ok() {
-            let config: String = missing
-                .iter()
-                .map(|(url, _, tmp)| {
-                    format!(
-                        "url = {}\noutput = {}\n",
-                        curl_quote(url),
-                        curl_quote(&tmp.display().to_string())
-                    )
-                })
-                .collect();
-            let list = cattube_core::util::unique_tmp_path(
-                &cattube_core::env::runtime_dir().join("cattube-img-batch"),
-                "cfg",
-            );
-            let parallel_max = if low_power { "4" } else { "8" };
-            let timed_out = if std::fs::write(&list, config).is_ok() {
-                let res = SystemRunner.run(
-                    &Cmd::new("curl")
-                        .args([
-                            "-sS".to_string(),
-                            "--fail".to_string(),
-                            "--parallel".to_string(),
-                            "--parallel-max".to_string(),
-                            parallel_max.to_string(),
-                            "-m".to_string(),
-                            "20".to_string(),
-                            "-K".to_string(),
-                            list.display().to_string(),
-                        ])
-                        .timeout(Duration::from_secs(30)),
-                );
-                let _ = std::fs::remove_file(&list);
-                res.map(|o| o.timed_out).unwrap_or(true)
-            } else {
-                true
-            };
-            for (_, target, tmp) in &missing {
-                let valid = !timed_out
-                    && std::fs::metadata(tmp).is_ok_and(|m| m.len() > 0)
-                    && std::fs::rename(tmp, target).is_ok();
-                if !valid {
-                    let _ = std::fs::remove_file(tmp);
+        let parallel_max = if low_power { 4 } else { 8 };
+        for chunk in missing.chunks(parallel_max) {
+            std::thread::scope(|s| {
+                for (url, target) in chunk {
+                    s.spawn(move || {
+                        let _ = download_image_bytes(url, target);
+                    });
                 }
-            }
+            });
         }
     }
 
@@ -354,6 +359,35 @@ pub fn fetch_images_batch(
             (url.clone(), resolved)
         })
         .collect()
+}
+
+/// Download a batch of missing pictures in-process (bounded parallelism over
+/// persistent keep-alive connections) and return their bytes in memory so
+/// callers can decode immediately without re-reading from disk.
+pub fn fetch_missing_image_bytes(
+    cache: &Path,
+    urls: &[String],
+    low_power: bool,
+) -> Vec<(String, Option<Vec<u8>>)> {
+    if urls.len() <= 1 {
+        return urls
+            .iter()
+            .map(|u| (u.clone(), fetch_image_bytes(cache, u)))
+            .collect();
+    }
+    let parallel_max = if low_power { 4 } else { 8 };
+    let mut out = Vec::with_capacity(urls.len());
+    for chunk in urls.chunks(parallel_max) {
+        let results: Vec<(String, Option<Vec<u8>>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|u| s.spawn(move || (u.clone(), fetch_image_bytes(cache, u))))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        out.extend(results);
+    }
+    out
 }
 
 /// Evict oldest cached images when `cache/images` grows beyond `max_bytes` or
@@ -1214,7 +1248,7 @@ fn spawn_next_lookup(s: &Session, id: String, tx: std::sync::mpsc::Sender<Option
 
 fn spawn_segments_lookup(url: String, tx: std::sync::mpsc::Sender<Vec<community::Segment>>) {
     std::thread::spawn(move || {
-        let segments = curl(&url, None)
+        let segments = get_plain(&url)
             .ok()
             .map(|b| community::parse_segments(&b))
             .unwrap_or_default();
@@ -1741,11 +1775,47 @@ mod player_tests {
     }
 
     #[test]
-    fn curl_quote_escapes_quotes_backslashes_and_newlines() {
-        assert_eq!(
-            curl_quote("https://example.com/a\"b\\c\nd\re"),
-            "\"https://example.com/a\\\"b\\\\cde\""
-        );
+    fn ureq_image_fetch_downloads_caches_and_decodes_in_memory() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let root = std::env::temp_dir().join(format!(
+            "cattube-img-http-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut jpeg = Vec::new();
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([12, 34, 56]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = jpeg.clone();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(&body).unwrap();
+        });
+        let url = format!("http://{addr}/thumb.jpg");
+        let got = fetch_missing_image_bytes(&root, std::slice::from_ref(&url), true);
+        server.join().unwrap();
+        assert_eq!(got.len(), 1);
+        let bytes = got[0].1.as_ref().expect("downloaded bytes");
+        assert_eq!(bytes, &jpeg);
+        assert!(cached_image_path(&root, &url).is_some());
+        assert!(crate::images::decode_bytes(bytes, 320).is_some());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -153,10 +153,25 @@ impl Images {
 
 /// Decode a downloaded PNG, JPEG or WebP away from the interface thread.
 pub fn decode(path: &str, max_side: u32) -> Option<ColorImage> {
-    let mut reader = image::ImageReader::open(path)
+    let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
+    decode_reader(reader, max_side)
+}
+
+/// Decode a PNG, JPEG or WebP directly from bytes already in memory.
+pub fn decode_bytes(bytes: &[u8], max_side: u32) -> Option<ColorImage> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    decode_reader(reader, max_side)
+}
+
+fn decode_reader<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+    max_side: u32,
+) -> Option<ColorImage> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(DECODE_LIMIT);
     limits.max_image_height = Some(DECODE_LIMIT);
