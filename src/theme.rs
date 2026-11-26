@@ -203,8 +203,8 @@ pub fn setup(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = rgb(BG_BOTTOM);
-    visuals.window_fill = rgb(BG_TOP);
+    visuals.panel_fill = if FLAT { Color32::BLACK } else { rgb(BG_BOTTOM) };
+    visuals.window_fill = if FLAT { Color32::BLACK } else { rgb(BG_TOP) };
     visuals.override_text_color = Some(text());
     ctx.set_visuals(visuals);
 }

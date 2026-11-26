@@ -914,6 +914,14 @@ fn hit_test(hits: &[(egui::Rect, Target)], pos: egui::Pos2) -> Option<Target> {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if theme::FLAT {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            theme::rgb(theme::BG_BOTTOM).to_normalized_gamma_f32()
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         for msg in self.jobs.drain() {
             self.message(ctx, msg);
@@ -1021,8 +1029,10 @@ impl eframe::App for App {
         if let Some(since) = self.opening
             && self.closing.is_none()
         {
-            ui.painter()
-                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            if !theme::FLAT {
+                ui.painter()
+                    .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            }
             widgets::spinner(
                 &canvas,
                 640.0,
@@ -1040,8 +1050,10 @@ impl eframe::App for App {
             if self.low_power {
                 self.images.clear();
             }
-            ui.painter()
-                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            if !theme::FLAT {
+                ui.painter()
+                    .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            }
             self.hits.clear();
             return;
         }
@@ -1297,6 +1309,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         renderer,
+        // FLAT has no gradients; skip per-pixel interleaved gradient noise in
+        // egui_glow's fragment shader on GPUs like Mali-450 (FP16 mediump).
+        dithering: !theme::FLAT && !cattube_core::env::low_power(),
         ..Default::default()
     };
     let start = std::cell::Cell::new(Some(start));
