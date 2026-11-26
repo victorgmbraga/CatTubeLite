@@ -102,9 +102,22 @@ pub fn low_power() -> bool {
 
 /// At most this much memory is a low-power machine on any architecture.
 const LOW_MEMORY_MIB: u64 = 3 * 1024;
+/// Tight-memory threshold (e.g. 1 GiB TV boxes like BTV9): use a smaller
+/// default playback buffer (32 MiB) so mpv + JS runtime fit comfortably.
+const TIGHT_MEMORY_MIB: u64 = 1536;
 /// ARM machines from this much memory up (Raspberry Pi 5, ARM laptops) get
 /// the full experience, unless their GPU says otherwise.
 const CAPABLE_ARM_MIB: u64 = 6 * 1024;
+
+/// True on very small RAM devices (<= 1.5 GiB, e.g. 1 GiB TV boxes).
+pub fn tight_memory() -> bool {
+    static DETECTED: OnceLock<bool> = OnceLock::new();
+    *DETECTED.get_or_init(|| is_tight_memory(total_memory_mib()))
+}
+
+fn is_tight_memory(memory_mib: Option<u64>) -> bool {
+    memory_mib.is_some_and(|m| m <= TIGHT_MEMORY_MIB)
+}
 
 fn is_low_power(arm: bool, memory_mib: Option<u64>, weak_gpu: bool) -> bool {
     if weak_gpu || memory_mib.is_some_and(|m| m <= LOW_MEMORY_MIB) {
@@ -166,6 +179,11 @@ mod tests {
         assert!(!is_low_power(false, Some(8192), false));
         assert!(!is_low_power(false, None, false));
         assert!(is_low_power(true, None, false));
+        // 1 GiB TV boxes trigger tight_memory; 2 GiB+ do not.
+        assert!(is_tight_memory(Some(1024)));
+        assert!(is_tight_memory(Some(1536)));
+        assert!(!is_tight_memory(Some(2048)));
+        assert!(!is_tight_memory(None));
     }
 
     #[test]

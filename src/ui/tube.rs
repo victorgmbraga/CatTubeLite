@@ -50,7 +50,7 @@ pub struct View<'a> {
     pub tube: &'a Tube,
     pub prefs: &'a Prefs,
     pub pics: &'a Images,
-    pub positions: &'a [(String, f64)],
+    pub positions: &'a std::collections::HashMap<String, f64>,
     pub tools: &'a Scan<String>,
     pub yt_dlp_ready: bool,
     pub now: f64,
@@ -393,7 +393,7 @@ fn header(c: &C, v: &View, focus: Option<usize>) {
 
 fn resumed(v: &View, t: &Tile) -> Option<f32> {
     t.progress.or_else(|| {
-        let pos = v.positions.iter().find(|(id, _)| *id == t.id)?.1;
+        let pos = *v.positions.get(&t.id)?;
         // The length from the badge ("12:34", "1:02:03").
         let secs = t.badge.split(':').try_fold(0.0, |acc, p| {
             p.trim().parse::<f64>().ok().map(|n| acc * 60.0 + n)
@@ -428,18 +428,12 @@ fn card(c: &C, v: &View, t: &Tile, x: f32, y: f32, focus: f32, focused: bool) {
                 None => c.circle(cx, cy, d / 2.0, theme::rgba(theme::WHITE, 30)),
             }
         }
-        // Shorts are upright: the picture stands in the middle, its blurred
-        // copy fills the sides (squeezed into the card it looked wrong).
+        // Shorts are upright: the picture stands in the middle over dark sides
+        // (squeezed into the card it looked wrong).
         (Kind::Short, Some(tex)) => {
             let k = c.appear(("tube-pic", &t.thumb), 0.3);
             let tint = Color32::from_gray((255.0 * k) as u8);
-            let soft = (!theme::FLAT)
-                .then(|| v.pics.get(&c.ctx, &format!("{}#blur", t.thumb), false))
-                .flatten();
-            match soft {
-                Some(soft) => c.image_rounded(rect, RADIUS, soft, tint),
-                None => c.fill(rect, RADIUS, theme::rgba(theme::BLACK, 200)),
-            }
+            c.fill(rect, RADIUS, theme::rgba(theme::BLACK, 200));
             let w = (rh * 9.0 / 16.0).min(rw);
             c.image(c.r(rx + (rw - w) / 2.0, ry, w, rh), tex, tint);
         }
@@ -711,7 +705,7 @@ fn failed(c: &C, e: &str, y: f32) {
         640.0,
         y + 50.0,
         Align2::CENTER_CENTER,
-        e,
+        tr(e),
         20.0,
         theme::text2(),
         Weight::Medium,
@@ -984,7 +978,7 @@ fn draw_search(
                 64.0,
                 470.0,
                 Align2::LEFT_TOP,
-                e,
+                tr(e),
                 17.0,
                 theme::text2(),
                 Weight::Medium,
@@ -1025,7 +1019,7 @@ fn draw_menu(
     details: &Scan<cattube_core::youtube::Details>,
     index: usize,
 ) {
-    let resumable = v.positions.iter().any(|(id, _)| *id == tile.id);
+    let resumable = v.positions.contains_key(&tile.id);
     let items = tube::menu_items(resumable);
     let h = 238.0 + items.len() as f32 * 56.0;
     let m = widgets::modal(c, 620.0, h.min(660.0));
@@ -1188,10 +1182,11 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
     let scroll = c.anim(("tube-settings-scroll", shown), target);
     let list = c.clipped(330.0, 204.0, 898.0, 480.0);
     let p = v.prefs;
-    let quality = player::resolution_label(p.max_height);
+    let quality_raw = player::resolution_label(p.max_height);
+    let quality = tr(&quality_raw).to_string();
     let tools = match v.tools {
         Scan::Done(s) => s.first().cloned().unwrap_or_default(),
-        Scan::Failed(e) => e.clone(),
+        Scan::Failed(e) => tr(e).into(),
         _ => tr("Updating…").into(),
     };
     let mut y = 212.0 - scroll;
@@ -1229,6 +1224,7 @@ fn draw_settings(c: &C, v: &View, index: usize, on_groups: bool) {
                 tr("Buffer").into(),
                 tr("Bigger rides out a shaky connection, smaller uses less memory").into(),
                 match p.buffer {
+                    32 => tr("Minimum").into(),
                     64 => tr("Small").into(),
                     768 => tr("Large").into(),
                     _ => tr("Medium").into(),

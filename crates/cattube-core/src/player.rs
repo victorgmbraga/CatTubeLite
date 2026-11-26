@@ -217,8 +217,41 @@ pub fn update_cmd(yt_dlp: &Path) -> Cmd {
         .timeout(Duration::from_secs(180))
 }
 
-/// The JavaScript runtime yt-dlp is given: `deno:/path` (or `node:`).
+/// Sanitize an explicit `CATTUBE_JS_RUNTIME` override (`deno:/path`,
+/// `quickjs:/path`, `node:/path`, `bun:/path`). Rejects shell/option
+/// separators so it can safely enter `--ytdl-raw-options=js-runtimes=...`.
+fn sanitize_js_runtime(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 512 {
+        return None;
+    }
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, ',' | '"' | '\'' | ';' | '\n' | '\r'))
+    {
+        return None;
+    }
+    let name = s.split(':').next().unwrap_or("");
+    matches!(name, "deno" | "node" | "quickjs" | "bun").then(|| s.to_string())
+}
+
+/// The JavaScript runtime yt-dlp is given: `CATTUBE_JS_RUNTIME` if set, else
+/// system `deno`, CatTube's own `deno`, system `qjs`/`quickjs`, or `node`.
 pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option<String> {
+    js_runtime_with_env(
+        data,
+        find,
+        std::env::var("CATTUBE_JS_RUNTIME").ok().as_deref(),
+    )
+}
+
+pub fn js_runtime_with_env(
+    data: &Path,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+    env: Option<&str>,
+) -> Option<String> {
+    if let Some(forced) = env.and_then(sanitize_js_runtime) {
+        return Some(forced);
+    }
     if let Some(p) = find("deno") {
         return Some(format!("deno:{}", p.display()));
     }
@@ -227,6 +260,9 @@ pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option
     let own = own_deno_path(data);
     if crate::process::find_executable(&own.display().to_string()).is_some() {
         return Some(format!("deno:{}", own.display()));
+    }
+    if let Some(p) = find("qjs").or_else(|| find("quickjs")) {
+        return Some(format!("quickjs:{}", p.display()));
     }
     find("node").map(|p| format!("node:{}", p.display()))
 }
@@ -374,9 +410,9 @@ pub fn format_string(max_h: u32, codec: Codec, hdr: bool, low_power: bool) -> St
     parts.join("/")
 }
 
-/// Buffer sizes offered (MiB): small for little memory, large for shaky
-/// connections.
-pub const BUFFERS: [u32; 3] = [64, 256, 768];
+/// Buffer sizes offered (MiB): 32 MiB for 1 GiB TV boxes, up to 768 MiB for
+/// shaky connections on desktops.
+pub const BUFFERS: [u32; 4] = [32, 64, 256, 768];
 
 /// Countries for recommendations (YouTube's region codes).
 pub const REGIONS: [&str; 16] = [
@@ -1219,15 +1255,39 @@ mod tests {
     #[test]
     fn js_runtime_choice() {
         let none = |_: &str| None;
-        assert_eq!(js_runtime(Path::new("/nope"), &none), None);
+        assert_eq!(js_runtime_with_env(Path::new("/nope"), &none, None), None);
         let sys = |n: &str| (n == "node").then(|| PathBuf::from("/usr/bin/node"));
         assert_eq!(
-            js_runtime(Path::new("/nope"), &sys).as_deref(),
+            js_runtime_with_env(Path::new("/nope"), &sys, None).as_deref(),
             Some("node:/usr/bin/node")
+        );
+        let qjs = |n: &str| (n == "qjs").then(|| PathBuf::from("/usr/bin/qjs"));
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &qjs, None).as_deref(),
+            Some("quickjs:/usr/bin/qjs")
+        );
+        let quickjs = |n: &str| (n == "quickjs").then(|| PathBuf::from("/usr/bin/quickjs"));
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &quickjs, None).as_deref(),
+            Some("quickjs:/usr/bin/quickjs")
         );
         let deno = |n: &str| (n == "deno").then(|| PathBuf::from("/usr/bin/deno"));
         assert_eq!(
-            js_runtime(Path::new("/nope"), &deno).as_deref(),
+            js_runtime_with_env(Path::new("/nope"), &deno, None).as_deref(),
+            Some("deno:/usr/bin/deno")
+        );
+        // Env override takes precedence when valid; malformed/unknown values are ignored.
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &deno, Some("quickjs:/usr/bin/qjs")).as_deref(),
+            Some("quickjs:/usr/bin/qjs")
+        );
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &deno, Some("evil:/bin/sh")).as_deref(),
+            Some("deno:/usr/bin/deno")
+        );
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &deno, Some("quickjs:/bin/qjs,foo=bar"))
+                .as_deref(),
             Some("deno:/usr/bin/deno")
         );
     }

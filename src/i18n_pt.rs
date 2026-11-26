@@ -29,9 +29,26 @@ pub fn translate(text: &str) -> &str {
         "Bigger rides out a shaky connection, smaller uses less memory" => {
             "Maior aguenta conexão instável, menor usa menos memória"
         }
+        "Minimum" => "Mínimo",
         "Small" => "Pequeno",
         "Medium" => "Médio",
         "Large" => "Grande",
+        "Best" => "Melhor",
+        "Watched" => "Assistido",
+        "Resume at" => "Continuar de",
+        "No internet connection" => "Sem conexão com a internet",
+        "YouTube took too long to answer" => "O YouTube demorou demais para responder",
+        "YouTube said no" => "O YouTube recusou o pedido",
+        "YouTube didn't answer properly" => "O YouTube não respondeu corretamente",
+        "That can't be opened" => "Não foi possível abrir",
+        "Something went wrong, try again" => "Algo deu errado, tente novamente",
+        "Could not save the settings" => "Não foi possível salvar as configurações",
+        "Could not go back to the video" => "Não foi possível voltar ao vídeo",
+        "Getting the player ready, try again in a moment" => {
+            "Preparando o player, tente novamente em instantes"
+        }
+        "Could not download yt-dlp" => "Não foi possível baixar o yt-dlp",
+        "mpv is not installed" => "O mpv não está instalado",
         "Country" => "País",
         "For recommendations, trending and news" => "Para recomendações, em alta e notícias",
         "Skip sponsors and more" => "Pular patrocínios e mais",

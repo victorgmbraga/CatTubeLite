@@ -30,7 +30,7 @@ use cattube_core::tube::{Ctx, Effect, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{self as ytc, Details, Page, Tile};
 use eframe::egui;
 use jobs::Jobs;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use target::Target;
@@ -121,7 +121,7 @@ struct App {
     now_playing: Option<Tile>,
     /// Video queued by `--play` while waiting for first-run tool downloads.
     pending_play: Option<Tile>,
-    positions: Vec<(String, f64)>,
+    positions: HashMap<String, f64>,
     tools: Scan<String>,
     yt_dlp_ready: bool,
     /// Started with `--play`: close when the video ends.
@@ -183,7 +183,7 @@ impl App {
             player_seq: 0,
             now_playing: None,
             pending_play: None,
-            positions: Vec::new(),
+            positions: HashMap::new(),
             tools: Scan::Busy,
             yt_dlp_ready,
             quit_after_play: false,
@@ -271,21 +271,24 @@ impl App {
     }
 
     fn toast(&mut self, ctx: &egui::Context, text: &str) {
-        self.toast = Some((text.to_string(), Instant::now() + Duration::from_secs(3)));
+        self.toast = Some((
+            i18n::tr(text).to_string(),
+            Instant::now() + Duration::from_secs(3),
+        ));
         ctx.request_repaint();
     }
 
     fn save_prefs(&mut self, ctx: &egui::Context) {
         if let Err(e) = prefs::save(&self.config, &self.prefs) {
-            self.toast(ctx, &format!("Could not save the settings ({e})"));
+            self.toast(
+                ctx,
+                &format!("{} ({e})", i18n::tr("Could not save the settings")),
+            );
         }
     }
 
     fn resume_at(&self, id: &str) -> Option<f64> {
-        self.positions
-            .iter()
-            .find(|(x, _)| x == id)
-            .map(|(_, s)| *s)
+        self.positions.get(id).copied()
     }
 
     fn effect(&mut self, ctx: &egui::Context, e: Effect) {
@@ -313,9 +316,13 @@ impl App {
                                         .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
                                 };
                                 tile.meta = if point.finished {
-                                    "Watched".into()
+                                    i18n::tr("Watched").into()
                                 } else {
-                                    format!("Resume at {}", player::position_clock(point.position))
+                                    format!(
+                                        "{} {}",
+                                        i18n::tr("Resume at"),
+                                        player::position_clock(point.position)
+                                    )
                                 };
                                 if tile.badge.is_empty()
                                     && let Some(d) = point.duration
@@ -771,11 +778,11 @@ impl App {
                 }
             }
             Msg::History(page, positions) => {
-                self.positions = positions;
+                self.positions = positions.into_iter().collect();
                 self.tube.replace_page(ytc::feeds::HISTORY, Ok(page));
             }
             Msg::Positions(positions) => {
-                self.positions = positions;
+                self.positions = positions.into_iter().collect();
             }
             Msg::PlayerChanged(seq, tile) => {
                 if seq == self.player_seq && self.player.is_some() {
@@ -1006,7 +1013,7 @@ impl eframe::App for App {
             p = Default::default();
         }
         let c = self.ctx();
-        let resumable = |id: &str| self.positions.iter().any(|(x, _)| x == id);
+        let resumable = |id: &str| self.positions.contains_key(id);
         let mut effects = Vec::new();
         for action in actions {
             effects.extend(self.tube.handle(action, c, &resumable));

@@ -191,30 +191,9 @@ fn image_path(cache: &Path, url: &str) -> PathBuf {
     cache.join("images").join(format!("{h:016x}.{ext}"))
 }
 
-/// A softened copy of a picture (backdrops): scaled down and blurred, written
-/// atomically so concurrent readers never see a half-written JPEG.
-fn blur_into(src: &Path, out: &Path) -> Option<()> {
-    let img = image::load_from_memory(&std::fs::read(src).ok()?).ok()?;
-    let small = img.resize(480, 270, image::imageops::FilterType::Triangle);
-    let soft = image::imageops::blur(&small.to_rgb8(), 7.0);
-    let _ = std::fs::create_dir_all(out.parent()?);
-    let tmp = cattube_core::util::unique_tmp_path(out, "part");
-    if soft
-        .save_with_format(&tmp, image::ImageFormat::Jpeg)
-        .is_ok()
-        && std::fs::rename(&tmp, out).is_ok()
-    {
-        Some(())
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        None
-    }
-}
-
 /// Existing disk-cache path for `url`, if already downloaded.
 pub fn cached_image_path(cache: &Path, url: &str) -> Option<String> {
-    let base = url.strip_suffix("#blur").unwrap_or(url);
-    if !cattube_core::mpv::is_playable_url(base) {
+    if !cattube_core::mpv::is_playable_url(url) {
         return None;
     }
     let path = image_path(cache, url);
@@ -253,15 +232,6 @@ fn download_image_bytes(url: &str, target: &Path) -> Option<Vec<u8>> {
 /// Download a picture into the cache; returns its bytes in memory (decoding
 /// directly avoids re-reading from flash right after writing).
 pub fn fetch_image_bytes(cache: &Path, url: &str) -> Option<Vec<u8>> {
-    if let Some(base) = url.strip_suffix("#blur") {
-        let path = image_path(cache, url);
-        if let Ok(bytes) = std::fs::read(&path) {
-            return Some(bytes);
-        }
-        let src = fetch_image(cache, base)?;
-        blur_into(Path::new(&src), &path)?;
-        return std::fs::read(&path).ok();
-    }
     if !cattube_core::mpv::is_playable_url(url) {
         return None;
     }
@@ -270,29 +240,6 @@ pub fn fetch_image_bytes(cache: &Path, url: &str) -> Option<Vec<u8>> {
         return Some(bytes);
     }
     download_image_bytes(url, &path)
-}
-
-/// Download a picture into the cache; returns its path. An address ending
-/// in `#blur` gives the blurred copy (the picture behind a focused video).
-pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
-    if let Some(base) = url.strip_suffix("#blur") {
-        let path = image_path(cache, url);
-        if path.is_file() {
-            return Some(path.to_string_lossy().into_owned());
-        }
-        let src = fetch_image(cache, base)?;
-        blur_into(Path::new(&src), &path)?;
-        return Some(path.to_string_lossy().into_owned());
-    }
-    if !cattube_core::mpv::is_playable_url(url) {
-        return None;
-    }
-    let path = image_path(cache, url);
-    if path.is_file() {
-        return Some(path.to_string_lossy().into_owned());
-    }
-    download_image_bytes(url, &path)?;
-    path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
 /// Download a batch of missing pictures in-process (bounded parallelism over
@@ -424,17 +371,14 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
     }
     unpack_yt_dlp(data);
     let find = |n: &str| cattube_core::process::find_executable(n);
-    if player::js_runtime(data, &find).is_none() {
+    let own_deno = player::own_deno_path(data);
+    let selected = player::js_runtime(data, &find);
+    if selected.is_none() {
         // A Deno that cannot run on this device is not fetched again for a day.
         if force_update || stale(&data.join(DENO_FAILED)) {
             install_deno(data)?;
         }
-    } else if find("deno").is_none()
-        && cattube_core::process::find_executable(
-            &player::own_deno_path(data).display().to_string(),
-        )
-        .is_some()
-    {
+    } else if selected.as_deref() == Some(format!("deno:{}", own_deno.display()).as_str()) {
         refresh_deno(data, force_update);
     }
     Ok(ytdlp_version(data))
@@ -646,6 +590,20 @@ pub fn checkpoint_player(data: &Path) {
         .or_else(|| path.split('?').next()?.rsplit('/').next())
         .unwrap_or("");
     if !yt::is_video_id(id) {
+        return;
+    }
+    // Live streams keep no resume position: never write a checkpoint for them.
+    let is_live = conn
+        .command_with_timeout(
+            &[
+                Arg::Str("get_property"),
+                Arg::Str("metadata/by-key/ytdl_is_live"),
+            ],
+            budget,
+        )
+        .ok()
+        .is_some_and(|j| j.as_str() == Some("true"));
+    if is_live {
         return;
     }
     let get = |conn: &mut mpv::IpcConn, name: &str| {
@@ -1469,8 +1427,16 @@ fn skip_segment(
     to_end && !looping
 }
 
-/// Quality from the control bar: same video, same place.
-fn change_quality(conn: &mut mpv::IpcConn, s: &Session, cur: &yt::Tile, height: u32, at: f64) {
+/// Quality from the control bar: same video, same place (live streams omit
+/// `start=` so mpv rejoins at the live edge).
+fn change_quality(
+    conn: &mut mpv::IpcConn,
+    s: &Session,
+    cur: &yt::Tile,
+    height: u32,
+    at: f64,
+    live: bool,
+) {
     let fmt = player::format_string(height, s.codec, s.hdr, s.low_power);
     let _ = conn.command(&[
         Arg::Str("set_property"),
@@ -1478,13 +1444,14 @@ fn change_quality(conn: &mut mpv::IpcConn, s: &Session, cur: &yt::Tile, height: 
         Arg::Str(&fmt),
     ]);
     let title = safe_media_title(&cur.title);
-    let opts = if title.trim().is_empty() {
-        format!("start={at:.3}")
-    } else {
-        format!(
+    let opts = match (live, title.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("force-media-title={}", mpv::option_value(&title)),
+        (false, true) => format!("start={at:.3}"),
+        (false, false) => format!(
             "start={at:.3},force-media-title={}",
             mpv::option_value(&title)
-        )
+        ),
     };
     loadfile_replace(conn, &cur.watch_url(), &opts);
     osd(
@@ -1846,11 +1813,11 @@ pub fn spawn_watcher(
                     }
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
-                        if let Some(p) = conn.get_f64("time-pos") {
+                        if !live && let Some(p) = conn.get_f64("time-pos") {
                             last = (p, dur);
                         }
                         conn.clear_observed("eof-reached");
-                        change_quality(&mut conn, &s, &cur, h, last.0);
+                        change_quality(&mut conn, &s, &cur, h, last.0, live);
                     }
                     // A new request supersedes prior work, including replies from
                     // the previous video. The Lua browser preserves its focus as
@@ -2143,6 +2110,62 @@ mod player_tests {
     }
 
     #[test]
+    fn change_quality_omits_start_option_on_live_streams() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let run_case = |live: bool| -> String {
+            let (a, mut b) = UnixStream::pair().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut reader = BufReader::new(b.try_clone().unwrap());
+                let mut loadfile_opts = String::new();
+                for _ in 0..3 {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let req = mpv::parse_json(line.trim()).unwrap();
+                    let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+                    let cmd = req.get("command").unwrap().as_arr().unwrap();
+                    if cmd.first().and_then(mpv::Json::as_str) == Some("loadfile") {
+                        loadfile_opts = cmd
+                            .last()
+                            .and_then(mpv::Json::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    writeln!(b, r#"{{"error":"success","data":null,"request_id":{id}}}"#).unwrap();
+                }
+                loadfile_opts
+            });
+            let mut conn = mpv::IpcConn::from_stream(a).unwrap();
+            let s = Session {
+                low_power: true,
+                ctx: String::new(),
+                cache: PathBuf::new(),
+                autoplay: crate::prefs::Autoplay::Off,
+                sponsorblock: None,
+                codec: cattube_core::player::Codec::Avc,
+                hdr: false,
+                queue: Vec::new(),
+                on_hide: None,
+                on_video: None,
+            };
+            let cur = yt::Tile {
+                id: "WhWc3b3KhnY".into(),
+                title: "Live Stream".into(),
+                ..Default::default()
+            };
+            change_quality(&mut conn, &s, &cur, 720, 125.5, live);
+            drop(conn);
+            server.join().unwrap()
+        };
+        assert!(run_case(false).starts_with("start=125.500,force-media-title="));
+        let live_opts = run_case(true);
+        assert!(!live_opts.contains("start="), "{live_opts}");
+        assert!(live_opts.starts_with("force-media-title="), "{live_opts}");
+    }
+
+    #[test]
     fn ureq_image_fetch_downloads_caches_and_decodes_in_memory() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -2226,7 +2249,7 @@ mod player_tests {
     }
 
     #[test]
-    fn fetch_images_batch_uses_cached_entries_blurs_atomically_and_rejects_bad_urls() {
+    fn fetch_missing_image_bytes_uses_cached_entries_and_rejects_bad_urls() {
         let root = std::env::temp_dir().join(format!(
             "cattube-img-batch-{}-{}",
             std::process::id(),
@@ -2236,7 +2259,6 @@ mod player_tests {
                 .as_nanos()
         ));
         let url = "https://i.ytimg.com/vi/WhWc3b3KhnY/hqdefault.jpg";
-        let blur_url = format!("{url}#blur");
         let cached = image_path(&root, url);
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
         let img = image::RgbImage::from_pixel(16, 9, image::Rgb([30, 60, 90]));
@@ -2245,18 +2267,12 @@ mod player_tests {
 
         let res = fetch_missing_image_bytes(
             &root,
-            &[
-                url.to_string(),
-                blur_url.clone(),
-                "javascript:alert(1)".to_string(),
-            ],
+            &[url.to_string(), "javascript:alert(1)".to_string()],
             true,
         );
-        assert_eq!(res.len(), 3);
+        assert_eq!(res.len(), 2);
         assert!(res[0].1.as_ref().is_some_and(|b| !b.is_empty()));
-        assert!(res[1].1.as_ref().is_some_and(|b| !b.is_empty()));
-        assert!(image_path(&root, &blur_url).is_file());
-        assert!(res[2].1.is_none());
+        assert!(res[1].1.is_none());
         // No leftover .part files.
         let parts: Vec<_> = std::fs::read_dir(root.join("images"))
             .unwrap()

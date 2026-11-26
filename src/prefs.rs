@@ -81,13 +81,13 @@ impl Default for Prefs {
 }
 
 impl Prefs {
-    fn defaults(low_power: bool) -> Self {
+    fn defaults_for(low_power: bool, tight_memory: bool) -> Self {
         if low_power {
             Self {
                 max_height: 720,
                 codec: Codec::Avc,
                 hdr: false,
-                buffer: 64,
+                buffer: if tight_memory { 32 } else { 64 },
                 ..Self::default()
             }
         } else {
@@ -95,8 +95,8 @@ impl Prefs {
         }
     }
 
-    pub fn parse(text: &str, low_power: bool) -> Self {
-        let mut p = Prefs::defaults(low_power);
+    pub fn parse(text: &str, low_power: bool, tight_memory: bool) -> Self {
+        let mut p = Prefs::defaults_for(low_power, tight_memory);
         let mut cats: Option<Vec<String>> = None;
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else {
@@ -194,9 +194,10 @@ pub fn path(config: &Path) -> PathBuf {
 
 pub fn load(config: &Path) -> Prefs {
     let low_power = cattube_core::env::low_power();
+    let tight_memory = cattube_core::env::tight_memory();
     std::fs::read_to_string(path(config))
-        .map(|t| Prefs::parse(&t, low_power))
-        .unwrap_or_else(|_| Prefs::defaults(low_power))
+        .map(|t| Prefs::parse(&t, low_power, tight_memory))
+        .unwrap_or_else(|_| Prefs::defaults_for(low_power, tight_memory))
 }
 
 pub fn save(config: &Path, p: &Prefs) -> std::io::Result<()> {
@@ -232,10 +233,11 @@ mod tests {
             region: "DE".into(),
             player_stats: true,
         };
-        assert_eq!(Prefs::parse(&p.to_conf(), false), p);
-        assert_eq!(Prefs::parse(&p.to_conf(), true), p);
+        assert_eq!(Prefs::parse(&p.to_conf(), false, false), p);
+        assert_eq!(Prefs::parse(&p.to_conf(), true, false), p);
         let junk = Prefs::parse(
             "max_height = 999\nspeed = 7\ncodec = xyz\nsponsorblock_categories = sponsor,evil\n",
+            false,
             false,
         );
         assert_eq!((junk.max_height, junk.codec), (2160, Codec::Vp9));
@@ -245,12 +247,16 @@ mod tests {
 
     #[test]
     fn low_power_defaults_fill_only_missing_settings() {
-        let p = Prefs::parse("accent = teal\nmax_height = 1080\n", true);
+        let p = Prefs::parse("accent = teal\nmax_height = 1080\n", true, false);
         assert_eq!(p.accent, "teal");
         assert_eq!(
             (p.max_height, p.codec, p.hdr, p.buffer),
             (1080, Codec::Avc, false, 64)
         );
-        assert_eq!(Prefs::parse("", true).max_height, 720);
+        assert_eq!(Prefs::parse("", true, false).max_height, 720);
+        // 1 GiB TV boxes default to 32 MiB buffer unless a setting already exists.
+        assert_eq!(Prefs::parse("", true, true).buffer, 32);
+        assert_eq!(Prefs::parse("buffer = 64\n", true, true).buffer, 64);
+        assert_eq!(Prefs::parse("buffer = 32\n", false, false).buffer, 32);
     }
 }
