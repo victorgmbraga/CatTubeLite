@@ -733,7 +733,9 @@ impl App {
                 let drop_for_player = self.low_power
                     && (self.opening.is_some() || (self.player.is_some() && !self.was_focused));
                 for (url, image) in batch {
-                    self.fetching.remove(&url);
+                    if !self.fetching.remove(&url) {
+                        continue;
+                    }
                     if !drop_for_player {
                         self.images.complete(url, image, frame);
                     }
@@ -850,16 +852,39 @@ impl App {
         let low_power = self.low_power;
         let requested = batch.clone();
         let failed = batch.clone();
+        let (tx, rctx) = self.jobs.sender();
         if !self.jobs.try_spawn_or(
             move || {
-                let fetched = yt::fetch_images_batch(&cache, &requested, low_power);
+                // Decode disk-cache hits right away so cached cards never wait
+                // behind network downloads in the same batch.
+                let mut cached_ready = Vec::new();
+                let mut missing = Vec::new();
+                for url in requested {
+                    if let Some(path) = yt::cached_image_path(&cache, &url) {
+                        if let Some(image) = images::decode(&path, max_side) {
+                            cached_ready.push((url, Some(image)));
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                            missing.push(url);
+                        }
+                    } else {
+                        missing.push(url);
+                    }
+                }
+                if !cached_ready.is_empty() && !missing.is_empty() {
+                    let _ = tx.send(Msg::Images(cached_ready));
+                    rctx.request_repaint();
+                } else if missing.is_empty() {
+                    return Msg::Images(cached_ready);
+                }
+                let fetched = yt::fetch_missing_image_bytes(&cache, &missing, low_power);
                 let decoded = fetched
                     .into_iter()
-                    .map(|(url, path)| {
-                        let image = path.and_then(|p| {
-                            let d = images::decode(&p, max_side);
+                    .map(|(url, bytes)| {
+                        let image = bytes.and_then(|b| {
+                            let d = images::decode_bytes(&b, max_side);
                             if d.is_none() {
-                                let _ = std::fs::remove_file(&p);
+                                yt::remove_cached_image(&cache, &url);
                             }
                             d
                         });
