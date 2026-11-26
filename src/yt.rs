@@ -44,22 +44,6 @@ pub fn friendly(t: &str) -> String {
     }
 }
 
-/// Quote a string for `curl -K` config syntax so paths and URLs cannot inject
-/// additional options.
-fn curl_quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' | '\r' => {}
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// Connections to YouTube kept open between requests: a new `curl` for
 /// each one paid a process start and a TLS handshake every time (about
 /// 0.1 s on a desktop, more on a TV box).
@@ -72,8 +56,33 @@ static AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
         .build()
 });
 
-/// One request to YouTube (or SponsorBlock): a POST of JSON when there is
-/// a `body`, else a GET. The answer's text, or a sentence for the TV.
+/// Persistent HTTP/TLS pool for thumbnails, avatars and plain GETs (e.g.
+/// SponsorBlock, search suggestions) without YouTube InnerTube headers.
+static PLAIN_AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .max_idle_connections_per_host(4)
+        .build()
+});
+
+/// Maximum accepted thumbnail / avatar download size (8 MiB).
+const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+
+fn read_response_text(reply: Result<ureq::Response, ureq::Error>) -> Result<String, String> {
+    match reply {
+        Ok(r) => r.into_string().map_err(|e| friendly(&e.to_string())),
+        Err(ureq::Error::Status(code, _)) => Err(friendly(&format!("http {code}"))),
+        Err(ureq::Error::Transport(t)) => Err(friendly(&match t.kind() {
+            ureq::ErrorKind::Dns => "could not resolve".to_string(),
+            ureq::ErrorKind::ConnectionFailed => "failed to connect".to_string(),
+            _ => t.to_string(),
+        })),
+    }
+}
+
+/// One InnerTube request to YouTube: a POST of JSON when there is a `body`,
+/// else a GET. The answer's text, or a sentence for the TV.
 fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
     let request = |method: &str| {
         AGENT
@@ -89,15 +98,12 @@ fn curl(url: &str, body: Option<&str>) -> Result<String, String> {
             .send_string(b),
         None => request("GET").call(),
     };
-    match reply {
-        Ok(r) => r.into_string().map_err(|e| friendly(&e.to_string())),
-        Err(ureq::Error::Status(code, _)) => Err(friendly(&format!("http {code}"))),
-        Err(ureq::Error::Transport(t)) => Err(friendly(&match t.kind() {
-            ureq::ErrorKind::Dns => "could not resolve".to_string(),
-            ureq::ErrorKind::ConnectionFailed => "failed to connect".to_string(),
-            _ => t.to_string(),
-        })),
-    }
+    read_response_text(reply)
+}
+
+/// Plain GET without YouTube InnerTube headers (SponsorBlock, suggestions).
+fn get_plain(url: &str) -> Result<String, String> {
+    read_response_text(PLAIN_AGENT.get(url).call())
 }
 
 // --------------------------------------------------------------- lists
@@ -155,7 +161,7 @@ pub fn search(ctx: &str, q: &str) -> Result<Page, String> {
 }
 
 pub fn suggestions(q: &str, hl: &str) -> Vec<String> {
-    curl(&yt::suggest_url_for(q, hl), None)
+    get_plain(&yt::suggest_url_for(q, hl))
         .map(|b| yt::parse_suggestions(&b))
         .unwrap_or_default()
 }
@@ -185,175 +191,84 @@ fn image_path(cache: &Path, url: &str) -> PathBuf {
     cache.join("images").join(format!("{h:016x}.{ext}"))
 }
 
-/// A softened copy of a picture (backdrops): scaled down and blurred, written
-/// atomically so concurrent readers never see a half-written JPEG.
-fn blur_into(src: &Path, out: &Path) -> Option<()> {
-    let img = image::load_from_memory(&std::fs::read(src).ok()?).ok()?;
-    let small = img.resize(480, 270, image::imageops::FilterType::Triangle);
-    let soft = image::imageops::blur(&small.to_rgb8(), 7.0);
-    let _ = std::fs::create_dir_all(out.parent()?);
-    let tmp = cattube_core::util::unique_tmp_path(out, "part");
-    if soft
-        .save_with_format(&tmp, image::ImageFormat::Jpeg)
-        .is_ok()
-        && std::fs::rename(&tmp, out).is_ok()
-    {
-        Some(())
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        None
-    }
-}
-
-/// Download a picture into the cache; returns its path. An address ending
-/// in `#blur` gives the blurred copy (the picture behind a focused video).
-pub fn fetch_image(cache: &Path, url: &str) -> Option<String> {
-    if let Some(base) = url.strip_suffix("#blur") {
-        let path = image_path(cache, url);
-        if path.is_file() {
-            return Some(path.to_string_lossy().into_owned());
-        }
-        let src = fetch_image(cache, base)?;
-        blur_into(Path::new(&src), &path)?;
-        return Some(path.to_string_lossy().into_owned());
-    }
+/// Existing disk-cache path for `url`, if already downloaded.
+pub fn cached_image_path(cache: &Path, url: &str) -> Option<String> {
     if !cattube_core::mpv::is_playable_url(url) {
         return None;
     }
     let path = image_path(cache, url);
-    if path.is_file() {
-        return Some(path.to_string_lossy().into_owned());
-    }
-    let _ = std::fs::create_dir_all(path.parent()?);
-    // Each download its own partial file: the card and the blurred
-    // backdrop can ask for the same picture at once.
-    let tmp = cattube_core::util::unique_tmp_path(&path, "part");
-    let ok = SystemRunner
-        .run(
-            &Cmd::new("curl")
-                .args([
-                    "-sS".to_string(),
-                    "--fail".to_string(),
-                    "-m".to_string(),
-                    "20".to_string(),
-                    "-o".to_string(),
-                    tmp.display().to_string(),
-                    "--".to_string(),
-                    url.to_string(),
-                ])
-                .timeout(Duration::from_secs(25)),
-        )
-        .is_ok_and(|o| o.success())
-        && std::fs::rename(&tmp, &path).is_ok();
-    if ok {
-        Some(path.to_string_lossy().into_owned())
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        None
-    }
+    path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
-/// Fetch a batch of pictures into the disk cache using a single `curl --parallel`
-/// invocation for all cache misses (reusing HTTP/2 + TLS connections). Returns
-/// `(url, Some(local_path))` in the same order as `urls`.
-pub fn fetch_images_batch(
+/// Remove a corrupt/undecodable cached image file.
+pub fn remove_cached_image(cache: &Path, url: &str) {
+    let _ = std::fs::remove_file(image_path(cache, url));
+}
+
+/// Download `url` into `target` atomically via persistent HTTP/TLS (`ureq`)
+/// and return the raw bytes so callers can decode directly from memory.
+fn download_image_bytes(url: &str, target: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let resp = PLAIN_AGENT.get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return None;
+    }
+    if let Some(parent) = target.parent()
+        && std::fs::create_dir_all(parent).is_ok()
+    {
+        let tmp = cattube_core::util::unique_tmp_path(target, "part");
+        if std::fs::write(&tmp, &bytes).is_err() || std::fs::rename(&tmp, target).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Some(bytes)
+}
+
+/// Download a picture into the cache; returns its bytes in memory (decoding
+/// directly avoids re-reading from flash right after writing).
+pub fn fetch_image_bytes(cache: &Path, url: &str) -> Option<Vec<u8>> {
+    if !cattube_core::mpv::is_playable_url(url) {
+        return None;
+    }
+    let path = image_path(cache, url);
+    if let Ok(bytes) = std::fs::read(&path) {
+        return Some(bytes);
+    }
+    download_image_bytes(url, &path)
+}
+
+/// Download a batch of missing pictures in-process (bounded parallelism over
+/// persistent keep-alive connections) and return their bytes in memory so
+/// callers can decode immediately without re-reading from disk.
+pub fn fetch_missing_image_bytes(
     cache: &Path,
     urls: &[String],
     low_power: bool,
-) -> Vec<(String, Option<String>)> {
-    let mut seen = std::collections::HashSet::new();
-    let mut missing: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
-    for url in urls {
-        let base = url.strip_suffix("#blur").unwrap_or(url.as_str());
-        if !cattube_core::mpv::is_playable_url(base) {
-            continue;
-        }
-        // If `#blur` itself is already cached, its base doesn't need downloading.
-        if url.ends_with("#blur") && image_path(cache, url).is_file() {
-            continue;
-        }
-        let target = image_path(cache, base);
-        if !target.is_file() && seen.insert(target.clone()) {
-            let tmp = cattube_core::util::unique_tmp_path(&target, "part");
-            missing.push((base, target, tmp));
-        }
+) -> Vec<(String, Option<Vec<u8>>)> {
+    if urls.len() <= 1 {
+        return urls
+            .iter()
+            .map(|u| (u.clone(), fetch_image_bytes(cache, u)))
+            .collect();
     }
-
-    if missing.len() == 1 {
-        let _ = fetch_image(cache, missing[0].0);
-    } else if missing.len() > 1 {
-        let img_dir = cache.join("images");
-        if std::fs::create_dir_all(&img_dir).is_ok() {
-            let config: String = missing
+    let parallel_max = if low_power { 4 } else { 8 };
+    let mut out = Vec::with_capacity(urls.len());
+    for chunk in urls.chunks(parallel_max) {
+        let results: Vec<(String, Option<Vec<u8>>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = chunk
                 .iter()
-                .map(|(url, _, tmp)| {
-                    format!(
-                        "url = {}\noutput = {}\n",
-                        curl_quote(url),
-                        curl_quote(&tmp.display().to_string())
-                    )
-                })
+                .map(|u| s.spawn(move || (u.clone(), fetch_image_bytes(cache, u))))
                 .collect();
-            let list = cattube_core::util::unique_tmp_path(
-                &cattube_core::env::runtime_dir().join("cattube-img-batch"),
-                "cfg",
-            );
-            let parallel_max = if low_power { "4" } else { "8" };
-            let timed_out = if std::fs::write(&list, config).is_ok() {
-                let res = SystemRunner.run(
-                    &Cmd::new("curl")
-                        .args([
-                            "-sS".to_string(),
-                            "--fail".to_string(),
-                            "--parallel".to_string(),
-                            "--parallel-max".to_string(),
-                            parallel_max.to_string(),
-                            "-m".to_string(),
-                            "20".to_string(),
-                            "-K".to_string(),
-                            list.display().to_string(),
-                        ])
-                        .timeout(Duration::from_secs(30)),
-                );
-                let _ = std::fs::remove_file(&list);
-                res.map(|o| o.timed_out).unwrap_or(true)
-            } else {
-                true
-            };
-            for (_, target, tmp) in &missing {
-                let valid = !timed_out
-                    && std::fs::metadata(tmp).is_ok_and(|m| m.len() > 0)
-                    && std::fs::rename(tmp, target).is_ok();
-                if !valid {
-                    let _ = std::fs::remove_file(tmp);
-                }
-            }
-        }
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        out.extend(results);
     }
-
-    urls.iter()
-        .map(|url| {
-            let resolved = if let Some(base) = url.strip_suffix("#blur") {
-                let path = image_path(cache, url);
-                if path.is_file() {
-                    Some(path.to_string_lossy().into_owned())
-                } else {
-                    let src = image_path(cache, base);
-                    if src.is_file() && blur_into(&src, &path).is_some() {
-                        Some(path.to_string_lossy().into_owned())
-                    } else {
-                        None
-                    }
-                }
-            } else if cattube_core::mpv::is_playable_url(url) {
-                let path = image_path(cache, url);
-                path.is_file().then(|| path.to_string_lossy().into_owned())
-            } else {
-                None
-            };
-            (url.clone(), resolved)
-        })
-        .collect()
+    out
 }
 
 /// Evict oldest cached images when `cache/images` grows beyond `max_bytes` or
@@ -456,17 +371,14 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
     }
     unpack_yt_dlp(data);
     let find = |n: &str| cattube_core::process::find_executable(n);
-    if player::js_runtime(data, &find).is_none() {
+    let own_deno = player::own_deno_path(data);
+    let selected = player::js_runtime(data, &find);
+    if selected.is_none() {
         // A Deno that cannot run on this device is not fetched again for a day.
         if force_update || stale(&data.join(DENO_FAILED)) {
             install_deno(data)?;
         }
-    } else if find("deno").is_none()
-        && cattube_core::process::find_executable(
-            &player::own_deno_path(data).display().to_string(),
-        )
-        .is_some()
-    {
+    } else if selected.as_deref() == Some(format!("deno:{}", own_deno.display()).as_str()) {
         refresh_deno(data, force_update);
     }
     Ok(ytdlp_version(data))
@@ -624,8 +536,12 @@ fn refresh_deno(data: &Path, force: bool) {
 }
 
 pub fn ytdlp_version(data: &Path) -> String {
+    if let Some(v) = player::yt_dlp_version_from_unpacked(data) {
+        return format!("yt-dlp {v}");
+    }
+    let runner = player::yt_dlp_runner(data);
     SystemRunner
-        .run(&Cmd::new(player::yt_dlp_path(data).display().to_string()).arg("--version"))
+        .run(&Cmd::new(runner.display().to_string()).arg("--version"))
         .ok()
         .filter(|o| o.success())
         .map(|o| format!("yt-dlp {}", o.stdout.trim()))
@@ -676,6 +592,20 @@ pub fn checkpoint_player(data: &Path) {
     if !yt::is_video_id(id) {
         return;
     }
+    // Live streams keep no resume position: never write a checkpoint for them.
+    let is_live = conn
+        .command_with_timeout(
+            &[
+                Arg::Str("get_property"),
+                Arg::Str("metadata/by-key/ytdl_is_live"),
+            ],
+            budget,
+        )
+        .ok()
+        .is_some_and(|j| j.as_str() == Some("true"));
+    if is_live {
+        return;
+    }
     let get = |conn: &mut mpv::IpcConn, name: &str| {
         conn.command_with_timeout(&[Arg::Str("get_property"), Arg::Str(name)], budget)
             .ok()
@@ -704,34 +634,110 @@ pub fn checkpoint_player(data: &Path) {
     }
 }
 
+const MAX_PLAYER_LOG_BYTES: usize = 8 * 1024;
+const MAX_PLAYER_LOG_LINES: usize = 40;
+
+struct PlayerState {
+    child: Option<std::process::Child>,
+    exit: Option<std::process::ExitStatus>,
+    stopped_by_app: bool,
+    log: std::collections::VecDeque<String>,
+    log_bytes: usize,
+    log_done: bool,
+}
+
 /// Shared handle to a running `mpv` child so both the UI and the
-/// watcher can check exit status and reap it without hanging.
+/// watcher can check exit status, read failure output, and reap it without
+/// hanging.
 #[derive(Clone)]
 pub struct PlayerHandle {
-    child: std::sync::Arc<Mutex<Option<std::process::Child>>>,
+    state: std::sync::Arc<(Mutex<PlayerState>, std::sync::Condvar)>,
 }
 
 impl PlayerHandle {
     pub fn new(child: std::process::Child) -> Self {
         Self {
-            child: std::sync::Arc::new(Mutex::new(Some(child))),
+            state: std::sync::Arc::new((
+                Mutex::new(PlayerState {
+                    child: Some(child),
+                    exit: None,
+                    stopped_by_app: false,
+                    log: std::collections::VecDeque::new(),
+                    log_bytes: 0,
+                    log_done: true,
+                }),
+                std::sync::Condvar::new(),
+            )),
         }
+    }
+
+    fn with_log_pipe(child: std::process::Child, reader: std::io::PipeReader) -> Self {
+        let handle = Self {
+            state: std::sync::Arc::new((
+                Mutex::new(PlayerState {
+                    child: Some(child),
+                    exit: None,
+                    stopped_by_app: false,
+                    log: std::collections::VecDeque::new(),
+                    log_bytes: 0,
+                    log_done: false,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        };
+        let state = handle.state.clone();
+        let _ = std::thread::Builder::new()
+            .name("cattube-mpv-log".into())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader, Read};
+                let mut br = BufReader::new(reader);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    // Bound any single line so pathological output cannot grow memory.
+                    let n = match br.by_ref().take(2048).read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let (lock, _) = &*state;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.log_bytes += line.len();
+                    guard.log.push_back(line);
+                    while guard.log.len() > MAX_PLAYER_LOG_LINES
+                        || guard.log_bytes > MAX_PLAYER_LOG_BYTES
+                    {
+                        if let Some(old) = guard.log.pop_front() {
+                            guard.log_bytes = guard.log_bytes.saturating_sub(old.len());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let (lock, cv) = &*state;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                guard.log_done = true;
+                cv.notify_all();
+            });
+        handle
     }
 
     /// True once the process has exited (reaping it immediately if so).
     pub fn exited(&self) -> bool {
-        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(child) = slot.as_mut() else {
+        let (lock, _) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(child) = guard.child.as_mut() else {
             return true;
         };
         match child.try_wait() {
-            Ok(Some(_)) => {
-                *slot = None;
+            Ok(Some(status)) => {
+                guard.exit = Some(status);
+                guard.child = None;
                 true
             }
             Ok(None) => false,
             Err(_) => {
-                *slot = None;
+                guard.child = None;
                 true
             }
         }
@@ -739,13 +745,22 @@ impl PlayerHandle {
 
     /// Terminate the player if it is still running and reap it.
     pub fn stop_and_reap(&self) {
-        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(mut child) = slot.take() else {
+        let (lock, _) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.stopped_by_app = true;
+        let Some(mut child) = guard.child.take() else {
             return;
         };
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            let _ = child.kill();
-            let _ = child.wait();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                guard.exit = Some(status);
+            }
+            _ => {
+                let _ = child.kill();
+                if let Ok(status) = child.wait() {
+                    guard.exit = Some(status);
+                }
+            }
         }
     }
 
@@ -760,6 +775,22 @@ impl PlayerHandle {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Return the process exit status, whether CatTube stopped it intentionally,
+    /// and the tail of mpv's error output (waiting briefly for EOF on the pipe).
+    fn failure_info(&self, wait_log: Duration) -> (Option<std::process::ExitStatus>, bool, String) {
+        let _ = self.exited();
+        let (lock, cv) = &*self.state;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = cv
+            .wait_timeout_while(guard, wait_log, |s| !s.log_done)
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = String::with_capacity(guard.log_bytes);
+        for line in &guard.log {
+            out.push_str(line);
+        }
+        (guard.exit, guard.stopped_by_app, out)
     }
 }
 
@@ -787,17 +818,31 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
         eprintln!("cattube: the previous player did not close in time");
     }
     let _ = std::fs::remove_file(player::player_socket());
-    std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        // In CatTube's own process group: a TV shell that closes CatTube
-        // (signalling the group) closes the player with it.
-        .spawn()
-        .map(PlayerHandle::new)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "mpv is not installed".to_string(),
-            _ => format!("Could not start the player ({e})"),
-        })
+    let pipe = std::io::pipe().ok().and_then(|(reader, writer)| {
+        writer
+            .try_clone()
+            .ok()
+            .map(|writer2| (reader, writer, writer2))
+    });
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).stdin(std::process::Stdio::null());
+    let reader = if let Some((reader, out_w, err_w)) = pipe {
+        cmd.stdout(std::process::Stdio::from(out_w))
+            .stderr(std::process::Stdio::from(err_w));
+        Some(reader)
+    } else {
+        None
+    };
+    // In CatTube's own process group: a TV shell that closes CatTube
+    // (signalling the group) closes the player with it.
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "mpv is not installed".to_string(),
+        _ => format!("Could not start the player ({e})"),
+    })?;
+    Ok(match reader {
+        Some(r) => PlayerHandle::with_log_pipe(child, r),
+        None => PlayerHandle::new(child),
+    })
 }
 
 /// CatTube's own window (its Wayland app id) and the player's.
@@ -837,6 +882,8 @@ pub struct Session {
 pub struct Ended {
     /// (video, position, duration) for every video that played.
     pub positions: Vec<(String, f64, Option<f64>)>,
+    /// Friendly message when playback failed to start (absent on normal exit).
+    pub error: Option<String>,
 }
 
 fn osd(conn: &mut mpv::IpcConn, text: &str) {
@@ -858,16 +905,9 @@ fn thumbnail_size(osd_width: f64, width: f64) -> (u32, u32) {
     ((width * scale) as u32, (width * 9.0 / 16.0 * scale) as u32)
 }
 
-/// Decode and scale a thumbnail directly into BGRA bytes in memory.
-fn bgra_thumbnail_pixels(
-    cache: &Path,
-    id: &str,
-    osd_width: f64,
-    width: f64,
-) -> Option<(Vec<u8>, u32, u32)> {
-    let (w, h) = thumbnail_size(osd_width, width);
-    let pic = fetch_image(cache, &yt::video_thumb_hq(id))?;
-    let img = image::load_from_memory(&std::fs::read(pic).ok()?).ok()?;
+/// Decode and scale raw image bytes directly into BGRA pixels in memory.
+fn bgra_from_bytes(bytes: &[u8], w: u32, h: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory(bytes).ok()?;
     let mut px = img
         .resize_to_fill(w, h, image::imageops::FilterType::Triangle)
         .to_rgba8()
@@ -878,15 +918,36 @@ fn bgra_thumbnail_pixels(
     Some((px, w, h))
 }
 
+/// Decode and scale a thumbnail directly into BGRA bytes in memory.
+/// Uses `mqdefault` (320×180, no black bars) whenever it already covers the
+/// target slot or in `low_power` mode.
+fn bgra_thumbnail_pixels(
+    cache: &Path,
+    id: &str,
+    osd_width: f64,
+    width: f64,
+    low_power: bool,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let (w, h) = thumbnail_size(osd_width, width);
+    let url = if low_power || w <= 320 {
+        yt::video_thumb_mq(id)
+    } else {
+        yt::video_thumb_hq(id)
+    };
+    let bytes = fetch_image_bytes(cache, &url)?;
+    bgra_from_bytes(&bytes, w, h)
+}
+
 /// Raw thumbnail pixels written once for a player overlay.
 fn bgra_thumbnail(
     cache: &Path,
     id: &str,
     osd_width: f64,
     width: f64,
+    low_power: bool,
     name: &str,
 ) -> Option<(String, u32, u32)> {
-    let (px, w, h) = bgra_thumbnail_pixels(cache, id, osd_width, width)?;
+    let (px, w, h) = bgra_thumbnail_pixels(cache, id, osd_width, width, low_power)?;
     let path = player::player_socket().with_file_name(name);
     std::fs::write(&path, px).ok()?;
     Some((path.to_string_lossy().into_owned(), w, h))
@@ -903,7 +964,18 @@ const RELATED_ATLAS_W: usize = 1680;
 const RELATED_FLUSH_BATCH: usize = 4;
 const RELATED_FLUSH_INTERVAL: Duration = Duration::from_millis(400);
 
-fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize)>) -> String {
+fn related_atlas_geometry(low_power: bool) -> (usize, usize, usize, f64, f64) {
+    let div = if low_power { 2usize } else { 1usize };
+    (
+        RELATED_ATLAS_W / div,
+        RELATED_STEP_X / div,
+        RELATED_STEP_Y / div,
+        RELATED_THUMB_W / div as f64,
+        1.0 / div as f64,
+    )
+}
+
+fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize, f64)>) -> String {
     let list: Vec<_> = tiles
         .iter()
         .map(|t| {
@@ -917,9 +989,9 @@ fn related_json(tiles: &[yt::Tile], atlas: Option<(&str, usize, usize, usize)>) 
         .collect();
     let atlas = atlas.map_or_else(
         || "null".to_string(),
-        |(p, w, h, v)| {
+        |(p, w, h, v, s)| {
             format!(
-                "{{\"p\":{},\"w\":{w},\"h\":{h},\"v\":{v}}}",
+                "{{\"p\":{},\"w\":{w},\"h\":{h},\"v\":{v},\"s\":{s}}}",
                 mpv::json_string(p)
             )
         },
@@ -1012,9 +1084,12 @@ fn send_related(
     }
     send(&related_json(&tiles, None));
     // One transparent image plane keeps every thumbnail in the same frame.
-    // Its source stays at design resolution even on a 4K screen.
-    let height = tiles.len().div_ceil(4) * RELATED_STEP_Y;
-    let mut pixels = vec![0u8; RELATED_ATLAS_W * height * 4];
+    // On low-power devices (1 GiB RAM TV boxes), build the atlas at half scale
+    // (840x480 = 1.54 MiB instead of 6.15 MiB) and source from mqdefault.
+    let (atlas_w, step_x, step_y, thumb_w, atlas_scale) = related_atlas_geometry(session.low_power);
+    let (tw, th) = thumbnail_size(1920.0, thumb_w);
+    let height = tiles.len().div_ceil(4) * step_y;
+    let mut pixels = vec![0u8; atlas_w * height * 4];
     let safe_id: String = id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
@@ -1031,21 +1106,28 @@ fn send_related(
         if !current() {
             return;
         }
-        let urls: Vec<String> = chunk.iter().map(|t| yt::video_thumb_hq(&t.id)).collect();
-        let _ = fetch_images_batch(&session.cache, &urls, session.low_power);
-        for (offset, tile) in chunk.iter().enumerate() {
+        let urls: Vec<String> = chunk
+            .iter()
+            .map(|t| {
+                if session.low_power {
+                    yt::video_thumb_mq(&t.id)
+                } else {
+                    yt::video_thumb_hq(&t.id)
+                }
+            })
+            .collect();
+        let fetched = fetch_missing_image_bytes(&session.cache, &urls, session.low_power);
+        for (offset, (_, raw)) in fetched.into_iter().enumerate() {
             if !current() {
                 return;
             }
             let i = chunk_idx * RELATED_FLUSH_BATCH + offset;
-            if let Some((bytes, w, h)) =
-                bgra_thumbnail_pixels(&session.cache, &tile.id, 1920.0, RELATED_THUMB_W)
+            if let Some(raw) = raw
+                && let Some((bytes, w, h)) = bgra_from_bytes(&raw, tw, th)
                 && bytes.len() == w as usize * h as usize * 4
             {
                 for row in 0..h as usize {
-                    let dest = ((i / 4 * RELATED_STEP_Y + row) * RELATED_ATLAS_W
-                        + i % 4 * RELATED_STEP_X)
-                        * 4;
+                    let dest = ((i / 4 * step_y + row) * atlas_w + i % 4 * step_x) * 4;
                     let source = row * w as usize * 4;
                     pixels[dest..dest + w as usize * 4]
                         .copy_from_slice(&bytes[source..source + w as usize * 4]);
@@ -1074,7 +1156,7 @@ fn send_related(
                     revision += 1;
                     send(&related_json(
                         &tiles,
-                        Some((&name, RELATED_ATLAS_W, height, revision)),
+                        Some((&name, atlas_w, height, revision, atlas_scale)),
                     ));
                     sent_at = Instant::now();
                     pending = 0;
@@ -1115,6 +1197,7 @@ fn fetch_card_thumbnail(
     cache: PathBuf,
     id: String,
     width: f64,
+    low_power: bool,
 ) -> std::sync::mpsc::Receiver<Option<CardThumbnail>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1126,6 +1209,7 @@ fn fetch_card_thumbnail(
                 &id,
                 width,
                 CARD_THUMB_W,
+                low_power,
                 &format!("cattube-next-{}-{serial}.bgra", std::process::id()),
             )
             .map(CardThumbnail)
@@ -1165,25 +1249,117 @@ fn safe_media_title(title: &str) -> String {
         .collect()
 }
 
-/// Wait for mpv to answer with a playing video (up to a minute). `None`: the
-/// player went away, or was stopped for never getting there.
-fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Option<mpv::IpcConn> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectError {
+    Exited,
+    TimedOut,
+}
+
+/// Wait for mpv to answer with a playing video (up to a minute).
+fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Result<mpv::IpcConn, ConnectError> {
     let started = Instant::now();
     loop {
         if player.exited() {
-            return None;
+            return Err(ConnectError::Exited);
         }
         if let Ok(mut c) = mpv::IpcConn::connect(socket)
             && c.get_f64("time-pos").is_some()
         {
-            return Some(c);
+            return Ok(c);
         }
         if started.elapsed() > Duration::from_secs(60) {
             player.stop_and_reap();
-            return None;
+            return Err(ConnectError::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Turn an early mpv exit (before playback started) into a friendly toast
+/// key, or `None` when the user closed mpv cleanly or CatTube replaced it.
+fn classify_player_error(
+    status: Option<std::process::ExitStatus>,
+    stopped_by_app: bool,
+    output: &str,
+    timed_out: bool,
+) -> Option<&'static str> {
+    if timed_out {
+        return Some("The video took too long to start");
+    }
+    if stopped_by_app || status.is_some_and(|s| s.success()) {
+        return None;
+    }
+    let lower = output.to_ascii_lowercase();
+    if [
+        "video unavailable",
+        "this video is not available",
+        "private video",
+        "has been removed",
+        "members-only",
+        "join this channel",
+        "sign in to confirm your age",
+        "age-restricted",
+        "live event will begin",
+        "premieres in",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("This video is not available");
+    }
+    if [
+        "not a bot",
+        "http error 403",
+        "403 forbidden",
+        "unable to extract",
+        "signature extraction",
+        "n challenge",
+        "youtube-dl failed: not found",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("YouTube blocked playback; try updating the player in Settings");
+    }
+    if [
+        "requested format is not available",
+        "no video formats found",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("This quality or codec is not available for this video");
+    }
+    if [
+        "connection refused",
+        "connection timed out",
+        "timed out",
+        "temporary failure in name resolution",
+        "could not resolve",
+        "failed to resolve",
+        "network is unreachable",
+        "no route to host",
+        "http error 5",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("Could not reach YouTube");
+    }
+    if [
+        "hwdec",
+        "v4l2m2m",
+        "vaapi",
+        "vdpau",
+        "error initializing",
+        "could not initialize video",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("Could not start video playback; check quality or codec in Settings");
+    }
+    Some("Could not play this video")
 }
 
 /// YouTube's pick for what follows `id`, delivered on `tx`.
@@ -1210,7 +1386,7 @@ fn spawn_next_lookup(s: &Session, id: String, tx: std::sync::mpsc::Sender<Option
 
 fn spawn_segments_lookup(url: String, tx: std::sync::mpsc::Sender<Vec<community::Segment>>) {
     std::thread::spawn(move || {
-        let segments = curl(&url, None)
+        let segments = get_plain(&url)
             .ok()
             .map(|b| community::parse_segments(&b))
             .unwrap_or_default();
@@ -1251,8 +1427,16 @@ fn skip_segment(
     to_end && !looping
 }
 
-/// Quality from the control bar: same video, same place.
-fn change_quality(conn: &mut mpv::IpcConn, s: &Session, cur: &yt::Tile, height: u32, at: f64) {
+/// Quality from the control bar: same video, same place (live streams omit
+/// `start=` so mpv rejoins at the live edge).
+fn change_quality(
+    conn: &mut mpv::IpcConn,
+    s: &Session,
+    cur: &yt::Tile,
+    height: u32,
+    at: f64,
+    live: bool,
+) {
     let fmt = player::format_string(height, s.codec, s.hdr, s.low_power);
     let _ = conn.command(&[
         Arg::Str("set_property"),
@@ -1260,13 +1444,14 @@ fn change_quality(conn: &mut mpv::IpcConn, s: &Session, cur: &yt::Tile, height: 
         Arg::Str(&fmt),
     ]);
     let title = safe_media_title(&cur.title);
-    let opts = if title.trim().is_empty() {
-        format!("start={at:.3}")
-    } else {
-        format!(
+    let opts = match (live, title.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("force-media-title={}", mpv::option_value(&title)),
+        (false, true) => format!("start={at:.3}"),
+        (false, false) => format!(
             "start={at:.3},force-media-title={}",
             mpv::option_value(&title)
-        )
+        ),
     };
     loadfile_replace(conn, &cur.watch_url(), &opts);
     osd(
@@ -1372,10 +1557,35 @@ pub fn spawn_watcher(
         .spawn(move || {
             let socket = player::player_socket();
             let mut ended = Ended::default();
-            let Some(mut conn) = connect_to_player(&player, &socket) else {
-                done(ended);
-                return;
+            let mut conn = match connect_to_player(&player, &socket) {
+                Ok(conn) => conn,
+                Err(why) => {
+                    let (status, stopped_by_app, log) =
+                        player.failure_info(Duration::from_millis(200));
+                    if let Some(msg) = classify_player_error(
+                        status,
+                        stopped_by_app,
+                        &log,
+                        why == ConnectError::TimedOut,
+                    ) {
+                        if !log.trim().is_empty() {
+                            eprintln!("cattube: playback failed:\n{}", log.trim());
+                        }
+                        ended.error = Some(msg.to_string());
+                    }
+                    done(ended);
+                    return;
+                }
             };
+            // Subscribe to mpv property changes so the watcher stays idle
+            // without polling IPC multiple times per second when SponsorBlock
+            // has nothing to skip.
+            let observed = conn.observe_property(1, "eof-reached").is_ok()
+                && conn.observe_property(2, "duration").is_ok()
+                && conn.observe_property(3, "pause").is_ok()
+                && conn
+                    .observe_property(4, "metadata/by-key/ytdl_is_live")
+                    .is_ok();
             let mut queue = s.queue.clone();
             let mut history: Vec<yt::Tile> = Vec::new();
             let mut cur = first;
@@ -1419,11 +1629,13 @@ pub fn spawn_watcher(
                     }),
                 ]);
                 let (segments_tx, segments_rx) = std::sync::mpsc::channel();
+                let mut segments_pending = false;
                 if let Some(url) = s
                     .sponsorblock
                     .as_ref()
                     .and_then(|cats| community::segments_url(&cur.id, cats))
                 {
+                    segments_pending = true;
                     spawn_segments_lookup(url, segments_tx);
                 }
                 let mut segments: Vec<community::Segment> = Vec::new();
@@ -1436,7 +1648,7 @@ pub fn spawn_watcher(
                 let mut last = (0.0f64, None::<f64>);
                 // A live stream has no place to come back to (its time is
                 // the stream's, and mpv cannot seek a start into it): it is
-                // never saved. Known from the card, else asked once.
+                // never saved. Known from the card, else observed from mpv.
                 let mut live = cur.kind == yt::Kind::Live;
                 let mut live_asked = live;
                 let mut card_until: Option<Instant> = None;
@@ -1448,65 +1660,133 @@ pub fn spawn_watcher(
                 let mut skipped_to_end = false;
                 let mut thumb: Option<CardThumbnail> = None;
                 let width = conn.get_f64("osd-width").unwrap_or(1920.0);
-                let mut thumb_job = next_id
-                    .as_ref()
-                    .map(|n| fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width));
+                let mut thumb_job = next_id.as_ref().map(|n| {
+                    fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
+                });
                 loop {
-                    if let Ok(next) = next_rx.try_recv() {
-                        next_id = next;
-                        next_pending = false;
-                        thumb_job = next_id
-                            .as_ref()
-                            .map(|n| fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width));
-                        episode_controls(&mut conn, !history.is_empty(), next_id.is_some(), false);
+                    match next_rx.try_recv() {
+                        Ok(next) => {
+                            next_id = next;
+                            next_pending = false;
+                            thumb_job = next_id.as_ref().map(|n| {
+                                fetch_card_thumbnail(
+                                    s.cache.clone(),
+                                    n.id.clone(),
+                                    width,
+                                    s.low_power,
+                                )
+                            });
+                            episode_controls(
+                                &mut conn,
+                                !history.is_empty(),
+                                next_id.is_some(),
+                                false,
+                            );
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) if next_pending => {
+                            next_pending = false;
+                            episode_controls(
+                                &mut conn,
+                                !history.is_empty(),
+                                next_id.is_some(),
+                                false,
+                            );
+                        }
+                        Err(_) => {}
                     }
-                    if let Ok(found) = segments_rx.try_recv() {
-                        segments = found;
-                        let marks = segments
-                            .iter()
-                            .map(|x| format!("{:.1}-{:.1}", x.start, x.end))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let _ = conn.command(&[
-                            Arg::Str("script-message"),
-                            Arg::Str("cattube-segments"),
-                            Arg::Str(&marks),
-                        ]);
+                    match segments_rx.try_recv() {
+                        Ok(found) => {
+                            segments_pending = false;
+                            segments = found;
+                            let marks = segments
+                                .iter()
+                                .map(|x| format!("{:.1}-{:.1}", x.start, x.end))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let _ = conn.command(&[
+                                Arg::Str("script-message"),
+                                Arg::Str("cattube-segments"),
+                                Arg::Str(&marks),
+                            ]);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            segments_pending = false;
+                        }
+                        Err(_) => {}
                     }
-                    if let Some(job) = &thumb_job
-                        && let Ok(pic) = job.try_recv()
-                    {
-                        thumb = pic;
-                        thumb_job = None;
-                        if card_until.is_some()
-                            && let Some(pic) = &thumb
-                        {
-                            let (p, w, h) = &pic.0;
-                            card(&mut conn, &["thumb", p, &w.to_string(), &h.to_string()]);
+                    if let Some(job) = &thumb_job {
+                        match job.try_recv() {
+                            Ok(pic) => {
+                                thumb = pic;
+                                thumb_job = None;
+                                if card_until.is_some()
+                                    && let Some(pic) = &thumb
+                                {
+                                    let (p, w, h) = &pic.0;
+                                    card(&mut conn, &["thumb", p, &w.to_string(), &h.to_string()]);
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                thumb_job = None;
+                            }
+                            Err(_) => {}
                         }
                     }
-                    let msgs = conn.messages(Duration::from_millis(400));
+                    let paused = observed && conn.observed_bool("pause").unwrap_or(false);
+                    let poll_pos = !segments.is_empty() && !paused;
+                    let wait = if card_until.is_some()
+                        || next_pending
+                        || segments_pending
+                        || thumb_job.is_some()
+                    {
+                        Duration::from_millis(250)
+                    } else if poll_pos || !observed {
+                        Duration::from_millis(400)
+                    } else {
+                        Duration::from_millis(1000)
+                    };
+                    let msgs = conn.messages(wait);
                     if conn.closed() || player.exited() {
                         if !live {
                             ended.positions.push((cur.id.clone(), last.0, last.1));
                         }
                         break 'videos;
                     }
-                    let pos = conn.get_f64("time-pos");
-                    let dur = conn.get_f64("duration").filter(|d| *d > 0.0);
-                    if pos.is_some() && !live_asked {
-                        live_asked = true;
-                        live =
-                            conn.get_str("metadata/by-key/ytdl_is_live").as_deref() == Some("true");
+                    let dur = if observed {
+                        conn.observed_f64("duration").filter(|d| *d > 0.0)
+                    } else {
+                        conn.get_f64("duration").filter(|d| *d > 0.0)
+                    };
+                    if !live {
+                        if observed {
+                            live =
+                                conn.observed_str("metadata/by-key/ytdl_is_live") == Some("true");
+                        } else if !live_asked {
+                            live_asked = true;
+                            live = conn.get_str("metadata/by-key/ytdl_is_live").as_deref()
+                                == Some("true");
+                        }
                     }
-                    if let Some(p) = pos {
-                        last = (p, dur);
-                    }
-                    // SponsorBlock: jump over the segment once.
-                    if let Some(p) = pos {
-                        let looping = s.autoplay == crate::prefs::Autoplay::Loop;
-                        skipped_to_end |=
-                            skip_segment(&mut conn, &segments, &mut skipped, p, dur, looping);
+                    // Poll time-pos only while SponsorBlock has segments to
+                    // skip during active playback (or if property observation
+                    // is unavailable); cattube-osd.lua owns disk checkpoints.
+                    if poll_pos || !observed {
+                        if let Some(p) = conn.get_f64("time-pos") {
+                            last = (p, dur);
+                            if !segments.is_empty() {
+                                let looping = s.autoplay == crate::prefs::Autoplay::Loop;
+                                skipped_to_end |= skip_segment(
+                                    &mut conn,
+                                    &segments,
+                                    &mut skipped,
+                                    p,
+                                    dur,
+                                    looping,
+                                );
+                            }
+                        }
+                    } else if dur.is_some() {
+                        last.1 = dur;
                     }
                     let want = |name: &str| {
                         msgs.iter()
@@ -1533,7 +1813,11 @@ pub fn spawn_watcher(
                     }
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
-                        change_quality(&mut conn, &s, &cur, h, last.0);
+                        if !live && let Some(p) = conn.get_f64("time-pos") {
+                            last = (p, dur);
+                        }
+                        conn.clear_observed("eof-reached");
+                        change_quality(&mut conn, &s, &cur, h, last.0, live);
                     }
                     // A new request supersedes prior work, including replies from
                     // the previous video. The Lua browser preserves its focus as
@@ -1549,7 +1833,11 @@ pub fn spawn_watcher(
                         _ => None,
                     }
                     .or(picked);
-                    let eof = conn.get_bool("eof-reached").unwrap_or(false) || skipped_to_end;
+                    let eof = if observed {
+                        conn.observed_bool("eof-reached").unwrap_or(false)
+                    } else {
+                        conn.get_bool("eof-reached").unwrap_or(false)
+                    } || skipped_to_end;
                     // The end: "Up next" counts down five seconds.
                     if eof && !quit_sent && !next_pending && card_until.is_none() && jump.is_none()
                     {
@@ -1590,6 +1878,9 @@ pub fn spawn_watcher(
                     if let Some(n) = go_next {
                         card(&mut conn, &["hide"]);
                         if !live {
+                            if let Some(p) = conn.get_f64("time-pos") {
+                                last = (p, dur);
+                            }
                             ended.positions.push((cur.id.clone(), last.0, last.1));
                         }
                         let backwards = want("cattube-episode").as_deref() == Some("prev");
@@ -1601,6 +1892,9 @@ pub fn spawn_watcher(
                         }
                         let title = safe_media_title(&n.title);
                         let opts = format!("force-media-title={}", mpv::option_value(&title));
+                        conn.clear_observed("eof-reached");
+                        conn.clear_observed("duration");
+                        conn.clear_observed("metadata/by-key/ytdl_is_live");
                         loadfile_replace(&mut conn, &n.watch_url(), &opts);
                         // The end left it paused on the last frame (for the card).
                         let _ = conn.command(&[
@@ -1675,6 +1969,12 @@ mod player_tests {
         assert_eq!(thumbnail_size(1920.0, CARD_THUMB_W), (256, 144));
         assert_eq!(thumbnail_size(1280.0, CARD_THUMB_W), (170, 96));
         assert_eq!(thumbnail_size(3840.0, CARD_THUMB_W), (512, 288));
+        // Low-power related atlas is half scale (4x less RAM/I/O) and tiles fit cleanly.
+        let (aw, sx, sy, tw, scale) = related_atlas_geometry(true);
+        assert_eq!((aw, sx, sy, scale), (840, 215, 160, 0.5));
+        let (w, h) = thumbnail_size(1920.0, tw);
+        assert_eq!(3 * sx + w as usize, aw);
+        assert!((h as usize) < sy);
     }
 
     #[test]
@@ -1700,6 +2000,79 @@ mod player_tests {
         stuck_handle.reap_or_kill(Duration::from_millis(40));
         assert!(stuck_handle.exited());
         assert!(at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn player_handle_captures_error_output_and_classifies_failures() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let writer2 = writer.try_clone().unwrap();
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "echo '[ytdl_hook] ERROR: [youtube] xyz: Video unavailable'; exit 2",
+            ])
+            .stdout(std::process::Stdio::from(writer))
+            .stderr(std::process::Stdio::from(writer2))
+            .spawn()
+            .unwrap();
+        let handle = PlayerHandle::with_log_pipe(child, reader);
+        let t0 = Instant::now();
+        while !handle.exited() && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (status, stopped, log) = handle.failure_info(Duration::from_millis(200));
+        assert!(!stopped);
+        assert_eq!(status.and_then(|s| s.code()), Some(2));
+        assert!(log.contains("Video unavailable"), "{log:?}");
+        assert_eq!(
+            classify_player_error(status, stopped, &log, false),
+            Some("This video is not available")
+        );
+        // Clean user quit (exit 0) or app-initiated stop must not show an error.
+        let ok_status = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            classify_player_error(Some(ok_status), false, "anything", false),
+            None
+        );
+        assert_eq!(classify_player_error(status, true, &log, false), None);
+        // Timeout always reports a timeout even though connect_to_player stopped mpv.
+        assert_eq!(
+            classify_player_error(status, true, "", true),
+            Some("The video took too long to start")
+        );
+        assert_eq!(
+            classify_player_error(
+                status,
+                false,
+                "[ytdl_hook] ERROR: Sign in to confirm you're not a bot",
+                false
+            ),
+            Some("YouTube blocked playback; try updating the player in Settings")
+        );
+        assert_eq!(
+            classify_player_error(
+                status,
+                false,
+                "[ytdl_hook] ERROR: Requested format is not available",
+                false
+            ),
+            Some("This quality or codec is not available for this video")
+        );
+        assert_eq!(
+            classify_player_error(status, false, "[ffmpeg] tcp: Connection refused", false),
+            Some("Could not reach YouTube")
+        );
+        assert_eq!(
+            classify_player_error(status, false, "[vd] Failed to open hwdec v4l2m2m", false),
+            Some("Could not start video playback; check quality or codec in Settings")
+        );
+        assert_eq!(
+            classify_player_error(status, false, "unknown failure", false),
+            Some("Could not play this video")
+        );
     }
 
     #[test]
@@ -1737,11 +2110,103 @@ mod player_tests {
     }
 
     #[test]
-    fn curl_quote_escapes_quotes_backslashes_and_newlines() {
-        assert_eq!(
-            curl_quote("https://example.com/a\"b\\c\nd\re"),
-            "\"https://example.com/a\\\"b\\\\cde\""
-        );
+    fn change_quality_omits_start_option_on_live_streams() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+        let run_case = |live: bool| -> String {
+            let (a, mut b) = UnixStream::pair().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut reader = BufReader::new(b.try_clone().unwrap());
+                let mut loadfile_opts = String::new();
+                for _ in 0..3 {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let req = mpv::parse_json(line.trim()).unwrap();
+                    let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+                    let cmd = req.get("command").unwrap().as_arr().unwrap();
+                    if cmd.first().and_then(mpv::Json::as_str) == Some("loadfile") {
+                        loadfile_opts = cmd
+                            .last()
+                            .and_then(mpv::Json::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                    writeln!(b, r#"{{"error":"success","data":null,"request_id":{id}}}"#).unwrap();
+                }
+                loadfile_opts
+            });
+            let mut conn = mpv::IpcConn::from_stream(a).unwrap();
+            let s = Session {
+                low_power: true,
+                ctx: String::new(),
+                cache: PathBuf::new(),
+                autoplay: crate::prefs::Autoplay::Off,
+                sponsorblock: None,
+                codec: cattube_core::player::Codec::Avc,
+                hdr: false,
+                queue: Vec::new(),
+                on_hide: None,
+                on_video: None,
+            };
+            let cur = yt::Tile {
+                id: "WhWc3b3KhnY".into(),
+                title: "Live Stream".into(),
+                ..Default::default()
+            };
+            change_quality(&mut conn, &s, &cur, 720, 125.5, live);
+            drop(conn);
+            server.join().unwrap()
+        };
+        assert!(run_case(false).starts_with("start=125.500,force-media-title="));
+        let live_opts = run_case(true);
+        assert!(!live_opts.contains("start="), "{live_opts}");
+        assert!(live_opts.starts_with("force-media-title="), "{live_opts}");
+    }
+
+    #[test]
+    fn ureq_image_fetch_downloads_caches_and_decodes_in_memory() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let root = std::env::temp_dir().join(format!(
+            "cattube-img-http-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut jpeg = Vec::new();
+        let img = image::RgbImage::from_pixel(8, 8, image::Rgb([12, 34, 56]));
+        img.write_to(
+            &mut std::io::Cursor::new(&mut jpeg),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = jpeg.clone();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut req = [0u8; 512];
+            let _ = s.read(&mut req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            s.write_all(head.as_bytes()).unwrap();
+            s.write_all(&body).unwrap();
+        });
+        let url = format!("http://{addr}/thumb.jpg");
+        let got = fetch_missing_image_bytes(&root, std::slice::from_ref(&url), true);
+        server.join().unwrap();
+        assert_eq!(got.len(), 1);
+        let bytes = got[0].1.as_ref().expect("downloaded bytes");
+        assert_eq!(bytes, &jpeg);
+        assert!(cached_image_path(&root, &url).is_some());
+        assert!(crate::images::decode_bytes(bytes, 320).is_some());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1784,7 +2249,7 @@ mod player_tests {
     }
 
     #[test]
-    fn fetch_images_batch_uses_cached_entries_blurs_atomically_and_rejects_bad_urls() {
+    fn fetch_missing_image_bytes_uses_cached_entries_and_rejects_bad_urls() {
         let root = std::env::temp_dir().join(format!(
             "cattube-img-batch-{}-{}",
             std::process::id(),
@@ -1794,27 +2259,20 @@ mod player_tests {
                 .as_nanos()
         ));
         let url = "https://i.ytimg.com/vi/WhWc3b3KhnY/hqdefault.jpg";
-        let blur_url = format!("{url}#blur");
         let cached = image_path(&root, url);
         std::fs::create_dir_all(cached.parent().unwrap()).unwrap();
         let img = image::RgbImage::from_pixel(16, 9, image::Rgb([30, 60, 90]));
         img.save_with_format(&cached, image::ImageFormat::Jpeg)
             .unwrap();
 
-        let res = fetch_images_batch(
+        let res = fetch_missing_image_bytes(
             &root,
-            &[
-                url.to_string(),
-                blur_url.clone(),
-                "javascript:alert(1)".to_string(),
-            ],
+            &[url.to_string(), "javascript:alert(1)".to_string()],
             true,
         );
-        assert_eq!(res.len(), 3);
-        assert_eq!(res[0].1.as_deref(), Some(cached.to_string_lossy().as_ref()));
-        let blur_path = res[1].1.as_deref().expect("blur image generated");
-        assert!(Path::new(blur_path).is_file());
-        assert!(res[2].1.is_none());
+        assert_eq!(res.len(), 2);
+        assert!(res[0].1.as_ref().is_some_and(|b| !b.is_empty()));
+        assert!(res[1].1.is_none());
         // No leftover .part files.
         let parts: Vec<_> = std::fs::read_dir(root.join("images"))
             .unwrap()

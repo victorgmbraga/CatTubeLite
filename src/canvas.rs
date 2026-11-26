@@ -608,7 +608,8 @@ impl<H: Copy> Canvas<H> {
     /// and turn slowly so the screen is never a still picture. Periods are long and unrelated, so it never visibly loops.
     pub fn background_at(&self, tint: Option<Rgb>, glow: bool, t: f64) {
         if theme::FLAT {
-            self.fill(self.screen, 0.0, Color32::BLACK);
+            // App::clear_color clears the framebuffer directly to pure black
+            // via glClear, avoiding a full-screen overdraw quad on Mali-450.
             return;
         }
         self.vgradient(
@@ -701,6 +702,9 @@ impl<H: Copy> Canvas<H> {
 
     /// Dim everything behind a modal overlay.
     pub fn scrim(&self) {
+        if theme::FLAT {
+            return;
+        }
         self.painter.rect_filled(self.screen, 0.0, theme::scrim());
     }
 

@@ -157,8 +157,19 @@ fn path<'a>(v: &'a Json, keys: &[&str]) -> Option<&'a Json> {
     Some(cur)
 }
 
-/// The largest thumbnail of a `{thumbnails:[…]}` or `{sources:[…]}`.
+/// Preferred thumbnail width for channel avatars in `low_power` mode
+/// (channel avatars are drawn around 95 design px ≈ 142 px at 1080p).
+const SMALL_THUMB_TARGET_W: f64 = 240.0;
+
+/// Pick a thumbnail from `{thumbnails:[…]}` or `{sources:[…]}`. On standard
+/// machines this returns the largest; in `low_power` it picks the smallest
+/// entry at least [`SMALL_THUMB_TARGET_W`] wide (falling back to the largest
+/// available) so channel avatars don't download 800–900 px images.
 fn best_thumb(v: Option<&Json>) -> String {
+    best_thumb_sized(v, SMALL_PICTURES.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn best_thumb_sized(v: Option<&Json>, small: bool) -> String {
     let Some(v) = v else {
         return String::new();
     };
@@ -167,17 +178,21 @@ fn best_thumb(v: Option<&Json>) -> String {
         .or_else(|| v.get("sources"))
         .and_then(Json::as_arr)
         .unwrap_or(&[]);
-    let mut best: Option<(f64, &str)> = None;
+    let mut largest: Option<(f64, &str)> = None;
+    let mut fit: Option<(f64, &str)> = None;
     for t in list {
         let Some(url) = t.get("url").and_then(Json::as_str) else {
             continue;
         };
         let w = t.get("width").and_then(Json::as_f64).unwrap_or(0.0);
-        if best.is_none_or(|(bw, _)| w > bw) {
-            best = Some((w, url));
+        if largest.is_none_or(|(bw, _)| w > bw) {
+            largest = Some((w, url));
+        }
+        if small && w >= SMALL_THUMB_TARGET_W && fit.is_none_or(|(fw, _)| w < fw) {
+            fit = Some((w, url));
         }
     }
-    let url = best.map_or("", |(_, u)| u);
+    let url = fit.or(largest).map_or("", |(_, u)| u);
     // Protocol-relative avatars ("//yt3.ggpht.com/…").
     if let Some(rest) = url.strip_prefix("//") {
         format!("https://{rest}")
@@ -207,9 +222,37 @@ pub fn video_thumb(id: &str) -> String {
 }
 
 /// [`video_thumb`] at the larger size, whatever the device (the player's
-/// row of related videos draws them bigger than the cards).
+/// row of related videos draws them bigger than the cards on desktop).
 pub fn video_thumb_hq(id: &str) -> String {
     video_thumb_sized(id, false)
+}
+
+/// [`video_thumb`] at the 320×180 size (`mqdefault`), without letterbox bars.
+pub fn video_thumb_mq(id: &str) -> String {
+    video_thumb_sized(id, true)
+}
+
+/// Normalize a persisted video thumbnail URL to match the active picture-size
+/// mode (so cached History / Home entries upgrade to `mqdefault` in `low_power`).
+pub fn normalize_video_thumb(id: &str, thumb: &str) -> String {
+    normalize_video_thumb_sized(
+        id,
+        thumb,
+        SMALL_PICTURES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn normalize_video_thumb_sized(id: &str, thumb: &str, small: bool) -> String {
+    if !is_video_id(id) {
+        return thumb.to_string();
+    }
+    let hq = video_thumb_sized(id, false);
+    let mq = video_thumb_sized(id, true);
+    if thumb.is_empty() || thumb == hq || thumb == mq {
+        video_thumb_sized(id, small)
+    } else {
+        thumb.to_string()
+    }
 }
 
 fn video_thumb_sized(id: &str, small: bool) -> String {
@@ -879,6 +922,45 @@ mod tests {
         assert_eq!(
             video_thumb_hq("dQw4w9WgXcQ"),
             video_thumb_sized("dQw4w9WgXcQ", false)
+        );
+        assert_eq!(
+            video_thumb_mq("dQw4w9WgXcQ"),
+            video_thumb_sized("dQw4w9WgXcQ", true)
+        );
+        assert_eq!(
+            normalize_video_thumb_sized(
+                "dQw4w9WgXcQ",
+                "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+                true
+            ),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+        );
+        assert_eq!(
+            normalize_video_thumb_sized("dQw4w9WgXcQ", "", true),
+            "https://i.ytimg.com/vi/dQw4w9WgXcQ/mqdefault.jpg"
+        );
+        // Low-power avatar selection picks the smallest >= 240 px (or largest if all smaller).
+        let avatars = parse_json(
+            r#"{"thumbnails":[
+                {"url":"//yt3.ggpht.com/s88","width":88},
+                {"url":"//yt3.ggpht.com/s240","width":240},
+                {"url":"//yt3.ggpht.com/s800","width":800}
+            ]}"#,
+        );
+        assert_eq!(
+            best_thumb_sized(avatars.as_ref(), false),
+            "https://yt3.ggpht.com/s800"
+        );
+        assert_eq!(
+            best_thumb_sized(avatars.as_ref(), true),
+            "https://yt3.ggpht.com/s240"
+        );
+        let tiny = parse_json(
+            r#"{"thumbnails":[{"url":"//yt3.ggpht.com/s88","width":88},{"url":"//yt3.ggpht.com/s176","width":176}]}"#,
+        );
+        assert_eq!(
+            best_thumb_sized(tiny.as_ref(), true),
+            "https://yt3.ggpht.com/s176"
         );
     }
 

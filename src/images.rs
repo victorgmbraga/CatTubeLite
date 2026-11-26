@@ -123,6 +123,14 @@ impl Images {
         }
     }
 
+    /// Drop all cached textures and decoded images to free unified RAM/VRAM
+    /// (e.g. while the fullscreen player runs on a 1 GiB TV box).
+    pub fn clear(&mut self) {
+        self.entries.get_mut().clear();
+        self.wanted.get_mut().clear();
+        self.bytes = 0;
+    }
+
     /// Run after drawing so textures touched in this frame are newest.
     pub fn trim(&mut self) {
         let entries = self.entries.get_mut();
@@ -145,10 +153,25 @@ impl Images {
 
 /// Decode a downloaded PNG, JPEG or WebP away from the interface thread.
 pub fn decode(path: &str, max_side: u32) -> Option<ColorImage> {
-    let mut reader = image::ImageReader::open(path)
+    let reader = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?;
+    decode_reader(reader, max_side)
+}
+
+/// Decode a PNG, JPEG or WebP directly from bytes already in memory.
+pub fn decode_bytes(bytes: &[u8], max_side: u32) -> Option<ColorImage> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    decode_reader(reader, max_side)
+}
+
+fn decode_reader<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+    max_side: u32,
+) -> Option<ColorImage> {
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(DECODE_LIMIT);
     limits.max_image_height = Some(DECODE_LIMIT);
@@ -246,6 +269,10 @@ mod tests {
         assert!(images.get(&ctx, "recent", false).is_some());
         assert!(images.get(&ctx, "new", false).is_some());
         assert_eq!(images.bytes, 8);
+        images.clear();
+        assert_eq!(images.bytes, 0);
+        assert!(images.entries.borrow().is_empty());
+        assert_eq!(images.take_wanted().count(), 0);
     }
 
     #[test]

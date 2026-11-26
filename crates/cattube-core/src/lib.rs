@@ -8,7 +8,6 @@ pub mod error;
 pub mod home_cache;
 pub mod input;
 pub mod mpv;
-pub mod net;
 pub mod osk;
 pub mod player;
 pub mod process;

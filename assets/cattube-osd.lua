@@ -58,7 +58,7 @@ local function checkpoint(force, finished)
     -- into it): nothing is saved.
     if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then return end
     local at = mp.get_time()
-    local min_gap = opts.low_power and 10 or 5
+    local min_gap = opts.low_power and 30 or 5
     if not force and at - saved_at < min_gap then return end
     local path = mp.get_property("path", "")
     local id = path:match("[?&]v=([%w_-]+)") or path:match("youtu%.be/([%w_-]+)") or current_video
@@ -841,12 +841,14 @@ render_card = function(a)
     rect(a, x, y, CW, CH, 28)
     a:draw_stop()
     -- Frost: faint layers from the top edge that add up to a soft fade.
-    for k = 1, 4 do
-        a:new_event()
-        a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HFA&}")
-        a:draw_start()
-        rect(a, x + 1, y + 1, CW - 2, 22 * k, 27)
-        a:draw_stop()
+    if not opts.low_power then
+        for k = 1, 4 do
+            a:new_event()
+            a:append("{\\an7\\pos(0,0)\\bord0\\shad0\\1c&HFFFFFF&\\1a&HFA&}")
+            a:draw_start()
+            rect(a, x + 1, y + 1, CW - 2, 22 * k, 27)
+            a:draw_stop()
+        end
     end
     -- Thumbnail frame (the picture is an overlay placed on top of it).
     local tx, ty = x + 28, y + 28
@@ -999,6 +1001,18 @@ local function quick_seek(secs)
     end)
 end
 
+local function sync_tick_timer(paused)
+    if paused == nil then paused = mp.get_property_bool("pause", false) end
+    if shown and not paused then
+        if not tick_timer then
+            tick_timer = mp.add_periodic_timer(opts.low_power and 1.0 or 0.5, render)
+        end
+    elseif tick_timer then
+        tick_timer:kill()
+        tick_timer = nil
+    end
+end
+
 local function show()
     -- Coming up from hidden (OK, an arrow, or a pause from a media key):
     -- focus starts on Play / Pause.
@@ -1009,9 +1023,7 @@ local function show()
     end
     shown = true
     render()
-    if not tick_timer then
-        tick_timer = mp.add_periodic_timer(0.5, render)
-    end
+    sync_tick_timer()
     arm_hide()
 end
 
@@ -1065,11 +1077,14 @@ local function related_overlays(atlas)
     end
     local dims = mp.get_property_native("osd-dimensions") or {}
     local sx, sy = (dims.w or W) / W, (dims.h or H) / H
-    local offset_y = math.floor(related_scroll * RSTEP + 0.5)
-    local height = math.min(H - 40 - RY, atlas.h - offset_y)
+    local as = atlas.s or 1
+    local offset_y = math.floor(related_scroll * RSTEP * as + 0.5)
+    local vis_h = math.floor((H - 40 - RY) * as + 0.5)
+    local height = math.min(vis_h, atlas.h - offset_y)
     if height <= 0 then return end
     local x, y = math.floor(RX * sx), math.floor(RY * sy)
-    local dw, dh = math.floor(atlas.w * sx), math.floor(height * sy)
+    local dw = math.floor((atlas.w / as) * sx + 0.5)
+    local dh = math.floor((height / as) * sy + 0.5)
     local offset = offset_y * atlas.w * 4
     local key = table.concat({atlas.p, atlas.v or 0, x, y, offset, height, dw, dh}, " ")
     if key ~= related_placed then
@@ -1414,7 +1429,14 @@ end
 -- Media keys keep working through the input conf; the bar follows pause.
 mp.observe_property("pause", "native", function(_, paused)
     if not related then
-        if paused then show() elseif shown then arm_hide() end
+        if paused then
+            show()
+        elseif shown then
+            arm_hide()
+            sync_tick_timer(false)
+        end
+    else
+        sync_tick_timer(paused)
     end
     render()
 end)
@@ -1492,15 +1514,15 @@ mp.observe_property("eof-reached", "bool", function(_, eof)
 end)
 mp.register_event("seek", function()
     if last_point then last_point.finished = false end
-    if peek then render() end
+    if peek or shown then render() end
 end)
-mp.add_periodic_timer(opts.low_power and 10 or 5, function()
+mp.add_periodic_timer(opts.low_power and 30 or 5, function()
     if not mp.get_property_bool("pause", false) then checkpoint(false, false) end
 end)
 mp.observe_property("pause", "bool", function() checkpoint(true, false) end)
 mp.register_event("playback-restart", function()
     checkpoint(true, false)
-    if peek then render() end
+    if peek or shown then render() end
 end)
 mp.observe_property("paused-for-cache", "bool", function(_, waiting)
     if waiting then loading(true) elseif mp.get_property("time-pos") then loading(false) end

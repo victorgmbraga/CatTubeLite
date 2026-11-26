@@ -16,6 +16,7 @@ type Task = Box<dyn FnOnce() + Send + 'static>;
 
 pub struct Jobs<M: Send + 'static> {
     work_tx: Sender<Task>,
+    maint_tx: Sender<Task>,
     tx: Sender<M>,
     rx: Receiver<M>,
     ctx: egui::Context,
@@ -25,6 +26,7 @@ impl<M: Send + 'static> Jobs<M> {
     pub fn new(ctx: &egui::Context, workers: usize) -> Self {
         let (tx, rx) = mpsc::channel();
         let (work_tx, work_rx) = mpsc::channel::<Task>();
+        let (maint_tx, maint_rx) = mpsc::channel::<Task>();
         let shared = Arc::new(Mutex::new(work_rx));
         let count = workers.max(1);
         for i in 0..count {
@@ -47,8 +49,22 @@ impl<M: Send + 'static> Jobs<M> {
                 eprintln!("cattube: could not start worker thread {i}: {e}");
             }
         }
+        // Dedicated single maintenance thread so startup/periodic chores
+        // (tool updates, disk cache pruning) never occupy the interactive
+        // worker slots needed for cached thumbnails, pages or search.
+        if let Err(e) = thread::Builder::new()
+            .name("cattube-maint".into())
+            .spawn(move || {
+                while let Ok(job) = maint_rx.recv() {
+                    job();
+                }
+            })
+        {
+            eprintln!("cattube: could not start maintenance thread: {e}");
+        }
         Self {
             work_tx,
+            maint_tx,
             tx,
             rx,
             ctx: ctx.clone(),
@@ -63,13 +79,30 @@ impl<M: Send + 'static> Jobs<M> {
         self.try_spawn(f);
     }
 
+    /// Run a background maintenance job off the interactive worker pool.
+    pub fn spawn_maintenance<F>(&self, f: F)
+    where
+        F: FnOnce() -> M + Send + 'static,
+    {
+        self.queue_on(&self.maint_tx, f, None::<fn() -> M>);
+    }
+
+    /// Like [`Jobs::spawn_maintenance`], delivering `on_panic` if `f` panics.
+    pub fn spawn_maintenance_or<F, R>(&self, f: F, on_panic: R)
+    where
+        F: FnOnce() -> M + Send + 'static,
+        R: FnOnce() -> M + Send + 'static,
+    {
+        self.queue_on(&self.maint_tx, f, Some(on_panic));
+    }
+
     /// Like [`Jobs::spawn`] but returns false (and logs) if the task could
     /// not be queued, for callers that track "in flight" state.
     pub fn try_spawn<F>(&self, f: F) -> bool
     where
         F: FnOnce() -> M + Send + 'static,
     {
-        self.queue(f, None::<fn() -> M>)
+        self.queue_on(&self.work_tx, f, None::<fn() -> M>)
     }
 
     /// Like [`Jobs::spawn`], for a job a screen is waiting on: if it panics,
@@ -79,7 +112,7 @@ impl<M: Send + 'static> Jobs<M> {
         F: FnOnce() -> M + Send + 'static,
         R: FnOnce() -> M + Send + 'static,
     {
-        self.queue(f, Some(on_panic));
+        self.queue_on(&self.work_tx, f, Some(on_panic));
     }
 
     /// [`Jobs::spawn_or`] for callers that track "in flight" state.
@@ -88,10 +121,10 @@ impl<M: Send + 'static> Jobs<M> {
         F: FnOnce() -> M + Send + 'static,
         R: FnOnce() -> M + Send + 'static,
     {
-        self.queue(f, Some(on_panic))
+        self.queue_on(&self.work_tx, f, Some(on_panic))
     }
 
-    fn queue<F, R>(&self, f: F, on_panic: Option<R>) -> bool
+    fn queue_on<F, R>(&self, target: &Sender<Task>, f: F, on_panic: Option<R>) -> bool
     where
         F: FnOnce() -> M + Send + 'static,
         R: FnOnce() -> M + Send + 'static,
@@ -112,7 +145,7 @@ impl<M: Send + 'static> Jobs<M> {
                 ctx.request_repaint();
             }
         });
-        match self.work_tx.send(job) {
+        match target.send(job) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("cattube: could not queue background job: {e}");
@@ -183,5 +216,28 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(got, [1, 2]);
+    }
+
+    #[test]
+    fn maintenance_jobs_do_not_block_interactive_workers() {
+        let ctx = egui::Context::default();
+        let jobs: Jobs<usize> = Jobs::new(&ctx, 1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        jobs.spawn_maintenance(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            99
+        });
+        jobs.spawn(|| 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_interactive = false;
+        while Instant::now() < deadline {
+            if jobs.drain().contains(&1) {
+                saw_interactive = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let _ = release_tx.send(());
+        assert!(saw_interactive);
     }
 }

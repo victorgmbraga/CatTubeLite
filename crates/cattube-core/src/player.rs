@@ -99,6 +99,27 @@ pub fn yt_dlp_runner(data: &Path) -> PathBuf {
     }
 }
 
+/// Read yt-dlp's version directly from the unpacked `yt_dlp/version.py`
+/// without spawning Python. Returns `None` if absent or malformed.
+pub fn yt_dlp_version_from_unpacked(data: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(yt_dlp_dir(data).join("yt_dlp/version.py")).ok()?;
+    parse_yt_dlp_version(&text)
+}
+
+fn parse_yt_dlp_version(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("__version__")?.trim_start();
+        let val = rest.strip_prefix('=')?.trim();
+        let unquoted = val
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .or_else(|| val.strip_prefix('"').and_then(|s| s.strip_suffix('"')))?;
+        let v = unquoted.trim();
+        (!v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic()))
+            .then(|| v.to_string())
+    })
+}
+
 /// Unpack the single-file yt-dlp (a zip) into `dir`.
 pub fn unzip_all_cmd(zip: &Path, dir: &Path) -> Cmd {
     Cmd::new("python3")
@@ -196,8 +217,41 @@ pub fn update_cmd(yt_dlp: &Path) -> Cmd {
         .timeout(Duration::from_secs(180))
 }
 
-/// The JavaScript runtime yt-dlp is given: `deno:/path` (or `node:`).
+/// Sanitize an explicit `CATTUBE_JS_RUNTIME` override (`deno:/path`,
+/// `quickjs:/path`, `node:/path`, `bun:/path`). Rejects shell/option
+/// separators so it can safely enter `--ytdl-raw-options=js-runtimes=...`.
+fn sanitize_js_runtime(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() || s.len() > 512 {
+        return None;
+    }
+    if s.chars()
+        .any(|c| c.is_control() || matches!(c, ',' | '"' | '\'' | ';' | '\n' | '\r'))
+    {
+        return None;
+    }
+    let name = s.split(':').next().unwrap_or("");
+    matches!(name, "deno" | "node" | "quickjs" | "bun").then(|| s.to_string())
+}
+
+/// The JavaScript runtime yt-dlp is given: `CATTUBE_JS_RUNTIME` if set, else
+/// system `deno`, CatTube's own `deno`, system `qjs`/`quickjs`, or `node`.
 pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option<String> {
+    js_runtime_with_env(
+        data,
+        find,
+        std::env::var("CATTUBE_JS_RUNTIME").ok().as_deref(),
+    )
+}
+
+pub fn js_runtime_with_env(
+    data: &Path,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+    env: Option<&str>,
+) -> Option<String> {
+    if let Some(forced) = env.and_then(sanitize_js_runtime) {
+        return Some(forced);
+    }
     if let Some(p) = find("deno") {
         return Some(format!("deno:{}", p.display()));
     }
@@ -206,6 +260,9 @@ pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option
     let own = own_deno_path(data);
     if crate::process::find_executable(&own.display().to_string()).is_some() {
         return Some(format!("deno:{}", own.display()));
+    }
+    if let Some(p) = find("qjs").or_else(|| find("quickjs")) {
+        return Some(format!("quickjs:{}", p.display()));
     }
     find("node").map(|p| format!("node:{}", p.display()))
 }
@@ -353,9 +410,9 @@ pub fn format_string(max_h: u32, codec: Codec, hdr: bool, low_power: bool) -> St
     parts.join("/")
 }
 
-/// Buffer sizes offered (MiB): small for little memory, large for shaky
-/// connections.
-pub const BUFFERS: [u32; 3] = [64, 256, 768];
+/// Buffer sizes offered (MiB): 32 MiB for 1 GiB TV boxes, up to 768 MiB for
+/// shaky connections on desktops.
+pub const BUFFERS: [u32; 4] = [32, 64, 256, 768];
 
 /// Countries for recommendations (YouTube's region codes).
 pub const REGIONS: [&str; 16] = [
@@ -458,7 +515,11 @@ pub fn mpv_argv(
         // restores them (volume too) would fight the start time.
         "--save-position-on-quit=no",
         "--resume-playback=no",
-        "--no-terminal",
+        // Do not take keys from stdin or print status lines, while keeping
+        // errors on stdout so CatTube can explain why a video failed to start.
+        "--no-input-terminal",
+        "--term-status-msg=",
+        "--msg-level=all=error",
         "--wayland-app-id=cattube-player",
         "--osc=no",
         // Only CatTube's keys: mpv's built-in ones (volume, the number
@@ -596,13 +657,97 @@ pub fn player_socket() -> PathBuf {
 /// newest last, at most `MAX_POSITIONS`.
 pub const MAX_POSITIONS: usize = 500;
 
-pub fn parse_positions(text: &str) -> Vec<(String, f64)> {
+static POSITIONS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn parse_checkpoint_fields(text: &str) -> Option<Checkpoint> {
+    let mut fields = text.split_whitespace();
+    let position: f64 = fields.next()?.parse().ok()?;
+    let duration: f64 = fields.next()?.parse().ok()?;
+    let finished = match fields.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    if fields.next().is_some()
+        || !position.is_finite()
+        || position < 0.0
+        || !duration.is_finite()
+        || duration < 0.0
+    {
+        return None;
+    }
+    Some(Checkpoint {
+        position,
+        duration: (duration > 0.0).then_some(duration),
+        finished,
+    })
+}
+
+/// Parse `positions.conf`: accepts both legacy 2-field lines (`<id> <pos>`)
+/// and compacted 4-field lines (`<id> <pos> <dur> <0|1>`).
+pub fn parse_position_records(text: &str) -> Vec<(String, Checkpoint)> {
     text.lines()
         .filter_map(|l| {
-            let (id, s) = l.trim().split_once(' ')?;
-            let s: f64 = s.trim().parse().ok()?;
-            (id.len() == 11 && s.is_finite() && s >= 0.0).then(|| (id.to_string(), s))
+            let mut fields = l.split_whitespace();
+            let id = fields.next()?;
+            if !crate::youtube::is_video_id(id) {
+                return None;
+            }
+            let position: f64 = fields.next()?.parse().ok()?;
+            if !position.is_finite() || position < 0.0 {
+                return None;
+            }
+            match fields.next() {
+                None => Some((
+                    id.to_string(),
+                    Checkpoint {
+                        position,
+                        duration: None,
+                        finished: false,
+                    },
+                )),
+                Some(dur_s) => {
+                    let duration: f64 = dur_s.parse().ok()?;
+                    let finished = match fields.next()? {
+                        "0" => false,
+                        "1" => true,
+                        _ => return None,
+                    };
+                    if fields.next().is_some() || !duration.is_finite() || duration < 0.0 {
+                        return None;
+                    }
+                    Some((
+                        id.to_string(),
+                        Checkpoint {
+                            position,
+                            duration: (duration > 0.0).then_some(duration),
+                            finished,
+                        },
+                    ))
+                }
+            }
         })
+        .collect()
+}
+
+pub fn position_records_text(list: &[(String, Checkpoint)]) -> String {
+    list.iter()
+        .map(|(id, p)| {
+            format!(
+                "{id} {:.3} {:.3} {}\n",
+                p.position,
+                p.duration.unwrap_or(0.0),
+                u8::from(p.finished)
+            )
+        })
+        .collect()
+}
+
+pub fn parse_positions(text: &str) -> Vec<(String, f64)> {
+    parse_position_records(text)
+        .into_iter()
+        .filter(|(_, p)| !p.finished)
+        .map(|(id, p)| (id, p.position))
         .collect()
 }
 
@@ -611,6 +756,20 @@ pub fn remember(list: &mut Vec<(String, f64)>, id: &str, pos: f64, _duration: Op
     list.retain(|(x, _)| x != id);
     if pos.is_finite() && pos > 0.0 {
         list.push((id.to_string(), pos));
+    }
+    let n = list.len();
+    if n > MAX_POSITIONS {
+        list.drain(..n - MAX_POSITIONS);
+    }
+}
+
+fn remember_record(list: &mut Vec<(String, Checkpoint)>, id: &str, point: Checkpoint) {
+    if !crate::youtube::is_video_id(id) || !point.position.is_finite() || point.position < 0.0 {
+        return;
+    }
+    list.retain(|(x, _)| x != id);
+    if point.finished || point.position > 0.0 {
+        list.push((id.to_string(), point));
     }
     let n = list.len();
     if n > MAX_POSITIONS {
@@ -662,32 +821,164 @@ pub fn store_checkpoint(data: &Path, id: &str, point: Checkpoint) -> std::io::Re
     res
 }
 
-/// Merge finished/stopped playback positions into `positions.conf` atomically.
-pub fn save_positions_merged(
-    data: &Path,
-    ended: &[(String, f64, Option<f64>)],
-) -> std::io::Result<()> {
-    use std::sync::Mutex;
-    static LOCK: Mutex<()> = Mutex::new(());
-    if ended.is_empty() {
-        return Ok(());
+fn read_checkpoint_with_inode(path: &Path) -> Option<(Checkpoint, u64, u64)> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let mut f = std::fs::File::open(path).ok()?;
+    let meta = f.metadata().ok()?;
+    let mut text = String::new();
+    f.read_to_string(&mut text).ok()?;
+    let point = parse_checkpoint_fields(&text)?;
+    Some((point, meta.dev(), meta.ino()))
+}
+
+fn remove_if_same_inode(path: &Path, dev: u64, ino: u64) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.dev() == dev
+        && meta.ino() == ino
+    {
+        let _ = std::fs::remove_file(path);
     }
-    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::fs::create_dir_all(data)?;
-    let path = data.join("positions.conf");
-    let mut list = std::fs::read_to_string(&path)
-        .map(|t| parse_positions(&t))
-        .unwrap_or_default();
-    for (id, pos, dur) in ended {
-        remember(&mut list, id, *pos, *dur);
-    }
-    let tmp = crate::util::unique_tmp_path(&path, "tmp");
-    let res =
-        std::fs::write(&tmp, positions_text(&list)).and_then(|()| std::fs::rename(&tmp, &path));
+}
+
+fn write_position_records(path: &Path, list: &[(String, Checkpoint)]) -> std::io::Result<()> {
+    let tmp = crate::util::unique_tmp_path(path, "tmp");
+    let res = std::fs::write(&tmp, position_records_text(list))
+        .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Merge finished/stopped playback positions into `positions.conf` atomically,
+/// folding in any per-video `positions/<id>.pos` checkpoint written by mpv and
+/// removing the merged `.pos` file once `positions.conf` is safely updated.
+pub fn save_positions_merged(
+    data: &Path,
+    ended: &[(String, f64, Option<f64>)],
+) -> std::io::Result<()> {
+    if ended.is_empty() {
+        return Ok(());
+    }
+    let _guard = POSITIONS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::create_dir_all(data)?;
+    let path = data.join("positions.conf");
+    let mut list = std::fs::read_to_string(&path)
+        .map(|t| parse_position_records(&t))
+        .unwrap_or_default();
+    let folder = data.join("positions");
+    let mut merged_files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    let mut changed = false;
+    for (id, pos, dur) in ended {
+        if !crate::youtube::is_video_id(id) {
+            continue;
+        }
+        let cp_path = folder.join(format!("{id}.pos"));
+        if let Some((point, dev, ino)) = read_checkpoint_with_inode(&cp_path) {
+            remember_record(&mut list, id, point);
+            merged_files.push((cp_path, dev, ino));
+            changed = true;
+        } else if pos.is_finite() && *pos > 0.0 {
+            let point = Checkpoint {
+                position: *pos,
+                duration: dur.filter(|d| d.is_finite() && *d > 0.0),
+                finished: false,
+            };
+            remember_record(&mut list, id, point);
+            changed = true;
+        }
+    }
+    if changed {
+        write_position_records(&path, &list)?;
+        for (cp_path, dev, ino) in merged_files {
+            remove_if_same_inode(&cp_path, dev, ino);
+        }
+    }
+    Ok(())
+}
+
+/// Fold leftover `positions/*.pos` files into `positions.conf` and remove
+/// them, so later startups and History loads read one file instead of
+/// hundreds of per-video files. Only call when no player is actively writing
+/// to `positions/`.
+pub fn compact_checkpoints(data: &Path) -> std::io::Result<()> {
+    let _guard = POSITIONS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = data.join("positions");
+    let mut files: Vec<_> = match std::fs::read_dir(&folder) {
+        Ok(rd) => rd
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension()?.to_str()? != "pos" {
+                    return None;
+                }
+                let id = path.file_stem()?.to_str()?.to_string();
+                if !crate::youtube::is_video_id(&id) {
+                    return None;
+                }
+                Some((entry.metadata().ok()?.modified().ok()?, id, path))
+            })
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if files.is_empty() {
+        return Ok(());
+    }
+    files.sort_by_key(|f| f.0);
+    let stale = files.len().saturating_sub(MAX_POSITIONS);
+    for (_, _, path) in files.drain(..stale) {
+        let _ = std::fs::remove_file(path);
+    }
+    let path = data.join("positions.conf");
+    let base = std::fs::read_to_string(&path)
+        .map(|t| parse_position_records(&t))
+        .unwrap_or_default();
+    let mut order: HashMap<String, (usize, Checkpoint)> =
+        HashMap::with_capacity(base.len() + files.len());
+    let mut seq = 0usize;
+    for (id, point) in base {
+        order.insert(id, (seq, point));
+        seq += 1;
+    }
+    let mut merged_files: Vec<(PathBuf, u64, u64)> = Vec::with_capacity(files.len());
+    let mut invalid_files: Vec<PathBuf> = Vec::new();
+    for (_, id, cp_path) in files {
+        if let Some((point, dev, ino)) = read_checkpoint_with_inode(&cp_path) {
+            if point.finished || point.position > 0.0 {
+                order.insert(id, (seq, point));
+                seq += 1;
+            } else {
+                order.remove(&id);
+            }
+            merged_files.push((cp_path, dev, ino));
+        } else {
+            invalid_files.push(cp_path);
+        }
+    }
+    if !merged_files.is_empty() {
+        let mut entries: Vec<(usize, String, Checkpoint)> = order
+            .into_iter()
+            .map(|(id, (idx, point))| (idx, id, point))
+            .collect();
+        entries.sort_unstable_by_key(|(idx, _, _)| *idx);
+        if entries.len() > MAX_POSITIONS {
+            entries.drain(..entries.len() - MAX_POSITIONS);
+        }
+        let compacted: Vec<(String, Checkpoint)> =
+            entries.into_iter().map(|(_, id, p)| (id, p)).collect();
+        std::fs::create_dir_all(data)?;
+        write_position_records(&path, &compacted)?;
+        for (cp_path, dev, ino) in merged_files {
+            remove_if_same_inode(&cp_path, dev, ino);
+        }
+    }
+    for bad in invalid_files {
+        let _ = std::fs::remove_file(bad);
+    }
+    Ok(())
 }
 
 pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
@@ -695,32 +986,17 @@ pub fn checkpoint(data: &Path, id: &str) -> Option<Checkpoint> {
         return None;
     }
     let text = std::fs::read_to_string(data.join("positions").join(format!("{id}.pos"))).ok()?;
-    let mut fields = text.split_whitespace();
-    let position: f64 = fields.next()?.parse().ok()?;
-    let duration: f64 = fields.next()?.parse().ok()?;
-    let finished = match fields.next()? {
-        "0" => false,
-        "1" => true,
-        _ => return None,
-    };
-    if !position.is_finite() || position < 0.0 || !duration.is_finite() {
-        return None;
-    }
-    Some(Checkpoint {
-        position,
-        duration: (duration > 0.0).then_some(duration),
-        finished,
-    })
+    parse_checkpoint_fields(&text)
 }
 
 /// Player checkpoints take precedence over the older watcher snapshots.
-/// Returns both the ordered resume list (newest last) and the raw checkpoints
-/// read from `positions/` in a single pass.
+/// Returns both the ordered resume list (newest last) and the checkpoints
+/// merged from `positions.conf` and any live `positions/*.pos` files.
 pub fn load_positions_and_checkpoints(
     data: &Path,
 ) -> (Vec<(String, f64)>, HashMap<String, Checkpoint>) {
     let base = std::fs::read_to_string(data.join("positions.conf"))
-        .map(|s| parse_positions(&s))
+        .map(|s| parse_position_records(&s))
         .unwrap_or_default();
     let mut files: Vec<_> = std::fs::read_dir(data.join("positions"))
         .into_iter()
@@ -745,12 +1021,19 @@ pub fn load_positions_and_checkpoints(
     }
     // Track newest order index per video id in O(N) instead of O(N^2) Vec::retain.
     let mut order: HashMap<String, (usize, f64)> = HashMap::with_capacity(base.len() + files.len());
+    let mut checkpoints = HashMap::with_capacity(base.len() + files.len());
     let mut seq = 0usize;
-    for (id, pos) in base {
-        order.insert(id, (seq, pos));
-        seq += 1;
+    for (id, point) in base {
+        checkpoints.insert(id.clone(), point);
+        if point.finished {
+            order.remove(&id);
+        } else if point.position.is_finite() && point.position > 0.0 {
+            order.insert(id, (seq, point.position));
+            seq += 1;
+        } else {
+            order.remove(&id);
+        }
     }
-    let mut checkpoints = HashMap::with_capacity(files.len());
     for (_, id, _) in files {
         if let Some(point) = checkpoint(data, &id) {
             checkpoints.insert(id.clone(), point);
@@ -972,15 +1255,39 @@ mod tests {
     #[test]
     fn js_runtime_choice() {
         let none = |_: &str| None;
-        assert_eq!(js_runtime(Path::new("/nope"), &none), None);
+        assert_eq!(js_runtime_with_env(Path::new("/nope"), &none, None), None);
         let sys = |n: &str| (n == "node").then(|| PathBuf::from("/usr/bin/node"));
         assert_eq!(
-            js_runtime(Path::new("/nope"), &sys).as_deref(),
+            js_runtime_with_env(Path::new("/nope"), &sys, None).as_deref(),
             Some("node:/usr/bin/node")
+        );
+        let qjs = |n: &str| (n == "qjs").then(|| PathBuf::from("/usr/bin/qjs"));
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &qjs, None).as_deref(),
+            Some("quickjs:/usr/bin/qjs")
+        );
+        let quickjs = |n: &str| (n == "quickjs").then(|| PathBuf::from("/usr/bin/quickjs"));
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &quickjs, None).as_deref(),
+            Some("quickjs:/usr/bin/quickjs")
         );
         let deno = |n: &str| (n == "deno").then(|| PathBuf::from("/usr/bin/deno"));
         assert_eq!(
-            js_runtime(Path::new("/nope"), &deno).as_deref(),
+            js_runtime_with_env(Path::new("/nope"), &deno, None).as_deref(),
+            Some("deno:/usr/bin/deno")
+        );
+        // Env override takes precedence when valid; malformed/unknown values are ignored.
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &deno, Some("quickjs:/usr/bin/qjs")).as_deref(),
+            Some("quickjs:/usr/bin/qjs")
+        );
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &deno, Some("evil:/bin/sh")).as_deref(),
+            Some("deno:/usr/bin/deno")
+        );
+        assert_eq!(
+            js_runtime_with_env(Path::new("/nope"), &deno, Some("quickjs:/bin/qjs,foo=bar"))
+                .as_deref(),
             Some("deno:/usr/bin/deno")
         );
     }
@@ -1016,6 +1323,22 @@ mod tests {
         std::fs::create_dir_all(yt_dlp_dir(&root)).unwrap();
         std::fs::write(yt_dlp_dir(&root).join("__main__.py"), "").unwrap();
         assert_eq!(yt_dlp_runner(&root), yt_dlp_launcher(&root));
+        assert_eq!(yt_dlp_version_from_unpacked(&root), None);
+        std::fs::create_dir_all(yt_dlp_dir(&root).join("yt_dlp")).unwrap();
+        std::fs::write(
+            yt_dlp_dir(&root).join("yt_dlp/version.py"),
+            "# comment\n__version__ = '2026.11.20'\nRELEASE_GIT_HEAD = 'abc'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            yt_dlp_version_from_unpacked(&root).as_deref(),
+            Some("2026.11.20")
+        );
+        assert_eq!(
+            parse_yt_dlp_version("__version__ = \"2026.01.02\"").as_deref(),
+            Some("2026.01.02")
+        );
+        assert_eq!(parse_yt_dlp_version("__version__ = ''"), None);
         let _ = std::fs::remove_dir_all(root);
         // The folder is quoted for the shell, even with a quote in it.
         let s = yt_dlp_launcher_script(Path::new("/home/o'neil/d"));
@@ -1131,6 +1454,116 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn position_records_round_trip_and_compact_checkpoints() {
+        let root = std::env::temp_dir().join(format!(
+            "cattube-pos-compact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("positions")).unwrap();
+        // Legacy 2-field + new 4-field + malformed lines.
+        let mixed = "WhWc3b3KhnY 100\nB4EPW7JUMTM 300.000 300.000 1\nccccccccccc 10 20\nddddddddddd 10 20 9\n";
+        let records = parse_position_records(mixed);
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0],
+            (
+                "WhWc3b3KhnY".into(),
+                Checkpoint {
+                    position: 100.0,
+                    duration: None,
+                    finished: false,
+                }
+            )
+        );
+        assert_eq!(
+            records[1],
+            (
+                "B4EPW7JUMTM".into(),
+                Checkpoint {
+                    position: 300.0,
+                    duration: Some(300.0),
+                    finished: true,
+                }
+            )
+        );
+        assert_eq!(
+            parse_position_records(&position_records_text(&records)),
+            records
+        );
+        // parse_positions excludes finished 4-field entries.
+        assert_eq!(parse_positions(mixed), vec![("WhWc3b3KhnY".into(), 100.0)]);
+
+        // save_positions_merged prefers .pos checkpoints and removes them once merged.
+        store_checkpoint(
+            &root,
+            "WhWc3b3KhnY",
+            Checkpoint {
+                position: 145.5,
+                duration: Some(250.0),
+                finished: false,
+            },
+        )
+        .unwrap();
+        store_checkpoint(
+            &root,
+            "B4EPW7JUMTM",
+            Checkpoint {
+                position: 600.0,
+                duration: Some(600.0),
+                finished: true,
+            },
+        )
+        .unwrap();
+        save_positions_merged(
+            &root,
+            &[
+                ("WhWc3b3KhnY".into(), 120.0, Some(250.0)),
+                ("B4EPW7JUMTM".into(), 598.0, Some(600.0)),
+            ],
+        )
+        .unwrap();
+        assert!(!root.join("positions/WhWc3b3KhnY.pos").exists());
+        assert!(!root.join("positions/B4EPW7JUMTM.pos").exists());
+        // A failed/immediate exit (pos == 0 with no .pos) must not erase saved progress.
+        save_positions_merged(&root, &[("WhWc3b3KhnY".into(), 0.0, None)]).unwrap();
+        let (resumable, checkpoints) = load_positions_and_checkpoints(&root);
+        assert_eq!(resumable, vec![("WhWc3b3KhnY".into(), 145.5)]);
+        assert_eq!(checkpoints["WhWc3b3KhnY"].duration, Some(250.0));
+        assert!(checkpoints["B4EPW7JUMTM"].finished);
+        assert_eq!(checkpoints["B4EPW7JUMTM"].duration, Some(600.0));
+
+        // compact_checkpoints folds leftover legacy/crash .pos files and removes invalid ones.
+        store_checkpoint(
+            &root,
+            "aaaaaaaaaaa",
+            Checkpoint {
+                position: 42.0,
+                duration: Some(90.0),
+                finished: false,
+            },
+        )
+        .unwrap();
+        std::fs::write(root.join("positions/bbbbbbbbbbb.pos"), "NaN 20 0\n").unwrap();
+        compact_checkpoints(&root).unwrap();
+        assert_eq!(
+            std::fs::read_dir(root.join("positions")).unwrap().count(),
+            0
+        );
+        let (resumable, checkpoints) = load_positions_and_checkpoints(&root);
+        assert_eq!(
+            resumable,
+            vec![("WhWc3b3KhnY".into(), 145.5), ("aaaaaaaaaaa".into(), 42.0)]
+        );
+        assert_eq!(checkpoints["aaaaaaaaaaa"].duration, Some(90.0));
+        assert!(checkpoints["B4EPW7JUMTM"].finished);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

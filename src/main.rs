@@ -30,7 +30,7 @@ use cattube_core::tube::{Ctx, Effect, Screen, Section, SettingRow, Tube};
 use cattube_core::youtube::{self as ytc, Details, Page, Tile};
 use eframe::egui;
 use jobs::Jobs;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use target::Target;
@@ -46,8 +46,9 @@ enum Msg {
     Quiet,
     Images(Vec<(String, Option<egui::ColorImage>)>),
     Tools(Result<String, String>),
-    /// A player ended: its number (see `App::player_seq`).
-    PlaybackDone(u64),
+    /// A player ended: its number (see `App::player_seq`) and an optional
+    /// user-facing error key when playback failed to start.
+    PlaybackDone(u64, Option<String>),
     /// That player's current video was hidden behind the browser.
     PlayerHidden(u64, Tile),
     PlayerChanged(u64, Tile),
@@ -120,7 +121,7 @@ struct App {
     now_playing: Option<Tile>,
     /// Video queued by `--play` while waiting for first-run tool downloads.
     pending_play: Option<Tile>,
-    positions: Vec<(String, f64)>,
+    positions: HashMap<String, f64>,
     tools: Scan<String>,
     yt_dlp_ready: bool,
     /// Started with `--play`: close when the video ends.
@@ -182,7 +183,7 @@ impl App {
             player_seq: 0,
             now_playing: None,
             pending_play: None,
-            positions: Vec::new(),
+            positions: HashMap::new(),
             tools: Scan::Busy,
             yt_dlp_ready,
             quit_after_play: false,
@@ -195,9 +196,15 @@ impl App {
             page_requests: HashSet::new(),
         };
         let pos_data = data.clone();
-        app.jobs
-            .spawn(move || Msg::Positions(player::load_positions(&pos_data)));
-        app.jobs.spawn_or(
+        app.jobs.spawn(move || {
+            // Compact any leftover per-video `.pos` files from earlier runs
+            // (or an older version) when no player is actively writing them.
+            if std::os::unix::net::UnixStream::connect(player::player_socket()).is_err() {
+                let _ = player::compact_checkpoints(&pos_data);
+            }
+            Msg::Positions(player::load_positions(&pos_data))
+        });
+        app.jobs.spawn_maintenance_or(
             move || Msg::Tools(yt::ensure_tools(&data)),
             || Msg::Tools(Err(JOB_FAILED.into())),
         );
@@ -206,7 +213,13 @@ impl App {
         } else {
             (256 * 1024 * 1024, 4000)
         };
-        app.jobs.spawn(move || {
+        let delay_prune = yt_dlp_ready;
+        app.jobs.spawn_maintenance(move || {
+            if delay_prune {
+                // Keep flash I/O clear during the first couple of seconds so
+                // cached Home thumbnails and positions finish loading first.
+                std::thread::sleep(Duration::from_secs(2));
+            }
             yt::prune_image_cache(&cache, cache_max_bytes, cache_max_files);
             Msg::Quiet
         });
@@ -258,21 +271,24 @@ impl App {
     }
 
     fn toast(&mut self, ctx: &egui::Context, text: &str) {
-        self.toast = Some((text.to_string(), Instant::now() + Duration::from_secs(3)));
+        self.toast = Some((
+            i18n::tr(text).to_string(),
+            Instant::now() + Duration::from_secs(3),
+        ));
         ctx.request_repaint();
     }
 
     fn save_prefs(&mut self, ctx: &egui::Context) {
         if let Err(e) = prefs::save(&self.config, &self.prefs) {
-            self.toast(ctx, &format!("Could not save the settings ({e})"));
+            self.toast(
+                ctx,
+                &format!("{} ({e})", i18n::tr("Could not save the settings")),
+            );
         }
     }
 
     fn resume_at(&self, id: &str) -> Option<f64> {
-        self.positions
-            .iter()
-            .find(|(x, _)| x == id)
-            .map(|(_, s)| *s)
+        self.positions.get(id).copied()
     }
 
     fn effect(&mut self, ctx: &egui::Context, e: Effect) {
@@ -300,9 +316,13 @@ impl App {
                                         .map(|d| (point.position / d).clamp(0.0, 1.0) as f32)
                                 };
                                 tile.meta = if point.finished {
-                                    "Watched".into()
+                                    i18n::tr("Watched").into()
                                 } else {
-                                    format!("Resume at {}", player::position_clock(point.position))
+                                    format!(
+                                        "{} {}",
+                                        i18n::tr("Resume at"),
+                                        player::position_clock(point.position)
+                                    )
                                 };
                                 if tile.badge.is_empty()
                                     && let Some(d) = point.duration
@@ -332,9 +352,10 @@ impl App {
                             ytc::tidy_home(p);
                             let _ = std::fs::create_dir_all(&cache);
                             let text = cattube_core::home_cache::to_text(&yctx, p);
-                            if let Err(e) =
-                                cattube_core::util::write_atomic(&home_cache_path(&cache), &text)
-                            {
+                            if let Err(e) = cattube_core::util::write_atomic_no_sync(
+                                &home_cache_path(&cache),
+                                &text,
+                            ) {
                                 eprintln!("cattube: could not keep Home ({e})");
                             }
                         }
@@ -553,7 +574,7 @@ impl App {
             SettingRow::UpdateYtDlp => {
                 self.tools = Scan::Busy;
                 let data = self.data.clone();
-                self.jobs.spawn_or(
+                self.jobs.spawn_maintenance_or(
                     move || Msg::Tools(yt::update_tools(&data)),
                     || Msg::Tools(Err(JOB_FAILED.into())),
                 );
@@ -619,6 +640,12 @@ impl App {
         self.yt_dlp_ready = true;
         match yt::start_player(&o, &self.data) {
             Ok(child) => {
+                if self.low_power {
+                    // Release decoded GL textures before mpv + Deno allocate
+                    // video buffers on a 1 GiB RAM box; the opening frame
+                    // flushes `glDeleteTextures` right away.
+                    self.images.clear();
+                }
                 self.opening = Some(Instant::now());
                 ctx.request_repaint();
                 let watcher_player = child.clone();
@@ -659,10 +686,13 @@ impl App {
                     save_positions(&data, &ended.positions);
                     // Opened to play this one video: done, close now.
                     if quit {
+                        if let Some(err) = &ended.error {
+                            eprintln!("cattube: {err}");
+                        }
                         let _ = hand_back_screen();
-                        std::process::exit(0);
+                        std::process::exit(if ended.error.is_some() { 1 } else { 0 });
                     }
-                    let _ = tx.send(Msg::PlaybackDone(seq));
+                    let _ = tx.send(Msg::PlaybackDone(seq, ended.error));
                     rctx.request_repaint();
                 });
             }
@@ -718,9 +748,15 @@ impl App {
             Msg::Quiet => {}
             Msg::Images(batch) => {
                 let frame = ctx.cumulative_frame_nr();
+                let drop_for_player = self.low_power
+                    && (self.opening.is_some() || (self.player.is_some() && !self.was_focused));
                 for (url, image) in batch {
-                    self.fetching.remove(&url);
-                    self.images.complete(url, image, frame);
+                    if !self.fetching.remove(&url) {
+                        continue;
+                    }
+                    if !drop_for_player {
+                        self.images.complete(url, image, frame);
+                    }
                 }
             }
             Msg::Tools(r) => {
@@ -742,11 +778,11 @@ impl App {
                 }
             }
             Msg::History(page, positions) => {
-                self.positions = positions;
+                self.positions = positions.into_iter().collect();
                 self.tube.replace_page(ytc::feeds::HISTORY, Ok(page));
             }
             Msg::Positions(positions) => {
-                self.positions = positions;
+                self.positions = positions.into_iter().collect();
             }
             Msg::PlayerChanged(seq, tile) => {
                 if seq == self.player_seq && self.player.is_some() {
@@ -771,7 +807,7 @@ impl App {
                     }
                 }
             }
-            Msg::PlaybackDone(seq) => {
+            Msg::PlaybackDone(seq, error) => {
                 // An older player (replaced by a newer one): only where it
                 // stopped counts. Its end must not bring CatTube over the
                 // video playing now, or wait for that one to end.
@@ -795,8 +831,13 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
                 }
+                if let Some(err) = error {
+                    self.toast(ctx, i18n::tr(&err));
+                }
                 // Fresh progress must not steal focus from another window.
-                if matches!(self.tube.section, Section::History | Section::Home)
+                // Home has no logged-in personalization in CatTubeLite, so only
+                // History needs a reload; resume markers update via Msg::Positions.
+                if self.tube.section == Section::History
                     && let Some(id) = self.tube.section.browse_id()
                 {
                     self.effect(ctx, Effect::Load(id.to_string()));
@@ -834,16 +875,39 @@ impl App {
         let low_power = self.low_power;
         let requested = batch.clone();
         let failed = batch.clone();
+        let (tx, rctx) = self.jobs.sender();
         if !self.jobs.try_spawn_or(
             move || {
-                let fetched = yt::fetch_images_batch(&cache, &requested, low_power);
+                // Decode disk-cache hits right away so cached cards never wait
+                // behind network downloads in the same batch.
+                let mut cached_ready = Vec::new();
+                let mut missing = Vec::new();
+                for url in requested {
+                    if let Some(path) = yt::cached_image_path(&cache, &url) {
+                        if let Some(image) = images::decode(&path, max_side) {
+                            cached_ready.push((url, Some(image)));
+                        } else {
+                            let _ = std::fs::remove_file(&path);
+                            missing.push(url);
+                        }
+                    } else {
+                        missing.push(url);
+                    }
+                }
+                if !cached_ready.is_empty() && !missing.is_empty() {
+                    let _ = tx.send(Msg::Images(cached_ready));
+                    rctx.request_repaint();
+                } else if missing.is_empty() {
+                    return Msg::Images(cached_ready);
+                }
+                let fetched = yt::fetch_missing_image_bytes(&cache, &missing, low_power);
                 let decoded = fetched
                     .into_iter()
-                    .map(|(url, path)| {
-                        let image = path.and_then(|p| {
-                            let d = images::decode(&p, max_side);
+                    .map(|(url, bytes)| {
+                        let image = bytes.and_then(|b| {
+                            let d = images::decode_bytes(&b, max_side);
                             if d.is_none() {
-                                let _ = std::fs::remove_file(&p);
+                                yt::remove_cached_image(&cache, &url);
                             }
                             d
                         });
@@ -898,6 +962,14 @@ fn hit_test(hits: &[(egui::Rect, Target)], pos: egui::Pos2) -> Option<Target> {
 }
 
 impl eframe::App for App {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if theme::FLAT {
+            [0.0, 0.0, 0.0, 1.0]
+        } else {
+            theme::rgb(theme::BG_BOTTOM).to_normalized_gamma_f32()
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         for msg in self.jobs.drain() {
             self.message(ctx, msg);
@@ -941,7 +1013,7 @@ impl eframe::App for App {
             p = Default::default();
         }
         let c = self.ctx();
-        let resumable = |id: &str| self.positions.iter().any(|(x, _)| x == id);
+        let resumable = |id: &str| self.positions.contains_key(id);
         let mut effects = Vec::new();
         for action in actions {
             effects.extend(self.tube.handle(action, c, &resumable));
@@ -999,6 +1071,40 @@ impl eframe::App for App {
 
         let mut canvas: Canvas<Target> = Canvas::new(ui, 0);
         canvas.reduce_motion = self.low_power;
+        // Opening a video: draw only the black loading screen and spinner,
+        // skipping the catalogue underneath and any thumbnail fetches while
+        // mpv + yt-dlp are starting.
+        if let Some(since) = self.opening
+            && self.closing.is_none()
+        {
+            if !theme::FLAT {
+                ui.painter()
+                    .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            }
+            widgets::spinner(
+                &canvas,
+                640.0,
+                360.0,
+                31.0 * 2.0 / 3.0,
+                since.elapsed().as_secs_f64(),
+            );
+            self.hits.clear();
+            return;
+        }
+        // Covered by the fullscreen player: do not redraw, animate spinners, or
+        // decode thumbnails in the background. On low-power boxes, also free
+        // any textures left from a temporary return to the browser.
+        if !focused && self.player.is_some() && self.closing.is_none() {
+            if self.low_power {
+                self.images.clear();
+            }
+            if !theme::FLAT {
+                ui.painter()
+                    .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
+            }
+            self.hits.clear();
+            return;
+        }
         canvas.background_at(None, false, now);
         let view = ui::tube::View {
             tube: &self.tube,
@@ -1033,20 +1139,6 @@ impl eframe::App for App {
                 left.min(0.016)
             };
             ctx.request_repaint_after(Duration::from_secs_f32(next));
-        }
-        if let Some(since) = self.opening {
-            // The player's loading screen, as `cattube-osd.lua` draws it
-            // (1080p arc of radius 31, width 6, in the 720p design space),
-            // timed from the same start, so the handover does not show.
-            ui.painter()
-                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::BLACK);
-            widgets::spinner(
-                &canvas,
-                640.0,
-                360.0,
-                31.0 * 2.0 / 3.0,
-                since.elapsed().as_secs_f64(),
-            );
         }
         self.hits = canvas.take_hits();
         self.images.trim();
@@ -1265,6 +1357,9 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         renderer,
+        // FLAT has no gradients; skip per-pixel interleaved gradient noise in
+        // egui_glow's fragment shader on GPUs like Mali-450 (FP16 mediump).
+        dithering: !theme::FLAT && !cattube_core::env::low_power(),
         ..Default::default()
     };
     let start = std::cell::Cell::new(Some(start));
