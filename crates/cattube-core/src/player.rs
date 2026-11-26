@@ -272,6 +272,14 @@ pub fn resolution_label(h: u32) -> String {
 
 /// yt-dlp's format choice: the preferred codec at most `max_h` high, then
 /// any codec at that height, then anything. `hdr = false` keeps to SDR.
+///
+/// On low-power TV boxes (`low_power = true`):
+/// - H.264 up to 720p allows up to 60 fps (hardware decoders such as Amlogic
+///   S905X handle 720p60 H.264 smoothly), while higher resolutions and other
+///   codecs still prefer `<= 30 fps`.
+/// - When the preferred codec is not AV1, fallbacks exclude AV1
+///   (`[vcodec!^=av01]`) before trying any codec so boxes without an AV1
+///   hardware decoder do not silently drop into software AV1 decoding.
 pub fn format_string(max_h: u32, codec: Codec, hdr: bool, low_power: bool) -> String {
     let h = if max_h == 0 {
         String::new()
@@ -293,13 +301,56 @@ pub fn format_string(max_h: u32, codec: Codec, hdr: bool, low_power: bool) -> St
     // Try capped formats with either separate or combined audio before
     // falling back to higher frame rates or an unknown frame rate.
     let sdr = if hdr { "" } else { "[dynamic_range=?SDR]" };
-    let cap = format!("{h}{sdr}[fps<=30]");
+    let cap30 = format!("{h}{sdr}[fps<=30]");
     let preferred = if codec == Codec::Vp9 {
         "[vcodec~='^(vp09|vp9$)']".to_string()
     } else {
         format!("[vcodec^={p}]")
     };
-    format!("(bv*{cap}{preferred}+ba/b{cap}{preferred})/bv*{cap}+ba/b{cap}/{general}")
+    let pair = |filter: &str| format!("bv*{filter}+ba/b{filter}");
+    let mut parts = Vec::new();
+    match codec {
+        Codec::Avc => {
+            if max_h > 720 {
+                // Keep >720p at <=30 fps (e.g. 1080p30) before stepping down to 720p60 H.264.
+                // Note: `{h}` comes first so the OSD's `height<=(%d+)` match still sees `max_h`.
+                parts.push(format!(
+                    "({})",
+                    pair(&format!("{h}[height>720]{sdr}[fps<=30]{preferred}"))
+                ));
+                parts.push(format!(
+                    "({})",
+                    pair(&format!("[height<=720]{sdr}[fps<=?60]{preferred}"))
+                ));
+            } else if max_h > 0 {
+                // Up to 720p H.264 allows up to 60 fps (and unknown fps on live streams).
+                parts.push(format!(
+                    "({})",
+                    pair(&format!("{h}{sdr}[fps<=?60]{preferred}"))
+                ));
+            } else {
+                // Uncapped ("Best"): keep `{h}` absent so the OSD still reports Best.
+                parts.push(format!("({})", pair(&format!("{cap30}{preferred}"))));
+            }
+            // Fall back to non-AV1 (e.g. VP9) before ever touching software AV1.
+            parts.push(pair(&format!("{cap30}[vcodec!^=av01]")));
+            parts.push(pair(&format!("{h}{sdr}[vcodec!^=av01]")));
+            parts.push(pair(&cap30));
+        }
+        Codec::Vp9 => {
+            parts.push(format!("({})", pair(&format!("{cap30}{preferred}"))));
+            // Fall back to non-AV1 (e.g. H.264) before ever touching software AV1.
+            parts.push(pair(&format!("{cap30}[vcodec!^=av01]")));
+            parts.push(pair(&format!("{h}{sdr}[vcodec!^=av01]")));
+            parts.push(pair(&cap30));
+        }
+        Codec::Av1 => {
+            parts.push(format!("({})", pair(&format!("{cap30}{preferred}"))));
+            parts.push(pair(&cap30));
+        }
+    }
+    parts.push(general);
+    parts.join("/")
 }
 
 /// Buffer sizes offered (MiB): small for little memory, large for shaky
@@ -787,13 +838,48 @@ mod tests {
 
     #[test]
     fn low_power_tries_all_capped_formats_before_uncapped_fallbacks() {
-        let selector = format_string(720, Codec::Vp9, false, true);
-        let capped = "[height<=720][dynamic_range=?SDR][fps<=30]";
+        let vp9_sel = format_string(720, Codec::Vp9, false, true);
+        let cap30 = "[height<=720][dynamic_range=?SDR][fps<=30]";
         let vp9 = "[vcodec~='^(vp09|vp9$)']";
-        let priority = format!("(bv*{capped}{vp9}+ba/b{capped}{vp9})/bv*{capped}+ba/b{capped}/");
+        let no_av1 = "[vcodec!^=av01]";
         assert_eq!(
-            selector,
-            priority + &format_string(720, Codec::Vp9, false, false)
+            vp9_sel,
+            format!(
+                "(bv*{cap30}{vp9}+ba/b{cap30}{vp9})/bv*{cap30}{no_av1}+ba/b{cap30}{no_av1}/bv*[height<=720][dynamic_range=?SDR]{no_av1}+ba/b[height<=720][dynamic_range=?SDR]{no_av1}/bv*{cap30}+ba/b{cap30}/{}",
+                format_string(720, Codec::Vp9, false, false)
+            )
+        );
+
+        // H.264 up to 720p allows 60 fps and excludes AV1 before falling back to any codec.
+        let avc720 = format_string(720, Codec::Avc, false, true);
+        assert!(avc720.starts_with(
+            "(bv*[height<=720][dynamic_range=?SDR][fps<=?60][vcodec^=avc1]+ba/b[height<=720][dynamic_range=?SDR][fps<=?60][vcodec^=avc1])/"
+        ));
+        let no_av1_pos = avc720.find("[vcodec!^=av01]").expect("av1 excluded");
+        let any_pos = avc720
+            .find("/bv*[height<=720][dynamic_range=?SDR][fps<=30]+ba")
+            .unwrap();
+        assert!(no_av1_pos < any_pos);
+
+        // Above 720p, H.264 prefers >720p at <=30 fps, then 720p60, keeping max_h as the first height<= match.
+        let avc1080 = format_string(1080, Codec::Avc, false, true);
+        assert!(avc1080.starts_with(
+            "(bv*[height<=1080][height>720][dynamic_range=?SDR][fps<=30][vcodec^=avc1]+ba/"
+        ));
+        assert!(
+            avc1080.contains(")/(bv*[height<=720][dynamic_range=?SDR][fps<=?60][vcodec^=avc1]+ba/")
+        );
+
+        // Best (0) carries no height<= cap so the OSD quality menu still detects Best.
+        let avc_best = format_string(0, Codec::Avc, false, true);
+        assert!(!avc_best.contains("height<="));
+        assert!(avc_best.contains("[vcodec!^=av01]"));
+
+        // Explicit AV1 choice does not insert an AV1 exclusion.
+        let av1_sel = format_string(720, Codec::Av1, false, true);
+        assert!(!av1_sel.contains("[vcodec!^=av01]"));
+        assert!(
+            av1_sel.starts_with("(bv*[height<=720][dynamic_range=?SDR][fps<=30][vcodec^=av01]+ba/")
         );
     }
 
