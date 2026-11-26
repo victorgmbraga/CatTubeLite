@@ -676,34 +676,110 @@ pub fn checkpoint_player(data: &Path) {
     }
 }
 
+const MAX_PLAYER_LOG_BYTES: usize = 8 * 1024;
+const MAX_PLAYER_LOG_LINES: usize = 40;
+
+struct PlayerState {
+    child: Option<std::process::Child>,
+    exit: Option<std::process::ExitStatus>,
+    stopped_by_app: bool,
+    log: std::collections::VecDeque<String>,
+    log_bytes: usize,
+    log_done: bool,
+}
+
 /// Shared handle to a running `mpv` child so both the UI and the
-/// watcher can check exit status and reap it without hanging.
+/// watcher can check exit status, read failure output, and reap it without
+/// hanging.
 #[derive(Clone)]
 pub struct PlayerHandle {
-    child: std::sync::Arc<Mutex<Option<std::process::Child>>>,
+    state: std::sync::Arc<(Mutex<PlayerState>, std::sync::Condvar)>,
 }
 
 impl PlayerHandle {
     pub fn new(child: std::process::Child) -> Self {
         Self {
-            child: std::sync::Arc::new(Mutex::new(Some(child))),
+            state: std::sync::Arc::new((
+                Mutex::new(PlayerState {
+                    child: Some(child),
+                    exit: None,
+                    stopped_by_app: false,
+                    log: std::collections::VecDeque::new(),
+                    log_bytes: 0,
+                    log_done: true,
+                }),
+                std::sync::Condvar::new(),
+            )),
         }
+    }
+
+    fn with_log_pipe(child: std::process::Child, reader: std::io::PipeReader) -> Self {
+        let handle = Self {
+            state: std::sync::Arc::new((
+                Mutex::new(PlayerState {
+                    child: Some(child),
+                    exit: None,
+                    stopped_by_app: false,
+                    log: std::collections::VecDeque::new(),
+                    log_bytes: 0,
+                    log_done: false,
+                }),
+                std::sync::Condvar::new(),
+            )),
+        };
+        let state = handle.state.clone();
+        let _ = std::thread::Builder::new()
+            .name("cattube-mpv-log".into())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader, Read};
+                let mut br = BufReader::new(reader);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    // Bound any single line so pathological output cannot grow memory.
+                    let n = match br.by_ref().take(2048).read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let (lock, _) = &*state;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.log_bytes += line.len();
+                    guard.log.push_back(line);
+                    while guard.log.len() > MAX_PLAYER_LOG_LINES
+                        || guard.log_bytes > MAX_PLAYER_LOG_BYTES
+                    {
+                        if let Some(old) = guard.log.pop_front() {
+                            guard.log_bytes = guard.log_bytes.saturating_sub(old.len());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                let (lock, cv) = &*state;
+                let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                guard.log_done = true;
+                cv.notify_all();
+            });
+        handle
     }
 
     /// True once the process has exited (reaping it immediately if so).
     pub fn exited(&self) -> bool {
-        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(child) = slot.as_mut() else {
+        let (lock, _) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(child) = guard.child.as_mut() else {
             return true;
         };
         match child.try_wait() {
-            Ok(Some(_)) => {
-                *slot = None;
+            Ok(Some(status)) => {
+                guard.exit = Some(status);
+                guard.child = None;
                 true
             }
             Ok(None) => false,
             Err(_) => {
-                *slot = None;
+                guard.child = None;
                 true
             }
         }
@@ -711,13 +787,22 @@ impl PlayerHandle {
 
     /// Terminate the player if it is still running and reap it.
     pub fn stop_and_reap(&self) {
-        let mut slot = self.child.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(mut child) = slot.take() else {
+        let (lock, _) = &*self.state;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        guard.stopped_by_app = true;
+        let Some(mut child) = guard.child.take() else {
             return;
         };
-        if !matches!(child.try_wait(), Ok(Some(_))) {
-            let _ = child.kill();
-            let _ = child.wait();
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                guard.exit = Some(status);
+            }
+            _ => {
+                let _ = child.kill();
+                if let Ok(status) = child.wait() {
+                    guard.exit = Some(status);
+                }
+            }
         }
     }
 
@@ -732,6 +817,22 @@ impl PlayerHandle {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Return the process exit status, whether CatTube stopped it intentionally,
+    /// and the tail of mpv's error output (waiting briefly for EOF on the pipe).
+    fn failure_info(&self, wait_log: Duration) -> (Option<std::process::ExitStatus>, bool, String) {
+        let _ = self.exited();
+        let (lock, cv) = &*self.state;
+        let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (guard, _) = cv
+            .wait_timeout_while(guard, wait_log, |s| !s.log_done)
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out = String::with_capacity(guard.log_bytes);
+        for line in &guard.log {
+            out.push_str(line);
+        }
+        (guard.exit, guard.stopped_by_app, out)
     }
 }
 
@@ -759,17 +860,31 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
         eprintln!("cattube: the previous player did not close in time");
     }
     let _ = std::fs::remove_file(player::player_socket());
-    std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
-        // In CatTube's own process group: a TV shell that closes CatTube
-        // (signalling the group) closes the player with it.
-        .spawn()
-        .map(PlayerHandle::new)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "mpv is not installed".to_string(),
-            _ => format!("Could not start the player ({e})"),
-        })
+    let pipe = std::io::pipe().ok().and_then(|(reader, writer)| {
+        writer
+            .try_clone()
+            .ok()
+            .map(|writer2| (reader, writer, writer2))
+    });
+    let mut cmd = std::process::Command::new(&argv[0]);
+    cmd.args(&argv[1..]).stdin(std::process::Stdio::null());
+    let reader = if let Some((reader, out_w, err_w)) = pipe {
+        cmd.stdout(std::process::Stdio::from(out_w))
+            .stderr(std::process::Stdio::from(err_w));
+        Some(reader)
+    } else {
+        None
+    };
+    // In CatTube's own process group: a TV shell that closes CatTube
+    // (signalling the group) closes the player with it.
+    let child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "mpv is not installed".to_string(),
+        _ => format!("Could not start the player ({e})"),
+    })?;
+    Ok(match reader {
+        Some(r) => PlayerHandle::with_log_pipe(child, r),
+        None => PlayerHandle::new(child),
+    })
 }
 
 /// CatTube's own window (its Wayland app id) and the player's.
@@ -809,6 +924,8 @@ pub struct Session {
 pub struct Ended {
     /// (video, position, duration) for every video that played.
     pub positions: Vec<(String, f64, Option<f64>)>,
+    /// Friendly message when playback failed to start (absent on normal exit).
+    pub error: Option<String>,
 }
 
 fn osd(conn: &mut mpv::IpcConn, text: &str) {
@@ -1174,25 +1291,117 @@ fn safe_media_title(title: &str) -> String {
         .collect()
 }
 
-/// Wait for mpv to answer with a playing video (up to a minute). `None`: the
-/// player went away, or was stopped for never getting there.
-fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Option<mpv::IpcConn> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectError {
+    Exited,
+    TimedOut,
+}
+
+/// Wait for mpv to answer with a playing video (up to a minute).
+fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Result<mpv::IpcConn, ConnectError> {
     let started = Instant::now();
     loop {
         if player.exited() {
-            return None;
+            return Err(ConnectError::Exited);
         }
         if let Ok(mut c) = mpv::IpcConn::connect(socket)
             && c.get_f64("time-pos").is_some()
         {
-            return Some(c);
+            return Ok(c);
         }
         if started.elapsed() > Duration::from_secs(60) {
             player.stop_and_reap();
-            return None;
+            return Err(ConnectError::TimedOut);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Turn an early mpv exit (before playback started) into a friendly toast
+/// key, or `None` when the user closed mpv cleanly or CatTube replaced it.
+fn classify_player_error(
+    status: Option<std::process::ExitStatus>,
+    stopped_by_app: bool,
+    output: &str,
+    timed_out: bool,
+) -> Option<&'static str> {
+    if timed_out {
+        return Some("The video took too long to start");
+    }
+    if stopped_by_app || status.is_some_and(|s| s.success()) {
+        return None;
+    }
+    let lower = output.to_ascii_lowercase();
+    if [
+        "video unavailable",
+        "this video is not available",
+        "private video",
+        "has been removed",
+        "members-only",
+        "join this channel",
+        "sign in to confirm your age",
+        "age-restricted",
+        "live event will begin",
+        "premieres in",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("This video is not available");
+    }
+    if [
+        "not a bot",
+        "http error 403",
+        "403 forbidden",
+        "unable to extract",
+        "signature extraction",
+        "n challenge",
+        "youtube-dl failed: not found",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("YouTube blocked playback; try updating the player in Settings");
+    }
+    if [
+        "requested format is not available",
+        "no video formats found",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("This quality or codec is not available for this video");
+    }
+    if [
+        "connection refused",
+        "connection timed out",
+        "timed out",
+        "temporary failure in name resolution",
+        "could not resolve",
+        "failed to resolve",
+        "network is unreachable",
+        "no route to host",
+        "http error 5",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("Could not reach YouTube");
+    }
+    if [
+        "hwdec",
+        "v4l2m2m",
+        "vaapi",
+        "vdpau",
+        "error initializing",
+        "could not initialize video",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        return Some("Could not start video playback; check quality or codec in Settings");
+    }
+    Some("Could not play this video")
 }
 
 /// YouTube's pick for what follows `id`, delivered on `tx`.
@@ -1381,9 +1590,25 @@ pub fn spawn_watcher(
         .spawn(move || {
             let socket = player::player_socket();
             let mut ended = Ended::default();
-            let Some(mut conn) = connect_to_player(&player, &socket) else {
-                done(ended);
-                return;
+            let mut conn = match connect_to_player(&player, &socket) {
+                Ok(conn) => conn,
+                Err(why) => {
+                    let (status, stopped_by_app, log) =
+                        player.failure_info(Duration::from_millis(200));
+                    if let Some(msg) = classify_player_error(
+                        status,
+                        stopped_by_app,
+                        &log,
+                        why == ConnectError::TimedOut,
+                    ) {
+                        if !log.trim().is_empty() {
+                            eprintln!("cattube: playback failed:\n{}", log.trim());
+                        }
+                        ended.error = Some(msg.to_string());
+                    }
+                    done(ended);
+                    return;
+                }
             };
             // Subscribe to mpv property changes so the watcher stays idle
             // without polling IPC multiple times per second when SponsorBlock
@@ -1808,6 +2033,79 @@ mod player_tests {
         stuck_handle.reap_or_kill(Duration::from_millis(40));
         assert!(stuck_handle.exited());
         assert!(at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn player_handle_captures_error_output_and_classifies_failures() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let writer2 = writer.try_clone().unwrap();
+        let child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "echo '[ytdl_hook] ERROR: [youtube] xyz: Video unavailable'; exit 2",
+            ])
+            .stdout(std::process::Stdio::from(writer))
+            .stderr(std::process::Stdio::from(writer2))
+            .spawn()
+            .unwrap();
+        let handle = PlayerHandle::with_log_pipe(child, reader);
+        let t0 = Instant::now();
+        while !handle.exited() && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (status, stopped, log) = handle.failure_info(Duration::from_millis(200));
+        assert!(!stopped);
+        assert_eq!(status.and_then(|s| s.code()), Some(2));
+        assert!(log.contains("Video unavailable"), "{log:?}");
+        assert_eq!(
+            classify_player_error(status, stopped, &log, false),
+            Some("This video is not available")
+        );
+        // Clean user quit (exit 0) or app-initiated stop must not show an error.
+        let ok_status = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .status()
+            .unwrap();
+        assert_eq!(
+            classify_player_error(Some(ok_status), false, "anything", false),
+            None
+        );
+        assert_eq!(classify_player_error(status, true, &log, false), None);
+        // Timeout always reports a timeout even though connect_to_player stopped mpv.
+        assert_eq!(
+            classify_player_error(status, true, "", true),
+            Some("The video took too long to start")
+        );
+        assert_eq!(
+            classify_player_error(
+                status,
+                false,
+                "[ytdl_hook] ERROR: Sign in to confirm you're not a bot",
+                false
+            ),
+            Some("YouTube blocked playback; try updating the player in Settings")
+        );
+        assert_eq!(
+            classify_player_error(
+                status,
+                false,
+                "[ytdl_hook] ERROR: Requested format is not available",
+                false
+            ),
+            Some("This quality or codec is not available for this video")
+        );
+        assert_eq!(
+            classify_player_error(status, false, "[ffmpeg] tcp: Connection refused", false),
+            Some("Could not reach YouTube")
+        );
+        assert_eq!(
+            classify_player_error(status, false, "[vd] Failed to open hwdec v4l2m2m", false),
+            Some("Could not start video playback; check quality or codec in Settings")
+        );
+        assert_eq!(
+            classify_player_error(status, false, "unknown failure", false),
+            Some("Could not play this video")
+        );
     }
 
     #[test]

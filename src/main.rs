@@ -46,8 +46,9 @@ enum Msg {
     Quiet,
     Images(Vec<(String, Option<egui::ColorImage>)>),
     Tools(Result<String, String>),
-    /// A player ended: its number (see `App::player_seq`).
-    PlaybackDone(u64),
+    /// A player ended: its number (see `App::player_seq`) and an optional
+    /// user-facing error key when playback failed to start.
+    PlaybackDone(u64, Option<String>),
     /// That player's current video was hidden behind the browser.
     PlayerHidden(u64, Tile),
     PlayerChanged(u64, Tile),
@@ -678,10 +679,13 @@ impl App {
                     save_positions(&data, &ended.positions);
                     // Opened to play this one video: done, close now.
                     if quit {
+                        if let Some(err) = &ended.error {
+                            eprintln!("cattube: {err}");
+                        }
                         let _ = hand_back_screen();
-                        std::process::exit(0);
+                        std::process::exit(if ended.error.is_some() { 1 } else { 0 });
                     }
-                    let _ = tx.send(Msg::PlaybackDone(seq));
+                    let _ = tx.send(Msg::PlaybackDone(seq, ended.error));
                     rctx.request_repaint();
                 });
             }
@@ -796,7 +800,7 @@ impl App {
                     }
                 }
             }
-            Msg::PlaybackDone(seq) => {
+            Msg::PlaybackDone(seq, error) => {
                 // An older player (replaced by a newer one): only where it
                 // stopped counts. Its end must not bring CatTube over the
                 // video playing now, or wait for that one to end.
@@ -819,6 +823,9 @@ impl App {
                 if self.quit_after_play {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     return;
+                }
+                if let Some(err) = error {
+                    self.toast(ctx, i18n::tr(&err));
                 }
                 // Fresh progress must not steal focus from another window.
                 // Home has no logged-in personalization in CatTubeLite, so only
