@@ -75,6 +75,19 @@ pub fn translate(text: &str) -> &str {
         "Non-music part in a music video" => "Trecho sem música em clipe musical",
         "Off-topic filler" => "Conteúdo fora do assunto",
         "Hook or greeting" => "Chamada ou saudação",
+        "Could not play this video" => "Não foi possível reproduzir este vídeo",
+        "The video took too long to start" => "O vídeo demorou demais para começar",
+        "This video is not available" => "Este vídeo não está disponível",
+        "YouTube blocked playback; try updating the player in Settings" => {
+            "O YouTube bloqueou a reprodução; tente atualizar o player em Configurações"
+        }
+        "Could not reach YouTube" => "Não foi possível conectar ao YouTube",
+        "This quality or codec is not available for this video" => {
+            "Esta qualidade ou codec não está disponível para este vídeo"
+        }
+        "Could not start video playback; check quality or codec in Settings" => {
+            "Não foi possível iniciar o vídeo; verifique a qualidade ou o codec em Configurações"
+        }
         _ => text,
     }
 }

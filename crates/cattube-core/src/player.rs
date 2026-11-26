@@ -479,7 +479,11 @@ pub fn mpv_argv(
         // restores them (volume too) would fight the start time.
         "--save-position-on-quit=no",
         "--resume-playback=no",
-        "--no-terminal",
+        // Do not take keys from stdin or print status lines, while keeping
+        // errors on stdout so CatTube can explain why a video failed to start.
+        "--no-input-terminal",
+        "--term-status-msg=",
+        "--msg-level=all=error",
         "--wayland-app-id=cattube-player",
         "--osc=no",
         // Only CatTube's keys: mpv's built-in ones (volume, the number

@@ -129,6 +129,13 @@ mod tests {
         "Non-music part in a music video",
         "Off-topic filler",
         "Hook or greeting",
+        "Could not play this video",
+        "The video took too long to start",
+        "This video is not available",
+        "YouTube blocked playback; try updating the player in Settings",
+        "Could not reach YouTube",
+        "This quality or codec is not available for this video",
+        "Could not start video playback; check quality or codec in Settings",
     ];
 
     #[test]
