@@ -197,7 +197,7 @@ impl App {
         let pos_data = data.clone();
         app.jobs
             .spawn(move || Msg::Positions(player::load_positions(&pos_data)));
-        app.jobs.spawn_or(
+        app.jobs.spawn_maintenance_or(
             move || Msg::Tools(yt::ensure_tools(&data)),
             || Msg::Tools(Err(JOB_FAILED.into())),
         );
@@ -206,7 +206,13 @@ impl App {
         } else {
             (256 * 1024 * 1024, 4000)
         };
-        app.jobs.spawn(move || {
+        let delay_prune = yt_dlp_ready;
+        app.jobs.spawn_maintenance(move || {
+            if delay_prune {
+                // Keep flash I/O clear during the first couple of seconds so
+                // cached Home thumbnails and positions finish loading first.
+                std::thread::sleep(Duration::from_secs(2));
+            }
             yt::prune_image_cache(&cache, cache_max_bytes, cache_max_files);
             Msg::Quiet
         });
@@ -553,7 +559,7 @@ impl App {
             SettingRow::UpdateYtDlp => {
                 self.tools = Scan::Busy;
                 let data = self.data.clone();
-                self.jobs.spawn_or(
+                self.jobs.spawn_maintenance_or(
                     move || Msg::Tools(yt::update_tools(&data)),
                     || Msg::Tools(Err(JOB_FAILED.into())),
                 );
