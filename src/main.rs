@@ -195,8 +195,14 @@ impl App {
             page_requests: HashSet::new(),
         };
         let pos_data = data.clone();
-        app.jobs
-            .spawn(move || Msg::Positions(player::load_positions(&pos_data)));
+        app.jobs.spawn(move || {
+            // Compact any leftover per-video `.pos` files from earlier runs
+            // (or an older version) when no player is actively writing them.
+            if std::os::unix::net::UnixStream::connect(player::player_socket()).is_err() {
+                let _ = player::compact_checkpoints(&pos_data);
+            }
+            Msg::Positions(player::load_positions(&pos_data))
+        });
         app.jobs.spawn_maintenance_or(
             move || Msg::Tools(yt::ensure_tools(&data)),
             || Msg::Tools(Err(JOB_FAILED.into())),
@@ -338,9 +344,10 @@ impl App {
                             ytc::tidy_home(p);
                             let _ = std::fs::create_dir_all(&cache);
                             let text = cattube_core::home_cache::to_text(&yctx, p);
-                            if let Err(e) =
-                                cattube_core::util::write_atomic(&home_cache_path(&cache), &text)
-                            {
+                            if let Err(e) = cattube_core::util::write_atomic_no_sync(
+                                &home_cache_path(&cache),
+                                &text,
+                            ) {
                                 eprintln!("cattube: could not keep Home ({e})");
                             }
                         }
@@ -814,7 +821,9 @@ impl App {
                     return;
                 }
                 // Fresh progress must not steal focus from another window.
-                if matches!(self.tube.section, Section::History | Section::Home)
+                // Home has no logged-in personalization in CatTubeLite, so only
+                // History needs a reload; resume markers update via Msg::Positions.
+                if self.tube.section == Section::History
                     && let Some(id) = self.tube.section.browse_id()
                 {
                     self.effect(ctx, Effect::Load(id.to_string()));

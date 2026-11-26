@@ -58,7 +58,7 @@ local function checkpoint(force, finished)
     -- into it): nothing is saved.
     if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then return end
     local at = mp.get_time()
-    local min_gap = opts.low_power and 10 or 5
+    local min_gap = opts.low_power and 30 or 5
     if not force and at - saved_at < min_gap then return end
     local path = mp.get_property("path", "")
     local id = path:match("[?&]v=([%w_-]+)") or path:match("youtu%.be/([%w_-]+)") or current_video
@@ -1497,7 +1497,7 @@ mp.register_event("seek", function()
     if last_point then last_point.finished = false end
     if peek then render() end
 end)
-mp.add_periodic_timer(opts.low_power and 10 or 5, function()
+mp.add_periodic_timer(opts.low_power and 30 or 5, function()
     if not mp.get_property_bool("pause", false) then checkpoint(false, false) end
 end)
 mp.observe_property("pause", "bool", function() checkpoint(true, false) end)

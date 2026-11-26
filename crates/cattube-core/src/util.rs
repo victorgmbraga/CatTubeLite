@@ -19,12 +19,20 @@ pub fn unique_tmp_path(path: &std::path::Path, suffix: &str) -> std::path::PathB
 /// file (a managed dotfile) stays a symlink: its target is what is replaced.
 pub fn write_atomic(path: &std::path::Path, text: &str) -> io::Result<()> {
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    replace_file(&target, text)
+    replace_file(&target, text, true)
 }
 
-/// TV boxes are often switched off at the wall: the data reaches the disk
-/// before the rename, and the rename before this returns.
-fn replace_file(path: &std::path::Path, text: &str) -> io::Result<()> {
+/// Replace a disposable cache file atomically without forcing `fsync` on the
+/// file and parent directory (avoids unnecessary stalls and flash wear on
+/// eMMC TV boxes).
+pub fn write_atomic_no_sync(path: &std::path::Path, text: &str) -> io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    replace_file(&target, text, false)
+}
+
+/// TV boxes are often switched off at the wall: when `sync` is true, the data
+/// reaches the disk before the rename, and the rename before this returns.
+fn replace_file(path: &std::path::Path, text: &str, sync: bool) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = unique_tmp_path(path, "tmp");
@@ -35,19 +43,24 @@ fn replace_file(path: &std::path::Path, text: &str) -> io::Result<()> {
             .mode(0o666)
             .open(&tmp)?;
         f.write_all(text.as_bytes())?;
-        f.sync_all()
+        if sync {
+            f.sync_all()?;
+        }
+        Ok(())
     })()
     .and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
         return res;
     }
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => std::path::Path::new("."),
-    };
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+    if sync {
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => std::path::Path::new("."),
+        };
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }
@@ -105,9 +118,12 @@ mod tests {
         let fresh = dir.join("fresh.conf");
         super::write_atomic(&fresh, "first").unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "first");
+        let cache = dir.join("home.txt");
+        super::write_atomic_no_sync(&cache, "cached").unwrap();
+        assert_eq!(std::fs::read_to_string(&cache).unwrap(), "cached");
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
-            3,
+            4,
             "no temporary left"
         );
         let _ = std::fs::remove_dir_all(dir);
