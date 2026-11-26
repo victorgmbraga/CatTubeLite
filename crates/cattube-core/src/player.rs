@@ -99,6 +99,27 @@ pub fn yt_dlp_runner(data: &Path) -> PathBuf {
     }
 }
 
+/// Read yt-dlp's version directly from the unpacked `yt_dlp/version.py`
+/// without spawning Python. Returns `None` if absent or malformed.
+pub fn yt_dlp_version_from_unpacked(data: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(yt_dlp_dir(data).join("yt_dlp/version.py")).ok()?;
+    parse_yt_dlp_version(&text)
+}
+
+fn parse_yt_dlp_version(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("__version__")?.trim_start();
+        let val = rest.strip_prefix('=')?.trim();
+        let unquoted = val
+            .strip_prefix('\'')
+            .and_then(|s| s.strip_suffix('\''))
+            .or_else(|| val.strip_prefix('"').and_then(|s| s.strip_suffix('"')))?;
+        let v = unquoted.trim();
+        (!v.is_empty() && v.len() <= 64 && v.bytes().all(|b| b.is_ascii_graphic()))
+            .then(|| v.to_string())
+    })
+}
+
 /// Unpack the single-file yt-dlp (a zip) into `dir`.
 pub fn unzip_all_cmd(zip: &Path, dir: &Path) -> Cmd {
     Cmd::new("python3")
@@ -1016,6 +1037,22 @@ mod tests {
         std::fs::create_dir_all(yt_dlp_dir(&root)).unwrap();
         std::fs::write(yt_dlp_dir(&root).join("__main__.py"), "").unwrap();
         assert_eq!(yt_dlp_runner(&root), yt_dlp_launcher(&root));
+        assert_eq!(yt_dlp_version_from_unpacked(&root), None);
+        std::fs::create_dir_all(yt_dlp_dir(&root).join("yt_dlp")).unwrap();
+        std::fs::write(
+            yt_dlp_dir(&root).join("yt_dlp/version.py"),
+            "# comment\n__version__ = '2026.11.20'\nRELEASE_GIT_HEAD = 'abc'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            yt_dlp_version_from_unpacked(&root).as_deref(),
+            Some("2026.11.20")
+        );
+        assert_eq!(
+            parse_yt_dlp_version("__version__ = \"2026.01.02\"").as_deref(),
+            Some("2026.01.02")
+        );
+        assert_eq!(parse_yt_dlp_version("__version__ = ''"), None);
         let _ = std::fs::remove_dir_all(root);
         // The folder is quoted for the shell, even with a quote in it.
         let s = yt_dlp_launcher_script(Path::new("/home/o'neil/d"));

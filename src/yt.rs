@@ -624,8 +624,12 @@ fn refresh_deno(data: &Path, force: bool) {
 }
 
 pub fn ytdlp_version(data: &Path) -> String {
+    if let Some(v) = player::yt_dlp_version_from_unpacked(data) {
+        return format!("yt-dlp {v}");
+    }
+    let runner = player::yt_dlp_runner(data);
     SystemRunner
-        .run(&Cmd::new(player::yt_dlp_path(data).display().to_string()).arg("--version"))
+        .run(&Cmd::new(runner.display().to_string()).arg("--version"))
         .ok()
         .filter(|o| o.success())
         .map(|o| format!("yt-dlp {}", o.stdout.trim()))
