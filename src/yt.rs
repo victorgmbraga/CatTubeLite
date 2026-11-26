@@ -1385,6 +1385,15 @@ pub fn spawn_watcher(
                 done(ended);
                 return;
             };
+            // Subscribe to mpv property changes so the watcher stays idle
+            // without polling IPC multiple times per second when SponsorBlock
+            // has nothing to skip.
+            let observed = conn.observe_property(1, "eof-reached").is_ok()
+                && conn.observe_property(2, "duration").is_ok()
+                && conn.observe_property(3, "pause").is_ok()
+                && conn
+                    .observe_property(4, "metadata/by-key/ytdl_is_live")
+                    .is_ok();
             let mut queue = s.queue.clone();
             let mut history: Vec<yt::Tile> = Vec::new();
             let mut cur = first;
@@ -1428,11 +1437,13 @@ pub fn spawn_watcher(
                     }),
                 ]);
                 let (segments_tx, segments_rx) = std::sync::mpsc::channel();
+                let mut segments_pending = false;
                 if let Some(url) = s
                     .sponsorblock
                     .as_ref()
                     .and_then(|cats| community::segments_url(&cur.id, cats))
                 {
+                    segments_pending = true;
                     spawn_segments_lookup(url, segments_tx);
                 }
                 let mut segments: Vec<community::Segment> = Vec::new();
@@ -1445,7 +1456,7 @@ pub fn spawn_watcher(
                 let mut last = (0.0f64, None::<f64>);
                 // A live stream has no place to come back to (its time is
                 // the stream's, and mpv cannot seek a start into it): it is
-                // never saved. Known from the card, else asked once.
+                // never saved. Known from the card, else observed from mpv.
                 let mut live = cur.kind == yt::Kind::Live;
                 let mut live_asked = live;
                 let mut card_until: Option<Instant> = None;
@@ -1461,61 +1472,129 @@ pub fn spawn_watcher(
                     fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
                 });
                 loop {
-                    if let Ok(next) = next_rx.try_recv() {
-                        next_id = next;
-                        next_pending = false;
-                        thumb_job = next_id.as_ref().map(|n| {
-                            fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
-                        });
-                        episode_controls(&mut conn, !history.is_empty(), next_id.is_some(), false);
+                    match next_rx.try_recv() {
+                        Ok(next) => {
+                            next_id = next;
+                            next_pending = false;
+                            thumb_job = next_id.as_ref().map(|n| {
+                                fetch_card_thumbnail(
+                                    s.cache.clone(),
+                                    n.id.clone(),
+                                    width,
+                                    s.low_power,
+                                )
+                            });
+                            episode_controls(
+                                &mut conn,
+                                !history.is_empty(),
+                                next_id.is_some(),
+                                false,
+                            );
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) if next_pending => {
+                            next_pending = false;
+                            episode_controls(
+                                &mut conn,
+                                !history.is_empty(),
+                                next_id.is_some(),
+                                false,
+                            );
+                        }
+                        Err(_) => {}
                     }
-                    if let Ok(found) = segments_rx.try_recv() {
-                        segments = found;
-                        let marks = segments
-                            .iter()
-                            .map(|x| format!("{:.1}-{:.1}", x.start, x.end))
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let _ = conn.command(&[
-                            Arg::Str("script-message"),
-                            Arg::Str("cattube-segments"),
-                            Arg::Str(&marks),
-                        ]);
+                    match segments_rx.try_recv() {
+                        Ok(found) => {
+                            segments_pending = false;
+                            segments = found;
+                            let marks = segments
+                                .iter()
+                                .map(|x| format!("{:.1}-{:.1}", x.start, x.end))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            let _ = conn.command(&[
+                                Arg::Str("script-message"),
+                                Arg::Str("cattube-segments"),
+                                Arg::Str(&marks),
+                            ]);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            segments_pending = false;
+                        }
+                        Err(_) => {}
                     }
-                    if let Some(job) = &thumb_job
-                        && let Ok(pic) = job.try_recv()
-                    {
-                        thumb = pic;
-                        thumb_job = None;
-                        if card_until.is_some()
-                            && let Some(pic) = &thumb
-                        {
-                            let (p, w, h) = &pic.0;
-                            card(&mut conn, &["thumb", p, &w.to_string(), &h.to_string()]);
+                    if let Some(job) = &thumb_job {
+                        match job.try_recv() {
+                            Ok(pic) => {
+                                thumb = pic;
+                                thumb_job = None;
+                                if card_until.is_some()
+                                    && let Some(pic) = &thumb
+                                {
+                                    let (p, w, h) = &pic.0;
+                                    card(&mut conn, &["thumb", p, &w.to_string(), &h.to_string()]);
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                thumb_job = None;
+                            }
+                            Err(_) => {}
                         }
                     }
-                    let msgs = conn.messages(Duration::from_millis(400));
+                    let paused = observed && conn.observed_bool("pause").unwrap_or(false);
+                    let poll_pos = !segments.is_empty() && !paused;
+                    let wait = if card_until.is_some()
+                        || next_pending
+                        || segments_pending
+                        || thumb_job.is_some()
+                    {
+                        Duration::from_millis(250)
+                    } else if poll_pos || !observed {
+                        Duration::from_millis(400)
+                    } else {
+                        Duration::from_millis(1000)
+                    };
+                    let msgs = conn.messages(wait);
                     if conn.closed() || player.exited() {
                         if !live {
                             ended.positions.push((cur.id.clone(), last.0, last.1));
                         }
                         break 'videos;
                     }
-                    let pos = conn.get_f64("time-pos");
-                    let dur = conn.get_f64("duration").filter(|d| *d > 0.0);
-                    if pos.is_some() && !live_asked {
-                        live_asked = true;
-                        live =
-                            conn.get_str("metadata/by-key/ytdl_is_live").as_deref() == Some("true");
+                    let dur = if observed {
+                        conn.observed_f64("duration").filter(|d| *d > 0.0)
+                    } else {
+                        conn.get_f64("duration").filter(|d| *d > 0.0)
+                    };
+                    if !live {
+                        if observed {
+                            live =
+                                conn.observed_str("metadata/by-key/ytdl_is_live") == Some("true");
+                        } else if !live_asked {
+                            live_asked = true;
+                            live = conn.get_str("metadata/by-key/ytdl_is_live").as_deref()
+                                == Some("true");
+                        }
                     }
-                    if let Some(p) = pos {
-                        last = (p, dur);
-                    }
-                    // SponsorBlock: jump over the segment once.
-                    if let Some(p) = pos {
-                        let looping = s.autoplay == crate::prefs::Autoplay::Loop;
-                        skipped_to_end |=
-                            skip_segment(&mut conn, &segments, &mut skipped, p, dur, looping);
+                    // Poll time-pos only while SponsorBlock has segments to
+                    // skip during active playback (or if property observation
+                    // is unavailable); cattube-osd.lua owns disk checkpoints.
+                    if poll_pos || !observed {
+                        if let Some(p) = conn.get_f64("time-pos") {
+                            last = (p, dur);
+                            if !segments.is_empty() {
+                                let looping = s.autoplay == crate::prefs::Autoplay::Loop;
+                                skipped_to_end |= skip_segment(
+                                    &mut conn,
+                                    &segments,
+                                    &mut skipped,
+                                    p,
+                                    dur,
+                                    looping,
+                                );
+                            }
+                        }
+                    } else if dur.is_some() {
+                        last.1 = dur;
                     }
                     let want = |name: &str| {
                         msgs.iter()
@@ -1542,6 +1621,10 @@ pub fn spawn_watcher(
                     }
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
+                        if let Some(p) = conn.get_f64("time-pos") {
+                            last = (p, dur);
+                        }
+                        conn.clear_observed("eof-reached");
                         change_quality(&mut conn, &s, &cur, h, last.0);
                     }
                     // A new request supersedes prior work, including replies from
@@ -1558,7 +1641,11 @@ pub fn spawn_watcher(
                         _ => None,
                     }
                     .or(picked);
-                    let eof = conn.get_bool("eof-reached").unwrap_or(false) || skipped_to_end;
+                    let eof = if observed {
+                        conn.observed_bool("eof-reached").unwrap_or(false)
+                    } else {
+                        conn.get_bool("eof-reached").unwrap_or(false)
+                    } || skipped_to_end;
                     // The end: "Up next" counts down five seconds.
                     if eof && !quit_sent && !next_pending && card_until.is_none() && jump.is_none()
                     {
@@ -1599,6 +1686,9 @@ pub fn spawn_watcher(
                     if let Some(n) = go_next {
                         card(&mut conn, &["hide"]);
                         if !live {
+                            if let Some(p) = conn.get_f64("time-pos") {
+                                last = (p, dur);
+                            }
                             ended.positions.push((cur.id.clone(), last.0, last.1));
                         }
                         let backwards = want("cattube-episode").as_deref() == Some("prev");
@@ -1610,6 +1700,9 @@ pub fn spawn_watcher(
                         }
                         let title = safe_media_title(&n.title);
                         let opts = format!("force-media-title={}", mpv::option_value(&title));
+                        conn.clear_observed("eof-reached");
+                        conn.clear_observed("duration");
+                        conn.clear_observed("metadata/by-key/ytdl_is_live");
                         loadfile_replace(&mut conn, &n.watch_url(), &opts);
                         // The end left it paused on the last frame (for the card).
                         let _ = conn.command(&[

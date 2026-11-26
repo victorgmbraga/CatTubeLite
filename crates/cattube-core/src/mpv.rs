@@ -8,6 +8,7 @@
 //! URL check for anything handed to mpv.
 
 use crate::error::{Error, Result};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -394,12 +395,14 @@ pub fn quit_and_wait(socket: &Path, grace: Duration) -> bool {
 
 /// A long-lived IPC connection: commands get their replies, and the
 /// `script-message`s scripts send (mpv delivers them to IPC clients as
-/// `client-message` events) are kept for [`IpcConn::messages`]. CatTube's
-/// player loop uses it to hear the "Next episode" card's buttons.
+/// `client-message` events) as well as observed `property-change` events are
+/// kept without polling.
 pub struct IpcConn {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     messages: Vec<Vec<String>>,
+    properties: HashMap<String, Json>,
+    woke: bool,
     pending: Vec<u8>,
     discarding: bool,
     eof: bool,
@@ -419,6 +422,8 @@ impl IpcConn {
             reader: BufReader::new(stream),
             writer,
             messages: Vec::new(),
+            properties: HashMap::new(),
+            woke: false,
             pending: Vec::new(),
             discarding: false,
             eof: false,
@@ -485,16 +490,55 @@ impl IpcConn {
     }
 
     fn keep_event(&mut self, line: &str) {
-        if let Some(v) = parse_json(line.trim())
-            && v.get("event").and_then(Json::as_str) == Some("client-message")
-            && let Some(args) = v.get("args").and_then(Json::as_arr)
-        {
-            self.messages.push(
-                args.iter()
-                    .filter_map(|a| a.as_str().map(str::to_string))
-                    .collect(),
-            );
+        let Some(v) = parse_json(line.trim()) else {
+            return;
+        };
+        match v.get("event").and_then(Json::as_str) {
+            Some("client-message") => {
+                if let Some(args) = v.get("args").and_then(Json::as_arr) {
+                    self.messages.push(
+                        args.iter()
+                            .filter_map(|a| a.as_str().map(str::to_string))
+                            .collect(),
+                    );
+                }
+            }
+            Some("property-change") => {
+                if let Some(name) = v.get("name").and_then(Json::as_str) {
+                    let data = v.get("data").cloned().unwrap_or(Json::Null);
+                    if self.properties.get(name) != Some(&data) {
+                        self.properties.insert(name.to_string(), data);
+                        self.woke = true;
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// Subscribe to mpv `property-change` events for `name`.
+    pub fn observe_property(&mut self, id: u64, name: &str) -> Result<Json> {
+        self.command(&[
+            Arg::Str("observe_property"),
+            Arg::Num(id as f64),
+            Arg::Str(name),
+        ])
+    }
+
+    pub fn observed_f64(&self, name: &str) -> Option<f64> {
+        self.properties.get(name)?.as_f64()
+    }
+
+    pub fn observed_bool(&self, name: &str) -> Option<bool> {
+        self.properties.get(name)?.as_bool()
+    }
+
+    pub fn observed_str(&self, name: &str) -> Option<&str> {
+        self.properties.get(name)?.as_str()
+    }
+
+    pub fn clear_observed(&mut self, name: &str) {
+        self.properties.remove(name);
     }
 
     /// Send a command and wait (≤ [`IPC_TIMEOUT`]) for its reply.
@@ -532,11 +576,12 @@ impl IpcConn {
         Err(Error::msg("player did not answer"))
     }
 
-    /// Wait while idle, then return an input burst without delaying its action.
+    /// Wait while idle, then return an input burst without delaying its action
+    /// (also wakes promptly when an observed property changes).
     pub fn messages(&mut self, wait: Duration) -> Vec<Vec<String>> {
         let burst = Duration::from_millis(1);
         let mut deadline = Instant::now()
-            + if self.messages.is_empty() {
+            + if self.messages.is_empty() && !self.woke {
                 wait
             } else {
                 wait.min(burst)
@@ -550,7 +595,7 @@ impl IpcConn {
                 Some(line) => {
                     if parse_reply(&line).is_none() {
                         self.keep_event(&line);
-                        if !self.messages.is_empty() {
+                        if !self.messages.is_empty() || self.woke {
                             deadline = deadline.min(Instant::now() + burst);
                         }
                     }
@@ -558,6 +603,7 @@ impl IpcConn {
                 None => break,
             }
         }
+        self.woke = false;
         std::mem::take(&mut self.messages)
     }
 
@@ -889,5 +935,58 @@ mod tests {
         );
         assert!(conn.closed());
         assert!(at.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn ipc_conn_tracks_observed_properties_and_wakes_on_change() {
+        let (a, mut peer) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(peer.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req = parse_json(line.trim()).unwrap();
+            let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+            assert_eq!(
+                req.get("command").unwrap(),
+                &Json::Arr(vec![
+                    Json::Str("observe_property".into()),
+                    Json::Num(1.0),
+                    Json::Str("eof-reached".into()),
+                ])
+            );
+            writeln!(
+                peer,
+                r#"{{"event":"property-change","id":1,"name":"duration","data":321.5}}"#
+            )
+            .unwrap();
+            writeln!(peer, r#"{{"error":"success","request_id":{id}}}"#).unwrap();
+            writeln!(
+                peer,
+                r#"{{"event":"property-change","id":1,"name":"eof-reached","data":true}}"#
+            )
+            .unwrap();
+            writeln!(
+                peer,
+                r#"{{"event":"property-change","id":4,"name":"metadata/by-key/ytdl_is_live","data":"true"}}"#
+            )
+            .unwrap();
+            line.clear();
+            let _ = reader.read_line(&mut line);
+        });
+        let mut conn = IpcConn::from_stream(a).unwrap();
+        conn.observe_property(1, "eof-reached").unwrap();
+        assert_eq!(conn.observed_f64("duration"), Some(321.5));
+        let at = Instant::now();
+        assert!(conn.messages(Duration::from_secs(1)).is_empty());
+        assert!(at.elapsed() < Duration::from_millis(200));
+        assert_eq!(conn.observed_bool("eof-reached"), Some(true));
+        assert_eq!(
+            conn.observed_str("metadata/by-key/ytdl_is_live"),
+            Some("true")
+        );
+        conn.clear_observed("eof-reached");
+        assert_eq!(conn.observed_bool("eof-reached"), None);
+        drop(conn);
+        server.join().unwrap();
     }
 }
