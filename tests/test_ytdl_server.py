@@ -20,6 +20,7 @@ import unittest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER_PATH = os.path.join(REPO_ROOT, "assets", "ytdl-server.py")
 JSC_PATH = os.path.join(REPO_ROOT, "assets", "ytdl-jsc.js")
+QJS_PATH = os.path.join(REPO_ROOT, "assets", "ytdl-jsc-qjs.js")
 
 
 def load_server_module():
@@ -458,6 +459,186 @@ class YtdlServerTests(unittest.TestCase):
                 if proc.poll() is None:
                     proc.kill()
                     proc.wait(timeout=2)
+
+    def test_start_jsc_qjs_cache_probe_and_fork_guard(self):
+        mod = load_server_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            saved_mods = {}
+            fake_names = [
+                "yt_dlp_ejs",
+                "yt_dlp_ejs.yt",
+                "yt_dlp_ejs.yt.solver",
+                "yt_dlp",
+                "yt_dlp.extractor",
+                "yt_dlp.extractor.youtube",
+                "yt_dlp.extractor.youtube.jsc",
+                "yt_dlp.extractor.youtube.jsc._builtin",
+                "yt_dlp.extractor.youtube.jsc._builtin.ejs",
+                "yt_dlp.extractor.youtube.jsc._builtin.quickjs",
+            ]
+            for name in fake_names:
+                saved_mods[name] = sys.modules.get(name)
+
+            orig_construct_calls = []
+            orig_run_calls = []
+            orig_getpid = mod.os.getpid
+
+            try:
+                ejs_pkg = types.ModuleType("yt_dlp_ejs")
+                ejs_yt = types.ModuleType("yt_dlp_ejs.yt")
+                ejs_solver = types.ModuleType("yt_dlp_ejs.yt.solver")
+                ejs_solver.lib = lambda: "const lib = { marker: true };"
+                ejs_solver.core = lambda: "function jsc(i) { return { type: 'result', preprocessed_player: 'p', responses: [] }; }"
+
+                class FakeQuickJSJCP:
+                    logger = types.SimpleNamespace(debug=lambda *_a: None)
+
+                    def _construct_stdin(self, player, preprocessed, requests, /):
+                        orig_construct_calls.append(player)
+                        return f"QJS_REAL:{player}"
+
+                    def _run_js_runtime(self, stdin, /):
+                        orig_run_calls.append(stdin)
+                        return "FALLBACK"
+
+                qjs_mod = types.ModuleType("yt_dlp.extractor.youtube.jsc._builtin.quickjs")
+                qjs_mod.QuickJSJCP = FakeQuickJSJCP
+
+                sys.modules["yt_dlp_ejs"] = ejs_pkg
+                sys.modules["yt_dlp_ejs.yt"] = ejs_yt
+                sys.modules["yt_dlp_ejs.yt.solver"] = ejs_solver
+                sys.modules["yt_dlp"] = types.ModuleType("yt_dlp")
+                sys.modules["yt_dlp.extractor"] = types.ModuleType("yt_dlp.extractor")
+                sys.modules["yt_dlp.extractor.youtube"] = types.ModuleType("yt_dlp.extractor.youtube")
+                sys.modules["yt_dlp.extractor.youtube.jsc"] = types.ModuleType("yt_dlp.extractor.youtube.jsc")
+                sys.modules["yt_dlp.extractor.youtube.jsc._builtin"] = types.ModuleType("yt_dlp.extractor.youtube.jsc._builtin")
+                sys.modules["yt_dlp.extractor.youtube.jsc._builtin.quickjs"] = qjs_mod
+
+                log_path = os.path.join(tmp, "qjs_reqs.jsonl")
+                fake_qjs = os.path.join(tmp, "fake-qjs")
+                with open(fake_qjs, "w", encoding="utf-8") as f:
+                    f.write(
+                        "#!/usr/bin/env python3\n"
+                        "import json, sys\n"
+                        f"log_path = {log_path!r}\n"
+                        "cache = set()\n"
+                        "for line in sys.stdin:\n"
+                        "    req = json.loads(line)\n"
+                        "    with open(log_path, 'a', encoding='utf-8') as lf:\n"
+                        "        lf.write(json.dumps(req) + '\\n')\n"
+                        "    if req['type'] == 'cached':\n"
+                        "        if req['key'] in cache:\n"
+                        "            resp = {'type': 'result', 'responses': [{'type': 'result', 'data': {'abc': 'qjs-ok'}}]}\n"
+                        "        else:\n"
+                        "            resp = {'type': 'miss'}\n"
+                        "    else:\n"
+                        "        cache.add(req['key'])\n"
+                        "        resp = {'type': 'result', 'responses': [{'type': 'result', 'data': {'abc': 'qjs-ok'}}]}\n"
+                        "    sys.stdout.write(json.dumps(resp) + '\\n')\n"
+                        "    sys.stdout.flush()\n"
+                    )
+                os.chmod(fake_qjs, 0o755)
+
+                jsc_sock = os.path.join(tmp, "test-qjs.jsc")
+                proc = mod.start_jsc_qjs(fake_qjs, jsc_sock)
+                self.assertIsNotNone(proc)
+                try:
+                    self.assertEqual(stat.S_IMODE(os.stat(jsc_sock + ".js").st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE(os.stat(jsc_sock + ".lib.js").st_mode), 0o600)
+
+                    req_obj = types.SimpleNamespace(
+                        type=types.SimpleNamespace(value="n"),
+                        input=types.SimpleNamespace(player_url="player-q1", challenges=["abc"]),
+                    )
+                    jcp = FakeQuickJSJCP()
+
+                    # 1st call: miss -> sends preprocessed
+                    s1 = jcp._construct_stdin("PRE_4MB", True, [req_obj])
+                    r1 = json.loads(jcp._run_js_runtime(s1))
+                    self.assertEqual(r1["type"], "result")
+                    self.assertEqual(len(orig_construct_calls), 0)
+                    self.assertEqual(len(orig_run_calls), 0)
+
+                    # 2nd call: cache hit
+                    s2 = jcp._construct_stdin("PRE_4MB", True, [req_obj])
+                    r2 = json.loads(jcp._run_js_runtime(s2))
+                    self.assertEqual(r2["responses"][0]["data"]["abc"], "qjs-ok")
+
+                    with open(log_path, "r", encoding="utf-8") as f:
+                        seen = [json.loads(line)["type"] for line in f]
+                    self.assertEqual(seen, ["cached", "preprocessed", "cached"])
+
+                    # Simulated forked child PID bypasses resident pipe and falls back to orig_run
+                    real_pid = orig_getpid()
+                    mod.os.getpid = lambda: real_pid + 1
+                    s3 = jcp._construct_stdin("PRE_4MB", True, [req_obj])
+                    self.assertEqual(jcp._run_js_runtime(s3), "FALLBACK")
+                    self.assertEqual(orig_run_calls, ["QJS_REAL:PRE_4MB"])
+                finally:
+                    mod.os.getpid = orig_getpid
+                    for pipe in (proc.stdin, proc.stdout):
+                        if pipe:
+                            pipe.close()
+                    proc.terminate()
+                    proc.wait(timeout=2)
+            finally:
+                mod.os.getpid = orig_getpid
+                for name, prev in saved_mods.items():
+                    if prev is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = prev
+
+    @unittest.skipUnless(shutil.which("node"), "node required to exercise ytdl-jsc-qjs.js harness")
+    def test_ytdl_jsc_qjs_lazy_lib_load_and_cache_protocol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib_path = os.path.join(tmp, "lib.js")
+            with open(lib_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "globalThis.__qjsLibLoaded = (globalThis.__qjsLibLoaded || 0) + 1;\n"
+                    "function jsc(input) {\n"
+                    "  return {\n"
+                    "    type: 'result',\n"
+                    "    preprocessed_player: '_result.n = (x) => \"n:\" + x;',\n"
+                    "    responses: input.requests.map(r => ({ type: 'result', data: Object.fromEntries(r.challenges.map(c => [c, 'n:' + c])) }))\n"
+                    "  };\n"
+                    "}\n"
+                    "globalThis.__cattube_jsc = jsc;\n"
+                )
+            reqs = [
+                json.dumps({"type": "cached", "key": "k1", "requests": [{"type": "n", "challenges": ["a"]}]}),
+                json.dumps({"type": "preprocessed", "key": "k1", "preprocessed_player": "_result.n = (x) => 'p:' + x;", "requests": [{"type": "n", "challenges": ["a"]}]}),
+                json.dumps({"type": "cached", "key": "k1", "requests": [{"type": "n", "challenges": ["b"]}]}),
+                json.dumps({"type": "player", "key": "k2", "player": "raw", "requests": [{"type": "n", "challenges": ["c"]}]}),
+                json.dumps({"type": "cached", "key": "k2", "requests": [{"type": "n", "challenges": ["d"]}]}),
+            ]
+            harness = os.path.join(tmp, "harness-qjs.js")
+            with open(harness, "w", encoding="utf-8") as f:
+                f.write(
+                    "const fs = require('fs');\n"
+                    "const vm = require('vm');\n"
+                    "const assert = require('assert');\n"
+                    f"const queue = {json.dumps(reqs)};\n"
+                    "const outputs = [];\n"
+                    f"globalThis.scriptArgs = ['ytdl-jsc-qjs.js', {json.dumps(lib_path)}];\n"
+                    "globalThis.std = {\n"
+                    "  in: { getline: () => queue.length ? queue.shift() : null },\n"
+                    "  out: { puts: (s) => outputs.push(s), flush: () => {} },\n"
+                    "  loadFile: (p) => fs.readFileSync(p, 'utf8'),\n"
+                    "  evalScript: (code) => vm.runInThisContext(code),\n"
+                    "};\n"
+                    f"vm.runInThisContext(fs.readFileSync({json.dumps(QJS_PATH)}, 'utf8'));\n"
+                    "assert.strictEqual(outputs.length, 5);\n"
+                    "const parsed = outputs.map((s) => JSON.parse(s));\n"
+                    "assert.deepStrictEqual(parsed[0], { type: 'miss' });\n"
+                    "assert.deepStrictEqual(parsed[1], { type: 'result', responses: [{ type: 'result', data: { a: 'p:a' } }] });\n"
+                    "assert.deepStrictEqual(parsed[2], { type: 'result', responses: [{ type: 'result', data: { b: 'p:b' } }] });\n"
+                    "assert.strictEqual(globalThis.__qjsLibLoaded, 1);\n"
+                    "assert.deepStrictEqual(parsed[3].responses, [{ type: 'result', data: { c: 'n:c' } }]);\n"
+                    "assert.deepStrictEqual(parsed[4], { type: 'result', responses: [{ type: 'result', data: { d: 'n:d' } }] });\n"
+                    "assert.strictEqual(globalThis.__qjsLibLoaded, 1);\n"
+                )
+            subprocess.run([shutil.which("node"), harness], check=True)
 
 
 if __name__ == "__main__":

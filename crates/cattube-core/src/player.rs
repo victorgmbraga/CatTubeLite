@@ -110,10 +110,10 @@ pub fn ytdl_server_socket() -> PathBuf {
 }
 
 /// The command that keeps yt-dlp loaded between videos (`ytdl-server.py`):
-/// on a TV box starting yt-dlp, and the Deno that solves YouTube's
-/// JavaScript challenge, costs most of the wait for a video. `None` without
-/// the unpacked yt-dlp or the script. With Deno as `js`, it keeps one Deno
-/// with the player's functions ready too.
+/// on a TV box starting yt-dlp, and solving YouTube's JavaScript challenge,
+/// costs most of the wait for a video. `None` without the unpacked yt-dlp or
+/// the script. With Deno or QuickJS as `js`, it keeps one JS worker with the
+/// player's functions ready too.
 pub fn ytdl_server_argv(
     data: &Path,
     ui: &Path,
@@ -133,8 +133,8 @@ pub fn ytdl_server_argv(
         socket.display().to_string(),
         dir.display().to_string(),
     ];
-    if let Some(deno) = js.and_then(|j| j.strip_prefix("deno:")) {
-        v.push(deno.to_string());
+    if let Some(spec) = js.filter(|j| j.starts_with("deno:") || j.starts_with("quickjs:")) {
+        v.push(spec.to_string());
     }
     Some(v)
 }
@@ -286,12 +286,14 @@ fn sanitize_js_runtime(raw: &str) -> Option<String> {
 }
 
 /// The JavaScript runtime yt-dlp is given: `CATTUBE_JS_RUNTIME` if set, else
-/// system `deno`, CatTube's own `deno`, system `qjs`/`quickjs`, or `node`.
+/// on tight-memory devices system `qjs`/`quickjs` before `deno` (system or
+/// CatTube's own), or `node`; on roomier devices `deno` first.
 pub fn js_runtime(data: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> Option<String> {
-    js_runtime_with_env(
+    js_runtime_for(
         data,
         find,
         std::env::var("CATTUBE_JS_RUNTIME").ok().as_deref(),
+        crate::env::tight_memory(),
     )
 }
 
@@ -300,20 +302,47 @@ pub fn js_runtime_with_env(
     find: &dyn Fn(&str) -> Option<PathBuf>,
     env: Option<&str>,
 ) -> Option<String> {
+    js_runtime_for(data, find, env, false)
+}
+
+pub fn js_runtime_for(
+    data: &Path,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+    env: Option<&str>,
+    tight_memory: bool,
+) -> Option<String> {
     if let Some(forced) = env.and_then(sanitize_js_runtime) {
         return Some(forced);
     }
-    if let Some(p) = find("deno") {
-        return Some(format!("deno:{}", p.display()));
-    }
-    // Only marked executable once fully unpacked: a file left by an
-    // interrupted install is not a runtime, and gets replaced.
-    let own = own_deno_path(data);
-    if crate::process::find_executable(&own.display().to_string()).is_some() {
-        return Some(format!("deno:{}", own.display()));
-    }
-    if let Some(p) = find("qjs").or_else(|| find("quickjs")) {
-        return Some(format!("quickjs:{}", p.display()));
+    let quickjs = || {
+        find("qjs")
+            .or_else(|| find("quickjs"))
+            .map(|p| format!("quickjs:{}", p.display()))
+    };
+    let deno = || {
+        if let Some(p) = find("deno") {
+            return Some(format!("deno:{}", p.display()));
+        }
+        // Only marked executable once fully unpacked: a file left by an
+        // interrupted install is not a runtime, and gets replaced.
+        let own = own_deno_path(data);
+        crate::process::find_executable(&own.display().to_string())
+            .map(|_| format!("deno:{}", own.display()))
+    };
+    if tight_memory {
+        if let Some(q) = quickjs() {
+            return Some(q);
+        }
+        if let Some(d) = deno() {
+            return Some(d);
+        }
+    } else {
+        if let Some(d) = deno() {
+            return Some(d);
+        }
+        if let Some(q) = quickjs() {
+            return Some(q);
+        }
     }
     find("node").map(|p| format!("node:{}", p.display()))
 }
@@ -1391,6 +1420,23 @@ mod tests {
             js_runtime_with_env(Path::new("/nope"), &deno, None).as_deref(),
             Some("deno:/usr/bin/deno")
         );
+        let both = |n: &str| match n {
+            "deno" => Some(PathBuf::from("/usr/bin/deno")),
+            "qjs" => Some(PathBuf::from("/usr/bin/qjs")),
+            _ => None,
+        };
+        assert_eq!(
+            js_runtime_for(Path::new("/nope"), &both, None, false).as_deref(),
+            Some("deno:/usr/bin/deno")
+        );
+        assert_eq!(
+            js_runtime_for(Path::new("/nope"), &both, None, true).as_deref(),
+            Some("quickjs:/usr/bin/qjs")
+        );
+        assert_eq!(
+            js_runtime_for(Path::new("/nope"), &deno, None, true).as_deref(),
+            Some("deno:/usr/bin/deno")
+        );
         // Env override takes precedence when valid; malformed/unknown values are ignored.
         assert_eq!(
             js_runtime_with_env(Path::new("/nope"), &deno, Some("quickjs:/usr/bin/qjs")).as_deref(),
@@ -1483,11 +1529,13 @@ mod tests {
         std::fs::write(ytdl_server_script(&ui), "").unwrap();
         assert_eq!(ytdl_server_argv(&root, &ui, sock, None), None);
         std::fs::write(yt_dlp_dir(&root).join("__main__.py"), "").unwrap();
-        let v = ytdl_server_argv(&root, &ui, sock, Some("quickjs:/usr/bin/qjs")).unwrap();
+        let v = ytdl_server_argv(&root, &ui, sock, Some("node:/usr/bin/node")).unwrap();
         assert_eq!(v[3..5], ["serve".to_string(), "/run/y.sock".to_string()]);
-        assert_eq!(v.len(), 6, "only Deno is kept running: {v:?}");
+        assert_eq!(v.len(), 6, "only Deno and QuickJS are kept running: {v:?}");
+        let v = ytdl_server_argv(&root, &ui, sock, Some("quickjs:/usr/bin/qjs")).unwrap();
+        assert_eq!(v.last().map(String::as_str), Some("quickjs:/usr/bin/qjs"));
         let v = ytdl_server_argv(&root, &ui, sock, Some("deno:/d/deno")).unwrap();
-        assert_eq!(v.last().map(String::as_str), Some("/d/deno"));
+        assert_eq!(v.last().map(String::as_str), Some("deno:/d/deno"));
         let _ = std::fs::remove_dir_all(root);
     }
 

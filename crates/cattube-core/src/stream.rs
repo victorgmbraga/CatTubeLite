@@ -227,6 +227,338 @@ pub fn parse_resolved_stream(json_text: &str) -> Option<ResolvedStream> {
     })
 }
 
+fn sub_lang_bases(sub_langs: &str) -> Vec<String> {
+    sub_langs
+        .split(',')
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty() && {
+                let mut parts = s.splitn(2, '-');
+                let base = parts.next().unwrap_or("");
+                let rest = parts.next();
+                (2..=3).contains(&base.len())
+                    && base.bytes().all(|b| b.is_ascii_alphabetic())
+                    && rest.is_none_or(|r| {
+                        !r.is_empty() && r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                    })
+            }
+        })
+        .filter_map(|s| s.split('-').next().map(|b| b.to_ascii_lowercase()))
+        .collect()
+}
+
+fn sub_lang_matches(lang: &str, bases: &[String]) -> bool {
+    let low = lang.to_ascii_lowercase();
+    let base = low.split('-').next().unwrap_or("");
+    if !bases.iter().any(|b| b == base) {
+        return false;
+    }
+    if low == base || low == format!("{base}-orig") {
+        return true;
+    }
+    lang.get(base.len() + 1..)
+        .and_then(|s| s.bytes().next())
+        .is_some_and(|b| b.is_ascii_uppercase())
+}
+
+fn ensure_vtt_url(url: &str) -> String {
+    if url.contains("fmt=") {
+        return url.to_string();
+    }
+    if url.contains('?') {
+        format!("{url}&fmt=vtt")
+    } else {
+        format!("{url}?fmt=vtt")
+    }
+}
+
+fn parse_mime_codecs(mime: &str) -> (bool, bool, String, String) {
+    let lower = mime.to_ascii_lowercase();
+    let is_video = lower.starts_with("video/");
+    let is_audio = lower.starts_with("audio/");
+    let codecs = mime
+        .find("codecs=\"")
+        .and_then(|i| {
+            let rest = &mime[i + 8..];
+            rest.find('"').map(|end| &rest[..end])
+        })
+        .unwrap_or("");
+    let mut parts = codecs.split(',').map(str::trim);
+    if is_video {
+        let vcodec = parts.next().unwrap_or("").to_string();
+        let acodec = parts
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("none")
+            .to_string();
+        (true, false, vcodec, acodec)
+    } else if is_audio {
+        let acodec = parts.next().unwrap_or("").to_string();
+        (false, true, String::new(), acodec)
+    } else {
+        (false, false, String::new(), String::new())
+    }
+}
+
+fn is_hdr_format(f: &Json) -> bool {
+    let Some(tf) = f
+        .get("colorInfo")
+        .and_then(|c| c.get("transferCharacteristics"))
+        .and_then(Json::as_str)
+    else {
+        return false;
+    };
+    let upper = tf.to_ascii_uppercase();
+    upper.contains("SMPTEST2084")
+        || upper.contains("ARIB_STD_B67")
+        || upper.contains("PQ")
+        || upper.contains("HLG")
+}
+
+fn parse_timestamp_prefix(line: &str) -> Option<(f64, &str)> {
+    let s = line.trim_start();
+    let s = s
+        .strip_prefix('[')
+        .or_else(|| s.strip_prefix('('))
+        .unwrap_or(s);
+    let ts_end = s
+        .find(|c: char| !c.is_ascii_digit() && c != ':')
+        .unwrap_or(s.len());
+    let ts_str = s[..ts_end].trim_end_matches(':');
+    let rest = &s[ts_str.len()..];
+    let nums: Vec<u64> = ts_str
+        .split(':')
+        .map(|p| {
+            if p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(());
+            }
+            p.parse::<u64>().map_err(|_| ())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let secs = match nums.as_slice() {
+        [m, sec] if *sec < 60 => m.saturating_mul(60).saturating_add(*sec),
+        [h, m, sec] if *m < 60 && *sec < 60 => h
+            .saturating_mul(3600)
+            .saturating_add(m.saturating_mul(60))
+            .saturating_add(*sec),
+        _ => return None,
+    };
+    let rest = rest
+        .strip_prefix(']')
+        .or_else(|| rest.strip_prefix(')'))
+        .unwrap_or(rest)
+        .trim_start();
+    let rest = rest.trim_start_matches(['-', '–', '—', ':', '|']).trim();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((secs as f64, rest))
+}
+
+fn parse_description_chapters(desc: &str) -> Vec<Chapter> {
+    let mut chapters = Vec::new();
+    let mut prev_t = -1.0f64;
+    for line in desc.lines() {
+        let Some((t, title)) = parse_timestamp_prefix(line) else {
+            continue;
+        };
+        if t < prev_t {
+            return Vec::new();
+        }
+        prev_t = t;
+        chapters.push(Chapter {
+            start_time: t,
+            title: title.to_string(),
+        });
+    }
+    if chapters.len() >= 2 && chapters[0].start_time <= 5.0 {
+        chapters
+    } else {
+        Vec::new()
+    }
+}
+
+/// Parse an InnerTube `ANDROID_VR` `/player` response directly into a
+/// [`ResolvedStream`]. Returns `None` if the video is live, unavailable, uses
+/// `signatureCipher`/`cipher`, or lacks adaptive HD + audio streams.
+pub fn parse_innertube_player(
+    body: &str,
+    video_id: &str,
+    sub_langs: &str,
+) -> Option<ResolvedStream> {
+    if !is_video_id(video_id) {
+        return None;
+    }
+    let root = parse_json(body.trim())?;
+    let status = root
+        .get("playabilityStatus")
+        .and_then(|p| p.get("status"))
+        .and_then(Json::as_str)?;
+    if status != "OK" {
+        return None;
+    }
+    let vd = root.get("videoDetails");
+    if vd.and_then(|d| d.get("isLive")).and_then(Json::as_bool) == Some(true) {
+        return None;
+    }
+    let sd = root.get("streamingData")?;
+    let adaptive = sd.get("adaptiveFormats").and_then(Json::as_arr)?;
+    if adaptive.is_empty() {
+        return None;
+    }
+    let muxed = sd.get("formats").and_then(Json::as_arr).unwrap_or(&[]);
+
+    let mut videos = Vec::new();
+    let mut audios = Vec::new();
+    let mut adaptive_video_count = 0usize;
+
+    for (from_adaptive, list) in [(true, adaptive), (false, muxed)] {
+        for f in list {
+            if f.get("signatureCipher").is_some() || f.get("cipher").is_some() {
+                return None;
+            }
+            let url = json_str(f.get("url"));
+            if !is_playable_url(&url) {
+                continue;
+            }
+            let mime = json_str(f.get("mimeType"));
+            let (is_video, is_audio, vcodec, acodec) = parse_mime_codecs(&mime);
+            let bitrate_kbps =
+                json_f64(f.get("averageBitrate").or_else(|| f.get("bitrate"))) / 1000.0;
+            if is_video {
+                let height = json_u32(f.get("height"));
+                if height == 0 || vcodec.is_empty() {
+                    continue;
+                }
+                let final_acodec = if from_adaptive {
+                    "none".to_string()
+                } else if acodec == "none" && json_u32(f.get("audioChannels")) > 0 {
+                    "mp4a.40.2".to_string()
+                } else {
+                    acodec
+                };
+                if from_adaptive {
+                    adaptive_video_count += 1;
+                }
+                let format_id = f
+                    .get("itag")
+                    .and_then(Json::as_f64)
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| (n.round() as u64).to_string())
+                    .unwrap_or_default();
+                videos.push(VideoFormat {
+                    url,
+                    height,
+                    fps: json_f64(f.get("fps")),
+                    vcodec,
+                    acodec: final_acodec,
+                    hdr: is_hdr_format(f),
+                    protocol: "https".to_string(),
+                    tbr: bitrate_kbps,
+                    format_id,
+                    available_at: None,
+                });
+            } else if is_audio && from_adaptive && !acodec.is_empty() {
+                let track = f.get("audioTrack");
+                let track_id = track
+                    .and_then(|t| t.get("id"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                let language = track_id.split('.').next().unwrap_or("").to_string();
+                let title = track
+                    .and_then(|t| t.get("displayName"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let is_default = track
+                    .and_then(|t| t.get("audioIsDefault"))
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false);
+                audios.push(AudioFormat {
+                    url,
+                    acodec,
+                    abr: bitrate_kbps,
+                    language,
+                    title,
+                    is_default,
+                    protocol: "https".to_string(),
+                    available_at: None,
+                });
+            }
+        }
+    }
+
+    if adaptive_video_count == 0 || audios.is_empty() {
+        return None;
+    }
+
+    let bases = sub_lang_bases(sub_langs);
+    let mut subtitles = Vec::new();
+    if !bases.is_empty()
+        && let Some(tracks) = root
+            .get("captions")
+            .and_then(|c| c.get("playerCaptionsTracklistRenderer"))
+            .and_then(|r| r.get("captionTracks"))
+            .and_then(Json::as_arr)
+    {
+        for t in tracks {
+            let lang = json_str(t.get("languageCode"));
+            let base_url = json_str(t.get("baseUrl"));
+            if lang.is_empty()
+                || !sub_lang_matches(&lang, &bases)
+                || !is_playable_url(&base_url)
+                || base_url.contains("tlang=")
+            {
+                continue;
+            }
+            let name = {
+                let n = crate::youtube::text(t.get("name"));
+                if n.is_empty() { lang.clone() } else { n }
+            };
+            let auto = t.get("kind").and_then(Json::as_str) == Some("asr");
+            subtitles.push(SubtitleTrack {
+                lang,
+                name,
+                url: ensure_vtt_url(&base_url),
+                auto,
+            });
+        }
+    }
+
+    let title = vd
+        .and_then(|d| d.get("title"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    let duration = vd
+        .and_then(|d| d.get("lengthSeconds"))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
+        })
+        .filter(|d| d.is_finite() && *d > 0.0);
+    let chapters = vd
+        .and_then(|d| d.get("shortDescription"))
+        .and_then(Json::as_str)
+        .map(parse_description_chapters)
+        .unwrap_or_default();
+
+    Some(ResolvedStream {
+        video_id: video_id.to_string(),
+        title,
+        is_live: false,
+        duration,
+        user_agent: crate::youtube::ANDROID_VR_USER_AGENT.to_string(),
+        headers: Vec::new(),
+        videos,
+        audios,
+        subtitles,
+        chapters,
+        source: StreamSource::Innertube,
+    })
+}
+
 fn codec_matches(vcodec: &str, codec: Codec) -> bool {
     match codec {
         Codec::Av1 => vcodec.starts_with("av01"),
@@ -960,5 +1292,104 @@ mod tests {
 
         let live_opts = loadfile_options(42.5, true, "", "", None, &[]);
         assert_eq!(live_opts, "ytdl=no");
+    }
+
+    #[test]
+    fn parse_innertube_player_extracts_adaptive_vod_and_rejects_bad_states() {
+        let valid = r#"{
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {
+                "videoId": "WhWc3b3KhnY",
+                "title": "VR Video",
+                "lengthSeconds": "320",
+                "isLive": false,
+                "shortDescription": "Welcome!\n0:00 Intro\n1:30 - Middle Part\n2:45:Outro"
+            },
+            "streamingData": {
+                "adaptiveFormats": [
+                    {
+                        "itag": 137,
+                        "url": "https://cdn.example/1080.mp4",
+                        "mimeType": "video/mp4; codecs=\"avc1.640028\"",
+                        "bitrate": 3200000,
+                        "width": 1920,
+                        "height": 1080,
+                        "fps": 30
+                    },
+                    {
+                        "itag": 335,
+                        "url": "https://cdn.example/1080_hdr.webm",
+                        "mimeType": "video/webm; codecs=\"vp09.02.41.10\"",
+                        "bitrate": 4100000,
+                        "height": 1080,
+                        "fps": 60,
+                        "colorInfo": {"transferCharacteristics": "TRANSFER_CHARACTERISTICS_SMPTEST2084"}
+                    },
+                    {
+                        "itag": 251,
+                        "url": "https://cdn.example/audio.webm",
+                        "mimeType": "audio/webm; codecs=\"opus\"",
+                        "bitrate": 128000,
+                        "audioTrack": {"id": "en.4", "displayName": "English", "audioIsDefault": true}
+                    }
+                ],
+                "formats": [
+                    {
+                        "itag": 18,
+                        "url": "https://cdn.example/18.mp4",
+                        "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                        "bitrate": 500000,
+                        "height": 360,
+                        "fps": 30
+                    }
+                ]
+            },
+            "captions": {
+                "playerCaptionsTracklistRenderer": {
+                    "captionTracks": [
+                        {"baseUrl": "https://www.youtube.com/api/timedtext?lang=en", "name": {"simpleText": "English"}, "languageCode": "en"},
+                        {"baseUrl": "https://www.youtube.com/api/timedtext?lang=en&tlang=pt", "name": {"simpleText": "Bad"}, "languageCode": "pt"},
+                        {"baseUrl": "https://www.youtube.com/api/timedtext?lang=fr", "name": {"simpleText": "French"}, "languageCode": "fr"}
+                    ]
+                }
+            }
+        }"#;
+        let parsed = parse_innertube_player(valid, "WhWc3b3KhnY", "en").unwrap();
+        assert_eq!(parsed.source, StreamSource::Innertube);
+        assert_eq!(parsed.title, "VR Video");
+        assert_eq!(parsed.duration, Some(320.0));
+        assert_eq!(parsed.user_agent, crate::youtube::ANDROID_VR_USER_AGENT);
+        assert_eq!(parsed.videos.len(), 3);
+        assert!(parsed.videos[1].hdr);
+        assert_eq!(parsed.audios.len(), 1);
+        assert!(parsed.audios[0].is_default);
+        assert_eq!(parsed.audios[0].language, "en");
+        assert_eq!(parsed.subtitles.len(), 1);
+        assert!(parsed.subtitles[0].url.ends_with("&fmt=vtt"));
+        assert_eq!(parsed.chapters.len(), 3);
+        assert_eq!(parsed.chapters[1].start_time, 90.0);
+        assert_eq!(parsed.chapters[1].title, "Middle Part");
+
+        let login_req = valid.replace(r#""status": "OK""#, r#""status": "LOGIN_REQUIRED""#);
+        assert!(parse_innertube_player(&login_req, "WhWc3b3KhnY", "en").is_none());
+
+        let ciphered = valid.replace(
+            r#""url": "https://cdn.example/1080.mp4""#,
+            r#""signatureCipher": "s=abc""#,
+        );
+        assert!(parse_innertube_player(&ciphered, "WhWc3b3KhnY", "en").is_none());
+
+        let live = valid.replace(r#""isLive": false"#, r#""isLive": true"#);
+        assert!(parse_innertube_player(&live, "WhWc3b3KhnY", "en").is_none());
+
+        let only_360 = r#"{
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"videoId": "WhWc3b3KhnY", "isLive": false},
+            "streamingData": {
+                "adaptiveFormats": [],
+                "formats": [{"itag": 18, "url": "https://cdn.example/18.mp4", "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"", "height": 360}]
+            }
+        }"#;
+        assert!(parse_innertube_player(only_360, "WhWc3b3KhnY", "").is_none());
     }
 }

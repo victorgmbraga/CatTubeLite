@@ -221,6 +221,114 @@ def start_jsc(deno, sock_path):
     return proc
 
 
+def _parse_js_spec(js_spec):
+    if not js_spec:
+        return None, None
+    if js_spec.startswith("deno:"):
+        return "deno", js_spec[5:]
+    if js_spec.startswith("quickjs:"):
+        return "quickjs", js_spec[8:]
+    return "deno", js_spec
+
+
+def start_jsc_qjs(qjs, sock_path):
+    """A QuickJS that stays running with yt-dlp's challenge solver loaded
+    (ytdl-jsc-qjs.js), and yt-dlp's QuickJS provider sending work from the
+    resident process. Forked legacy workers fall back to running qjs."""
+    try:
+        import yt_dlp_ejs.yt.solver as ejs_solver
+        from yt_dlp.extractor.youtube.jsc._builtin import quickjs as qjs_jcp
+    except ImportError:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "ytdl-jsc-qjs.js"), encoding="utf-8") as f:
+        daemon = f.read()
+    lib_path = sock_path + ".lib.js"
+    script = sock_path + ".js"
+    _write_private_file(
+        lib_path,
+        f"{ejs_solver.lib()}\nObject.assign(globalThis, lib);\n{ejs_solver.core()}\nglobalThis.__cattube_jsc = jsc;\n",
+    )
+    _write_private_file(script, daemon)
+    import subprocess
+    import threading
+
+    proc = subprocess.Popen(
+        [qjs, "--std", script, lib_path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    server_pid = os.getpid()
+    lock = threading.Lock()
+    orig_construct = qjs_jcp.QuickJSJCP._construct_stdin
+    orig_run = qjs_jcp.QuickJSJCP._run_js_runtime
+
+    def construct(self, player, preprocessed, requests, /):
+        out = _Stdin(" ")
+        reqs = [{"type": r.type.value, "challenges": r.input.challenges} for r in requests]
+        key = requests[0].input.player_url if requests else ""
+        out.data = (self, player, preprocessed, requests, key, reqs)
+        return out
+
+    def _qjs_exchange(payload):
+        line = (json.dumps(payload) + "\n").encode()
+        proc.stdin.write(line)
+        proc.stdin.flush()
+        ready, _, _ = select.select([proc.stdout], [], [], 60.0)
+        if not ready:
+            raise TimeoutError("resident quickjs timed out")
+        raw = proc.stdout.readline()
+        if not raw:
+            raise EOFError("resident quickjs closed")
+        text = raw.decode()
+        return text, json.loads(text)
+
+    def run_js(self, stdin, /):
+        lazy = getattr(stdin, "data", None)
+        if lazy is None:
+            return orig_run(self, stdin)
+        owner, player, preprocessed, requests, key, reqs = lazy
+        if os.getpid() == server_pid and proc.poll() is None:
+            try:
+                with lock:
+                    if key:
+                        text, parsed = _qjs_exchange(
+                            {"type": "cached", "key": key, "requests": reqs}
+                        )
+                        if parsed.get("type") == "result":
+                            return text
+                        if parsed.get("type") != "miss":
+                            raise OSError(text[:300])
+                    payload = (
+                        {
+                            "key": key,
+                            "type": "preprocessed",
+                            "preprocessed_player": player,
+                            "requests": reqs,
+                        }
+                        if preprocessed
+                        else {
+                            "key": key,
+                            "type": "player",
+                            "player": player,
+                            "requests": reqs,
+                            "output_preprocessed": True,
+                        }
+                    )
+                    text, parsed = _qjs_exchange(payload)
+                    if parsed.get("type") == "result":
+                        return text
+                    raise OSError(text[:300])
+            except (OSError, ValueError, EOFError, TimeoutError) as e:
+                self.logger.debug(f"resident quickjs failed ({e}); running qjs")
+        real_stdin = orig_construct(owner, player, preprocessed, requests)
+        return orig_run(self, real_stdin)
+
+    qjs_jcp.QuickJSJCP._construct_stdin = construct
+    qjs_jcp.QuickJSJCP._run_js_runtime = run_js
+    return proc
+
+
 def _reap_children(child_pids):
     for pid in list(child_pids):
         try:
@@ -231,7 +339,7 @@ def _reap_children(child_pids):
             child_pids.discard(pid)
 
 
-def serve(sock_path, ytdlp_dir, deno=None):
+def serve(sock_path, ytdlp_dir, js_spec=None):
     sys.path.insert(0, ytdlp_dir)
     import yt_dlp  # noqa: F401  (the slow part, done once)
     import yt_dlp.extractor.youtube  # noqa: F401
@@ -242,12 +350,16 @@ def serve(sock_path, ytdlp_dir, deno=None):
         ejs.EJSBaseJCP._ENABLE_PREPROCESSED_PLAYER_CACHE = True
     except (ImportError, AttributeError):
         pass  # another yt-dlp: still faster without the cache
+    js_kind, js_path = _parse_js_spec(js_spec)
     jsc_proc = None
-    if deno:
+    if js_path:
         try:
-            jsc_proc = start_jsc(deno, sock_path + ".jsc")
+            if js_kind == "quickjs":
+                jsc_proc = start_jsc_qjs(js_path, sock_path + ".jsc")
+            else:
+                jsc_proc = start_jsc(js_path, sock_path + ".jsc")
         except Exception as e:  # noqa: BLE001
-            print(f"ytdl-server: no resident deno: {e!r}", file=sys.stderr)
+            print(f"ytdl-server: no resident {js_kind}: {e!r}", file=sys.stderr)
     try:
         from yt_dlp.cache import Cache
 
@@ -264,7 +376,7 @@ def serve(sock_path, ytdlp_dir, deno=None):
     parent = os.getppid()
     resolver_state = {
         "yt_dlp": yt_dlp,
-        "js_runtimes": {"deno": {"path": deno}} if deno else {},
+        "js_runtimes": {js_kind: {"path": js_path}} if (js_kind and js_path) else {},
         "ydl": {},
         "cache": OrderedDict(),
     }
@@ -325,11 +437,12 @@ def serve(sock_path, ytdlp_dir, deno=None):
             pid = os.fork()
             if pid == 0:
                 srv.close()
-                if jsc_proc and jsc_proc.stdin:
-                    try:
-                        jsc_proc.stdin.close()
-                    except OSError:
-                        pass
+                for pipe in (jsc_proc.stdin if jsc_proc else None, jsc_proc.stdout if jsc_proc else None):
+                    if pipe:
+                        try:
+                            pipe.close()
+                        except OSError:
+                            pass
                 if watch_stdin:
                     try:
                         devnull = os.open(os.devnull, os.O_RDONLY)
@@ -349,11 +462,12 @@ def serve(sock_path, ytdlp_dir, deno=None):
     finally:
         _reap_children(child_pids)
         if jsc_proc:
-            try:
-                if jsc_proc.stdin:
-                    jsc_proc.stdin.close()
-            except OSError:
-                pass
+            for pipe in (jsc_proc.stdin, jsc_proc.stdout):
+                if pipe:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
             try:
                 jsc_proc.terminate()
                 jsc_proc.wait(timeout=1)

@@ -25,6 +25,11 @@ pub const CLIENT_NUMBER: &str = "7";
 pub const CLIENT_VERSION: &str = "7.20260101.00.00";
 /// The TV app's user agent (Cobalt, YouTube's TV browser).
 pub const USER_AGENT: &str = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)";
+/// Direct `player` fast-path client (`ANDROID_VR`): returns plain adaptive/muxed URLs without `n`/sig JS challenges.
+pub const ANDROID_VR_CLIENT_NAME: &str = "ANDROID_VR";
+pub const ANDROID_VR_CLIENT_NUMBER: &str = "28";
+pub const ANDROID_VR_CLIENT_VERSION: &str = "1.71.26";
+pub const ANDROID_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 
 // ------------------------------------------------------------------- model
 
@@ -803,6 +808,18 @@ pub fn next_body(ctx: &str, video_id: &str) -> Option<String> {
     })
 }
 
+/// Request body for InnerTube `player` using the `ANDROID_VR` client.
+pub fn player_body_android_vr(video_id: &str, hl: &str, gl: &str) -> Option<String> {
+    is_video_id(video_id).then(|| {
+        format!(
+            "{{\"context\":{{\"client\":{{\"clientName\":\"{ANDROID_VR_CLIENT_NAME}\",\"clientVersion\":\"{ANDROID_VR_CLIENT_VERSION}\",\"deviceMake\":\"Oculus\",\"deviceModel\":\"Quest 3\",\"osName\":\"Android\",\"osVersion\":\"12L\",\"androidSdkVersion\":32,\"hl\":{},\"gl\":{}}}}},\"videoId\":{},\"contentCheckOk\":true,\"racyCheckOk\":true}}",
+            json_string(hl),
+            json_string(gl),
+            json_string(video_id)
+        )
+    })
+}
+
 /// Search suggestions while typing.
 pub fn suggest_url(query: &str) -> String {
     suggest_url_for(query, "en")
@@ -1122,6 +1139,12 @@ mod tests {
         assert_eq!(browse_body(&ctx, "a\"b"), None);
         assert!(search_body(&ctx, "  cats \"x\" ").contains(r#""query":"cats \"x\"""#));
         assert_eq!(next_body(&ctx, "short"), None);
+        assert_eq!(player_body_android_vr("bad", "en", "US"), None);
+        let vr = player_body_android_vr("WhWc3b3KhnY", "pt", "BR").unwrap();
+        assert!(vr.contains(r#""clientName":"ANDROID_VR""#));
+        assert!(vr.contains(r#""clientVersion":"1.71.26""#));
+        assert!(vr.contains(r#""hl":"pt","gl":"BR""#));
+        assert!(vr.contains(r#""videoId":"WhWc3b3KhnY""#));
     }
 
     #[test]
