@@ -111,7 +111,12 @@ pub fn ytdl_server_socket() -> PathBuf {
 /// JavaScript challenge, costs most of the wait for a video. `None` without
 /// the unpacked yt-dlp or the script. With Deno as `js`, it keeps one Deno
 /// with the player's functions ready too.
-pub fn ytdl_server_argv(data: &Path, ui: &Path, socket: &Path, js: Option<&str>) -> Option<Vec<String>> {
+pub fn ytdl_server_argv(
+    data: &Path,
+    ui: &Path,
+    socket: &Path,
+    js: Option<&str>,
+) -> Option<Vec<String>> {
     let script = ytdl_server_script(ui);
     let dir = yt_dlp_dir(data);
     if !script.is_file() || !dir.join("__main__.py").is_file() {

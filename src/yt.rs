@@ -387,7 +387,10 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
 /// Start (or restart, after yt-dlp changed) the yt-dlp that stays loaded
 /// between videos (see [`player::ytdl_server_argv`]). It ends by itself
 /// when CatTube does. `CATTUBE_YTDL_RESIDENT=0` turns it off.
-pub fn start_ytdl_server(data: &Path, old: Option<std::process::Child>) -> Option<std::process::Child> {
+pub fn start_ytdl_server(
+    data: &Path,
+    old: Option<std::process::Child>,
+) -> Option<std::process::Child> {
     if let Some(mut c) = old {
         let _ = c.kill();
         let _ = c.wait();
