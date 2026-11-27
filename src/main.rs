@@ -45,7 +45,7 @@ enum Msg {
     /// A background job with nothing to show.
     Quiet,
     Images(Vec<(String, Option<egui::ColorImage>)>),
-    Tools(Result<String, String>),
+    Tools(Result<yt::ToolsStatus, String>),
     /// A player ended: its number (see `App::player_seq`) and an optional
     /// user-facing error key when playback failed to start.
     PlaybackDone(u64, Option<String>),
@@ -125,7 +125,7 @@ struct App {
     tools: Scan<String>,
     yt_dlp_ready: bool,
     /// yt-dlp kept loaded between videos (`ytdl-server.py`).
-    ytdl_server: Option<std::process::Child>,
+    ytdl_server: Option<yt::YtdlServer>,
     /// Started with `--play`: close when the video ends.
     quit_after_play: bool,
     was_focused: bool,
@@ -148,7 +148,11 @@ impl App {
         ytc::use_small_pictures(low_power);
         theme::set_accent(&prefs.accent);
         i18n::set_language(prefs.language);
+        let quit_after_play = matches!(start, Start::Play(_, _));
         let yt_dlp_ready = player::yt_dlp_path(&data).is_file();
+        let ytdl_server = (!quit_after_play)
+            .then(|| yt::start_ytdl_server(&data, None))
+            .flatten();
         let ctx = Ctx {
             sponsorblock: prefs.sponsorblock,
             playing: false,
@@ -188,8 +192,8 @@ impl App {
             positions: HashMap::new(),
             tools: Scan::Busy,
             yt_dlp_ready,
-            ytdl_server: None,
-            quit_after_play: false,
+            ytdl_server,
+            quit_after_play,
             was_focused: true,
             search_generation: 0,
             search_query: String::new(),
@@ -765,12 +769,14 @@ impl App {
             Msg::Tools(r) => {
                 let ok = r.is_ok();
                 self.yt_dlp_ready = ok || player::yt_dlp_path(&self.data).is_file();
-                if ok {
-                    // after ensure_tools: the unpacked yt-dlp is current
-                    self.ytdl_server = yt::start_ytdl_server(&self.data, self.ytdl_server.take());
-                }
                 self.tools = match r {
-                    Ok(v) => Scan::Done(vec![v]),
+                    Ok(s) => {
+                        if !self.quit_after_play && (self.ytdl_server.is_none() || s.updated) {
+                            self.ytdl_server =
+                                yt::start_ytdl_server(&self.data, self.ytdl_server.take());
+                        }
+                        Scan::Done(vec![s.version])
+                    }
                     Err(e) => {
                         self.toast(ctx, &e);
                         Scan::Failed(e)
@@ -1171,9 +1177,8 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        if let Some(mut s) = self.ytdl_server.take() {
-            let _ = s.kill();
-            let _ = s.wait();
+        if let Some(s) = self.ytdl_server.take() {
+            s.stop();
         }
         if let Some(p) = self.player.take() {
             if !p.exited() {
@@ -1304,6 +1309,12 @@ watch positions in ~/.local/share/cattube/.";
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--ytdl-run") {
+        let (Some(socket), Some(ytdlp_dir)) = (args.get(1), args.get(2)) else {
+            std::process::exit(2);
+        };
+        yt::ytdl_run(std::path::Path::new(socket), ytdlp_dir, &args[3..]);
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("cattube {}", cattube_core::env::version());
         return Ok(());

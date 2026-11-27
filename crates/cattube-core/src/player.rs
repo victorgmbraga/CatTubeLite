@@ -77,9 +77,9 @@ pub fn yt_dlp_launcher(data: &Path) -> PathBuf {
     data.join("yt-dlp-unpacked")
 }
 
-/// The launcher's text: Python running the unpacked folder, or, while
-/// CatTube keeps yt-dlp loaded ([`ytdl_server_argv`]; mpv gets the two
-/// variables), a request to that copy.
+/// The launcher's text: asks the resident yt-dlp via `cattube --ytdl-run`
+/// (or `ytdl-server.py run` as fallback) while the socket is up, else runs
+/// the unpacked folder with Python.
 pub fn yt_dlp_launcher_script(data: &Path) -> String {
     let dir = yt_dlp_dir(data)
         .display()
@@ -87,13 +87,16 @@ pub fn yt_dlp_launcher_script(data: &Path) -> String {
         .replace('\'', "'\\''");
     format!(
         "#!/bin/sh\n# yt-dlp unpacked by CatTube, so Python keeps its compiled modules.\n\
+         if [ -n \"${YTDL_BIN_ENV}\" ] && [ -x \"${YTDL_BIN_ENV}\" ] && [ -n \"${YTDL_SOCKET_ENV}\" ] && [ -S \"${YTDL_SOCKET_ENV}\" ]; then\n  \
+         exec \"${YTDL_BIN_ENV}\" --ytdl-run \"${YTDL_SOCKET_ENV}\" '{dir}' \"$@\"\nfi\n\
          if [ -n \"${YTDL_SERVER_ENV}\" ] && [ -S \"${YTDL_SOCKET_ENV}\" ]; then\n  \
          exec python3 -I -S \"${YTDL_SERVER_ENV}\" run \"${YTDL_SOCKET_ENV}\" '{dir}' \"$@\"\nfi\n\
          exec python3 '{dir}' \"$@\"\n"
     )
 }
 
-/// Set for mpv while the resident yt-dlp runs: its script and socket.
+/// Set for mpv while the resident yt-dlp runs: CatTube binary, server script, and socket.
+pub const YTDL_BIN_ENV: &str = "CATTUBE_YTDL_BIN";
 pub const YTDL_SERVER_ENV: &str = "CATTUBE_YTDL_SERVER";
 pub const YTDL_SOCKET_ENV: &str = "CATTUBE_YTDL_SOCKET";
 
@@ -664,6 +667,7 @@ pub fn mpv_argv(
         ));
         raw.push("write-subs=".into());
         raw.push("write-auto-subs=".into());
+        raw.push("extractor-args=\"youtube:skip=translated_subs\"".into());
     }
     if !raw.is_empty() {
         v.push(format!("--ytdl-raw-options={}", raw.join(",")));
@@ -1264,7 +1268,7 @@ mod tests {
         assert!(v.contains(&"--speed=1".to_string()));
         assert!(v.contains(&"--force-media-title=Spring".to_string()));
         assert!(v.contains(&"--script-opts=ytdl_hook-ytdl_path=/d/yt-dlp,ytdl_hook-try_ytdl_first=yes,cattube_osd-accent=7c6cf0,cattube_osd-position_dir=/d/positions".to_string()));
-        assert!(v.contains(&"--ytdl-raw-options=js-runtimes=deno:/d/deno,sub-langs=\"en,en-(?-i:[A-Z]).*,en-orig\",write-subs=,write-auto-subs=".to_string()));
+        assert!(v.contains(&"--ytdl-raw-options=js-runtimes=deno:/d/deno,sub-langs=\"en,en-(?-i:[A-Z]).*,en-orig\",write-subs=,write-auto-subs=,extractor-args=\"youtube:skip=translated_subs\"".to_string()));
         assert!(v.contains(&"--sid=no".to_string()));
         assert!(v.contains(&"--demuxer-max-bytes=256MiB".to_string()));
         assert!(v.contains(&"--input-ipc-server=/run/s.sock".to_string()));
@@ -1392,6 +1396,10 @@ mod tests {
         let s = yt_dlp_launcher_script(Path::new("/home/o'neil/d"));
         assert!(
             s.ends_with("exec python3 '/home/o'\\''neil/d/yt-dlp.d' \"$@\"\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains("exec \"$CATTUBE_YTDL_BIN\" --ytdl-run \"$CATTUBE_YTDL_SOCKET\" '/home/o'\\''neil/d/yt-dlp.d' \"$@\""),
             "{s}"
         );
         assert!(

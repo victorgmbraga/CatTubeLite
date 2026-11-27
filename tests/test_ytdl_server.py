@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""Tests for assets/ytdl-server.py and assets/ytdl-jsc.js."""
+
+import array
+import importlib.util
+import json
+import os
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SERVER_PATH = os.path.join(REPO_ROOT, "assets", "ytdl-server.py")
+JSC_PATH = os.path.join(REPO_ROOT, "assets", "ytdl-jsc.js")
+
+
+def load_server_module():
+    spec = importlib.util.spec_from_file_location("ytdl_server", SERVER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def make_fake_ytdlp(root):
+    pkg = os.path.join(root, "yt_dlp")
+    ext = os.path.join(pkg, "extractor", "youtube")
+    os.makedirs(ext, exist_ok=True)
+    with open(os.path.join(root, "__main__.py"), "w", encoding="utf-8") as f:
+        f.write("import yt_dlp; yt_dlp.main()\n")
+    with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write(
+            "import sys\n"
+            "class YoutubeDL:\n"
+            "    def __init__(self, opts=None): self.opts = opts or {}\n"
+            "def main():\n"
+            "    args = sys.argv[1:]\n"
+            "    sys.stdout.write('OUT:' + ' '.join(args) + '\\n')\n"
+            "    sys.stderr.write('ERR:ok\\n')\n"
+            "    sys.exit(7 if '--fail' in args else 0)\n"
+        )
+    with open(os.path.join(pkg, "cache.py"), "w", encoding="utf-8") as f:
+        f.write("class Cache:\n    def __init__(self, ydl): pass\n    def _get_root_dir(self): return '/nonexistent'\n")
+    with open(os.path.join(pkg, "extractor", "__init__.py"), "w", encoding="utf-8") as f:
+        f.write("")
+    with open(os.path.join(ext, "__init__.py"), "w", encoding="utf-8") as f:
+        f.write("")
+    with open(os.path.join(ext, "_video.py"), "w", encoding="utf-8") as f:
+        f.write("def traverse_obj(obj, *paths, **kwargs): return obj\n")
+
+
+class YtdlServerTests(unittest.TestCase):
+    def test_serve_stream_mode_and_clean_stdin_eof_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ytdlp_dir = os.path.join(tmp, "yt-dlp.d")
+            make_fake_ytdlp(ytdlp_dir)
+            sock_path = os.path.join(tmp, "ytdl.sock")
+
+            proc = subprocess.Popen(
+                [sys.executable, "-I", SERVER_PATH, "serve", sock_path, ytdlp_dir],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while not os.path.exists(sock_path) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                if not os.path.exists(sock_path):
+                    self.fail(proc.stderr.read().decode())
+
+                # Stream protocol request
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(sock_path)
+                req = json.dumps({"mode": "stream", "args": ["--hello", "--fail"], "cwd": tmp}) + "\n"
+                s.sendall(req.encode())
+                stdout_buf = bytearray()
+                stderr_buf = bytearray()
+                exit_code = None
+                while True:
+                    hdr = s.recv(5)
+                    while len(hdr) < 5:
+                        more = s.recv(5 - len(hdr))
+                        if not more:
+                            break
+                        hdr += more
+                    self.assertEqual(len(hdr), 5)
+                    tag, length = struct.unpack("!BI", hdr)
+                    payload = bytearray()
+                    while len(payload) < length:
+                        part = s.recv(length - len(payload))
+                        if not part:
+                            break
+                        payload += part
+                    self.assertEqual(len(payload), length)
+                    if tag == 1:
+                        stdout_buf += payload
+                    elif tag == 2:
+                        stderr_buf += payload
+                    elif tag == 3:
+                        exit_code = struct.unpack("!i", payload)[0]
+                        break
+                s.close()
+                self.assertEqual(stdout_buf.decode(), "OUT:--hello --fail\n")
+                self.assertEqual(stderr_buf.decode(), "ERR:ok\n")
+                self.assertEqual(exit_code, 7)
+
+                # Legacy SCM_RIGHTS run mode still works
+                r_out, w_out = os.pipe()
+                r_err, w_err = os.pipe()
+                r_in, w_in = os.pipe()
+                os.close(w_in)
+                s2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s2.connect(sock_path)
+                msg = json.dumps({"args": ["--legacy"], "cwd": tmp}).encode()
+                s2.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [r_in, w_out, w_err]))])
+                os.close(r_in)
+                os.close(w_out)
+                os.close(w_err)
+                code_bytes = s2.recv(4)
+                s2.close()
+                self.assertEqual(struct.unpack("!i", code_bytes)[0], 0)
+                self.assertEqual(os.read(r_out, 1024).decode(), "OUT:--legacy\n")
+                self.assertEqual(os.read(r_err, 1024).decode(), "ERR:ok\n")
+                os.close(r_out)
+                os.close(r_err)
+
+                # Closing stdin shuts down cleanly and unlinks socket
+                proc.stdin.close()
+                proc.stdin = None
+                rc = proc.wait(timeout=3.0)
+                self.assertEqual(rc, 0)
+                self.assertFalse(os.path.exists(sock_path))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                if proc.stderr:
+                    proc.stderr.close()
+
+    def test_start_jsc_cache_first_probe_and_fallback(self):
+        mod = load_server_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            # Install fake yt_dlp + yt_dlp_ejs modules in sys.modules
+            saved_mods = {}
+            fake_names = [
+                "yt_dlp_ejs",
+                "yt_dlp_ejs.yt",
+                "yt_dlp_ejs.yt.solver",
+                "yt_dlp",
+                "yt_dlp.extractor",
+                "yt_dlp.extractor.youtube",
+                "yt_dlp.extractor.youtube.jsc",
+                "yt_dlp.extractor.youtube.jsc._builtin",
+                "yt_dlp.extractor.youtube.jsc._builtin.ejs",
+                "yt_dlp.extractor.youtube.jsc._builtin.deno",
+            ]
+            for name in fake_names:
+                saved_mods[name] = sys.modules.get(name)
+
+            orig_construct_calls = []
+            orig_run_calls = []
+
+            try:
+                ejs_pkg = types.ModuleType("yt_dlp_ejs")
+                ejs_yt = types.ModuleType("yt_dlp_ejs.yt")
+                ejs_solver = types.ModuleType("yt_dlp_ejs.yt.solver")
+                ejs_solver.lib = lambda: "const lib = { marker: true };"
+                ejs_solver.core = lambda: "function jsc(i) { return { type: 'result', preprocessed_player: 'p', responses: [] }; }"
+
+                class FakeEJSBaseJCP:
+                    def _construct_stdin(self, player, preprocessed, requests, /):
+                        orig_construct_calls.append((player, preprocessed))
+                        return f"REAL:{player}"
+
+                class FakeDenoJCP(FakeEJSBaseJCP):
+                    def __init__(self):
+                        self.logger = types.SimpleNamespace(debug=lambda *_a: None)
+
+                    def _run_js_runtime(self, stdin, /):
+                        orig_run_calls.append(stdin)
+                        return '{"type":"result","responses":[]}'
+
+                ejs_mod = types.ModuleType("yt_dlp.extractor.youtube.jsc._builtin.ejs")
+                ejs_mod.EJSBaseJCP = FakeEJSBaseJCP
+                deno_mod = types.ModuleType("yt_dlp.extractor.youtube.jsc._builtin.deno")
+                deno_mod.DenoJCP = FakeDenoJCP
+
+                sys.modules["yt_dlp_ejs"] = ejs_pkg
+                sys.modules["yt_dlp_ejs.yt"] = ejs_yt
+                sys.modules["yt_dlp_ejs.yt.solver"] = ejs_solver
+                sys.modules["yt_dlp"] = types.ModuleType("yt_dlp")
+                sys.modules["yt_dlp.extractor"] = types.ModuleType("yt_dlp.extractor")
+                sys.modules["yt_dlp.extractor.youtube"] = types.ModuleType("yt_dlp.extractor.youtube")
+                sys.modules["yt_dlp.extractor.youtube.jsc"] = types.ModuleType("yt_dlp.extractor.youtube.jsc")
+                sys.modules["yt_dlp.extractor.youtube.jsc._builtin"] = types.ModuleType("yt_dlp.extractor.youtube.jsc._builtin")
+                sys.modules["yt_dlp.extractor.youtube.jsc._builtin.ejs"] = ejs_mod
+                sys.modules["yt_dlp.extractor.youtube.jsc._builtin.deno"] = deno_mod
+
+                # Create dummy executable for Popen
+                fake_deno = os.path.join(tmp, "fake-deno")
+                with open(fake_deno, "w", encoding="utf-8") as f:
+                    f.write("#!/usr/bin/env python3\nimport sys\nsys.stdin.read()\n")
+                os.chmod(fake_deno, 0o755)
+
+                jsc_sock = os.path.join(tmp, "test.jsc")
+                seen_requests = []
+                cache = set()
+                ready_srv = threading.Event()
+                stop_srv = threading.Event()
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+                def jsc_server():
+                    srv.bind(jsc_sock)
+                    srv.listen(4)
+                    srv.settimeout(0.05)
+                    ready_srv.set()
+                    while not stop_srv.is_set():
+                        try:
+                            conn, _ = srv.accept()
+                        except socket.timeout:
+                            continue
+                        chunks = []
+                        while p := conn.recv(65536):
+                            chunks.append(p)
+                        req = json.loads(b"".join(chunks))
+                        seen_requests.append(req)
+                        if req["type"] == "cached":
+                            if req["key"] in cache:
+                                resp = {"type": "result", "responses": [{"type": "result", "data": {"abc": "xyz"}}]}
+                            else:
+                                resp = {"type": "miss"}
+                        else:
+                            cache.add(req["key"])
+                            resp = {"type": "result", "responses": [{"type": "result", "data": {"abc": "xyz"}}]}
+                        conn.sendall(json.dumps(resp).encode())
+                        conn.close()
+
+                proc = mod.start_jsc(fake_deno, jsc_sock)
+                self.assertIsNotNone(proc)
+                try:
+                    # Check private 0o600 permissions on generated JS files
+                    self.assertEqual(stat.S_IMODE(os.stat(jsc_sock + ".js").st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE(os.stat(jsc_sock + ".lib.js").st_mode), 0o600)
+
+                    t = threading.Thread(target=jsc_server, daemon=True)
+                    t.start()
+                    self.assertTrue(ready_srv.wait(timeout=2.0))
+
+                    # Ensure EJSBaseJCP._construct_stdin was NOT patched globally
+                    self.assertEqual(FakeEJSBaseJCP()._construct_stdin("P", True, []), "REAL:P")
+                    self.assertEqual(len(orig_construct_calls), 1)
+
+                    req_obj = types.SimpleNamespace(
+                        type=types.SimpleNamespace(value="n"),
+                        input=types.SimpleNamespace(player_url="player-v1", challenges=["abc"]),
+                    )
+                    jcp = FakeDenoJCP()
+
+                    # 1st call: miss -> sends preprocessed_player, never calls orig_construct
+                    stdin1 = jcp._construct_stdin("BIG_PREPROCESSED_4MB", True, [req_obj])
+                    self.assertEqual(len(orig_construct_calls), 1)
+                    res1 = json.loads(jcp._run_js_runtime(stdin1))
+                    self.assertEqual(res1["type"], "result")
+                    self.assertEqual([r["type"] for r in seen_requests], ["cached", "preprocessed"])
+                    self.assertEqual(len(orig_run_calls), 0)
+
+                    # 2nd call: cache hit -> ONLY sends tiny cached probe!
+                    stdin2 = jcp._construct_stdin("BIG_PREPROCESSED_4MB", True, [req_obj])
+                    res2 = json.loads(jcp._run_js_runtime(stdin2))
+                    self.assertEqual(res2["type"], "result")
+                    self.assertEqual([r["type"] for r in seen_requests], ["cached", "preprocessed", "cached"])
+                    self.assertEqual(len(orig_construct_calls), 1)
+                    self.assertEqual(len(orig_run_calls), 0)
+
+                    # 3rd call when socket disappears -> materializes real stdin and falls back to orig_run
+                    stop_srv.set()
+                    t.join(timeout=2)
+                    srv.close()
+                    os.unlink(jsc_sock)
+                    stdin3 = jcp._construct_stdin("BIG_PREPROCESSED_4MB", True, [req_obj])
+                    jcp._run_js_runtime(stdin3)
+                    self.assertEqual(orig_run_calls, ["REAL:BIG_PREPROCESSED_4MB"])
+                finally:
+                    stop_srv.set()
+                    if proc.stdin:
+                        proc.stdin.close()
+                    proc.terminate()
+                    proc.wait(timeout=2)
+            finally:
+                for name, prev in saved_mods.items():
+                    if prev is None:
+                        sys.modules.pop(name, None)
+                    else:
+                        sys.modules[name] = prev
+
+    @unittest.skipUnless(shutil.which("node"), "node required to exercise ytdl-jsc.js harness")
+    def test_ytdl_jsc_lazy_lib_load_and_cache_protocol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib_path = os.path.join(tmp, "lib.js")
+            with open(lib_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "globalThis.__libLoaded = (globalThis.__libLoaded || 0) + 1;\n"
+                    "function jsc(input) {\n"
+                    "  return {\n"
+                    "    type: 'result',\n"
+                    "    preprocessed_player: '_result.n = (x) => \"n:\" + x;',\n"
+                    "    responses: input.requests.map(r => ({ type: 'result', data: Object.fromEntries(r.challenges.map(c => [c, 'n:' + c])) }))\n"
+                    "  };\n"
+                    "}\n"
+                    "globalThis.__cattube_jsc = jsc;\n"
+                )
+            with open(JSC_PATH, "r", encoding="utf-8") as f:
+                src = f.read()
+            # Slice before Deno-specific I/O tail and drive solve() directly under Node.
+            core_js = src.split("async function readAll", 1)[0]
+            harness = os.path.join(tmp, "harness.js")
+            with open(harness, "w", encoding="utf-8") as f:
+                f.write(
+                    "const fs = require('fs');\n"
+                    "const assert = require('assert');\n"
+                    f"globalThis.Deno = {{ args: ['unused.sock', {json.dumps(lib_path)}], readTextFileSync: (p) => fs.readFileSync(p, 'utf8') }};\n"
+                    f"{core_js}\n"
+                    "// 1. cached miss\n"
+                    "assert.deepStrictEqual(solve({ type: 'cached', key: 'k1', requests: [{ type: 'n', challenges: ['a'] }] }), { type: 'miss' });\n"
+                    "assert.strictEqual(globalThis.__libLoaded, undefined);\n"
+                    "// 2. preprocessed never loads heavy lib\n"
+                    "const r1 = solve({ type: 'preprocessed', key: 'k1', preprocessed_player: '_result.n = (x) => \"p:\" + x;', requests: [{ type: 'n', challenges: ['a'] }] });\n"
+                    "assert.deepStrictEqual(r1, { type: 'result', responses: [{ type: 'result', data: { a: 'p:a' } }] });\n"
+                    "assert.strictEqual(globalThis.__libLoaded, undefined);\n"
+                    "// 3. cached hit reuses compiled solver\n"
+                    "const r2 = solve({ type: 'cached', key: 'k1', requests: [{ type: 'n', challenges: ['b'] }] });\n"
+                    "assert.deepStrictEqual(r2, { type: 'result', responses: [{ type: 'result', data: { b: 'p:b' } }] });\n"
+                    "assert.strictEqual(globalThis.__libLoaded, undefined);\n"
+                    "// 4. raw player loads lib lazily once\n"
+                    "const r3 = solve({ type: 'player', key: 'k2', player: 'raw', requests: [{ type: 'n', challenges: ['c'] }] });\n"
+                    "assert.strictEqual(globalThis.__libLoaded, 1);\n"
+                    "assert.deepStrictEqual(r3.responses, [{ type: 'result', data: { c: 'n:c' } }]);\n"
+                    "const r4 = solve({ type: 'cached', key: 'k2', requests: [{ type: 'n', challenges: ['d'] }] });\n"
+                    "assert.deepStrictEqual(r4, { type: 'result', responses: [{ type: 'result', data: { d: 'n:d' } }] });\n"
+                    "assert.strictEqual(globalThis.__libLoaded, 1);\n"
+                )
+            subprocess.run([shutil.which("node"), harness], check=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
