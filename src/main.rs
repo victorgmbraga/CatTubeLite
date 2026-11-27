@@ -646,7 +646,12 @@ impl App {
             return self.toast(ctx, "Getting the player ready, try again in a moment");
         }
         self.yt_dlp_ready = true;
-        match yt::start_player(&o, &self.data) {
+        match yt::start_player(
+            &o,
+            &self.data,
+            self.prefs.language.key(),
+            &self.prefs.region,
+        ) {
             Ok(child) => {
                 if self.low_power {
                     // Release decoded GL textures before mpv + Deno allocate
@@ -679,6 +684,8 @@ impl App {
                     hdr: self.prefs.hdr,
                     sub_langs: self.prefs.sub_lang.clone(),
                     subs_on: self.prefs.subs_on,
+                    hl: self.prefs.language.key().to_string(),
+                    gl: self.prefs.region.clone(),
                     start,
                     queue,
                     on_video: Some(Box::new(move |tile| {

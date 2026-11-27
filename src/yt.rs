@@ -67,6 +67,17 @@ static PLAIN_AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(
         .build()
 });
 
+/// Dedicated fast-path pool with short connect/read timeouts for InnerTube
+/// `ANDROID_VR` `/player` calls and CDN `Range: bytes=0-0` probes.
+static FASTPATH_AGENT: std::sync::LazyLock<ureq::Agent> = std::sync::LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(3))
+        .timeout_read(Duration::from_secs(6))
+        .max_idle_connections_per_host(4)
+        .user_agent(yt::ANDROID_VR_USER_AGENT)
+        .build()
+});
+
 /// Maximum accepted thumbnail / avatar download size (8 MiB).
 const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -820,6 +831,178 @@ pub fn resolve_via_server(
     resolve_via_socket(&player::ytdl_server_socket(), video_id, sub_langs, is_live)
 }
 
+/// Whether the direct InnerTube `ANDROID_VR` fast-path is enabled.
+/// `CATTUBE_FASTPATH=0` disables it.
+pub fn fastpath_enabled() -> bool {
+    !std::env::var("CATTUBE_FASTPATH").is_ok_and(|v| v == "0")
+}
+
+const FASTPATH_FAILURE_THRESHOLD: u32 = 3;
+const FASTPATH_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Default)]
+struct FastPathCircuit {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+impl FastPathCircuit {
+    fn allow_at(&mut self, now: Instant) -> bool {
+        match self.open_until {
+            Some(until) if now < until => false,
+            Some(_) => {
+                self.open_until = None;
+                true
+            }
+            None => true,
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+
+    fn record_failure_at(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= FASTPATH_FAILURE_THRESHOLD {
+            self.open_until = Some(now + FASTPATH_COOLDOWN);
+        }
+    }
+}
+
+static FASTPATH_CIRCUIT: std::sync::LazyLock<Mutex<FastPathCircuit>> =
+    std::sync::LazyLock::new(|| Mutex::new(FastPathCircuit::default()));
+
+fn fastpath_circuit_allows() -> bool {
+    FASTPATH_CIRCUIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .allow_at(Instant::now())
+}
+
+fn record_fastpath_success() {
+    FASTPATH_CIRCUIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .record_success();
+}
+
+fn record_fastpath_failure() {
+    FASTPATH_CIRCUIT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .record_failure_at(Instant::now());
+}
+
+fn probe_stream_url_with(agent: &ureq::Agent, url: &str, user_agent: &str) -> bool {
+    let mut req = agent.get(url).set("Range", "bytes=0-0");
+    if !user_agent.is_empty() {
+        req = req.set("User-Agent", user_agent);
+    }
+    matches!(req.call(), Ok(r) if matches!(r.status(), 200 | 206))
+}
+
+fn probe_stream_url(url: &str, user_agent: &str) -> bool {
+    probe_stream_url_with(&FASTPATH_AGENT, url, user_agent)
+}
+
+#[derive(Clone)]
+struct ResolveParams {
+    video_id: String,
+    hl: String,
+    gl: String,
+    sub_langs: String,
+    is_live: bool,
+    max_height: u32,
+    codec: player::Codec,
+    hdr: bool,
+    low_power: bool,
+}
+
+impl ResolveParams {
+    fn from_play_options(o: &PlayOptions, hl: &str, gl: &str) -> Self {
+        Self {
+            video_id: o.video_id.clone(),
+            hl: hl.to_string(),
+            gl: gl.to_string(),
+            sub_langs: o.sub_langs.clone(),
+            is_live: o.is_live,
+            max_height: o.max_height,
+            codec: o.codec,
+            hdr: o.hdr,
+            low_power: o.low_power,
+        }
+    }
+
+    fn from_session(s: &Session, tile: &yt::Tile, height: u32) -> Self {
+        Self {
+            video_id: tile.id.clone(),
+            hl: s.hl.clone(),
+            gl: s.gl.clone(),
+            sub_langs: s.sub_langs.clone(),
+            is_live: tile.kind == yt::Kind::Live,
+            max_height: height,
+            codec: s.codec,
+            hdr: s.hdr,
+            low_power: s.low_power,
+        }
+    }
+}
+
+fn resolve_via_innertube(p: &ResolveParams) -> Result<ResolvedStream, String> {
+    if !fastpath_enabled() {
+        return Err("InnerTube fast-path disabled".into());
+    }
+    if !fastpath_circuit_allows() {
+        return Err("InnerTube fast-path circuit open".into());
+    }
+    let body = yt::player_body_android_vr(&p.video_id, &p.hl, &p.gl)
+        .ok_or_else(|| "Invalid video ID".to_string())?;
+    let reply = FASTPATH_AGENT
+        .post(&yt::endpoint_url("player"))
+        .set("Content-Type", "application/json")
+        .set("X-YouTube-Client-Name", yt::ANDROID_VR_CLIENT_NUMBER)
+        .set("X-YouTube-Client-Version", yt::ANDROID_VR_CLIENT_VERSION)
+        .send_string(&body);
+    let text = match read_response_text(reply) {
+        Ok(t) => t,
+        Err(e) => {
+            record_fastpath_failure();
+            return Err(e);
+        }
+    };
+    let Some(resolved) = stream::parse_innertube_player(&text, &p.video_id, &p.sub_langs) else {
+        record_fastpath_failure();
+        return Err("InnerTube fast-path response incomplete".into());
+    };
+    let Some(sel) = stream::select_stream(&resolved, p.max_height, p.codec, p.hdr, p.low_power)
+    else {
+        record_fastpath_failure();
+        return Err("InnerTube fast-path had no selectable stream".into());
+    };
+    if !probe_stream_url(&sel.video_url, &resolved.user_agent) {
+        record_fastpath_failure();
+        return Err("InnerTube stream URL probe failed".into());
+    }
+    record_fastpath_success();
+    Ok(resolved)
+}
+
+fn resolve_stream(p: &ResolveParams) -> Result<ResolvedStream, String> {
+    if !p.is_live
+        && let Ok(resolved) = resolve_via_innertube(p)
+    {
+        return Ok(resolved);
+    }
+    resolve_via_server(&p.video_id, &p.sub_langs, p.is_live)
+}
+
+fn can_direct_resolve(is_live: bool) -> bool {
+    direct_extract_enabled()
+        && (resident_socket_up() || (!is_live && fastpath_enabled() && fastpath_circuit_allows()))
+}
+
 /// Capture the actual player before replacing or closing it, not its last poll.
 pub fn checkpoint_player(data: &Path) {
     let Ok(mut conn) = mpv::IpcConn::connect(&player::player_socket()) else {
@@ -1103,19 +1286,18 @@ fn resident_socket_up() -> bool {
 }
 
 /// Start mpv for a video (its own process group, stdin closed).
-pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String> {
+pub fn start_player(
+    o: &PlayOptions,
+    data: &Path,
+    hl: &str,
+    gl: &str,
+) -> Result<PlayerHandle, String> {
     std::fs::create_dir_all(data.join("positions"))
         .map_err(|e| format!("Could not save playback positions ({e})"))?;
-    let direct_idle = direct_extract_enabled() && resident_socket_up();
+    let direct_idle = can_direct_resolve(o.is_live);
     let initial_resolve = if direct_idle {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (vid, langs, is_live) = (o.video_id.clone(), o.sub_langs.clone(), o.is_live);
-        let _ = std::thread::Builder::new()
-            .name("cattube-resolve".into())
-            .spawn(move || {
-                let _ = tx.send(resolve_via_server(&vid, &langs, is_live));
-            });
-        Some(rx)
+        let params = ResolveParams::from_play_options(o, hl, gl);
+        Some(spawn_resolve_task(params))
     } else {
         None
     };
@@ -1214,6 +1396,8 @@ pub struct Session {
     pub hdr: bool,
     pub sub_langs: String,
     pub subs_on: bool,
+    pub hl: String,
+    pub gl: String,
     pub start: f64,
     /// Videos after this one (a playlist or a row), in order.
     pub queue: Vec<yt::Tile>,
@@ -2023,16 +2207,12 @@ fn wait_for_direct_load(
     DirectLoadCheck::Failed
 }
 
-fn spawn_resolve_task(
-    video_id: String,
-    sub_langs: String,
-    is_live: bool,
-) -> std::sync::mpsc::Receiver<Result<ResolvedStream, String>> {
+fn spawn_resolve_task(params: ResolveParams) -> ResolveRx {
     let (tx, rx) = std::sync::mpsc::channel();
     let _ = std::thread::Builder::new()
         .name("cattube-resolve".into())
         .spawn(move || {
-            let _ = tx.send(resolve_via_server(&video_id, &sub_langs, is_live));
+            let _ = tx.send(resolve_stream(&params));
         });
     rx
 }
@@ -2041,6 +2221,73 @@ struct LoadTarget<'a> {
     tile: &'a yt::Tile,
     height: u32,
     start: f64,
+}
+
+fn try_load_resolved(
+    conn: &mut mpv::IpcConn,
+    player: &PlayerHandle,
+    s: &Session,
+    target: &LoadTarget<'_>,
+    resolved: &ResolvedStream,
+    chapter_file: &mut ChapterFile,
+) -> Result<Option<stream::SelectedPlayback>, ()> {
+    let cur = target.tile;
+    let fmt = player::format_string(target.height, s.codec, s.hdr, s.low_power);
+    let Some(sel) = stream::select_stream(resolved, target.height, s.codec, s.hdr, s.low_power)
+    else {
+        return Ok(None);
+    };
+    if !wait_available_at(player, sel.available_at) {
+        return Err(());
+    }
+    let ch_path = write_chapters_file(&resolved.chapters, resolved.duration);
+    chapter_file.replace(ch_path);
+    let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("yes")]);
+    let _ = conn.command(&[
+        Arg::Str("set_property"),
+        Arg::Str("ytdl-format"),
+        Arg::Str(&fmt),
+    ]);
+    let _ = conn.command(&[
+        Arg::Str("set_property"),
+        Arg::Str("user-data/cattube/loaded"),
+        Arg::Str(""),
+    ]);
+    conn.clear_observed("eof-reached");
+    conn.clear_observed("duration");
+    conn.clear_observed("metadata/by-key/ytdl_is_live");
+    conn.clear_observed("user-data/cattube/loaded");
+    let _ = conn.command(&[
+        Arg::Str("script-message"),
+        Arg::Str("cattube-video"),
+        Arg::Str(&cur.id),
+        Arg::Str(if sel.is_live { "yes" } else { "no" }),
+    ]);
+    let title = safe_media_title(if cur.title.trim().is_empty() {
+        &resolved.title
+    } else {
+        &cur.title
+    });
+    let uri = stream::edl_uri(&sel.video_url, sel.audio_url.as_deref());
+    let opts = stream::loadfile_options(
+        target.start,
+        sel.is_live,
+        &title,
+        &sel.user_agent,
+        chapter_file.path(),
+        &sel.headers,
+    );
+    loadfile_replace(conn, &uri, &opts);
+    let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("pause"), Arg::Str("no")]);
+    match wait_for_direct_load(conn, player, &cur.id) {
+        DirectLoadCheck::Loaded => {
+            let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("no")]);
+            attach_external_tracks(conn, &sel, resolved, s.subs_on);
+            Ok(Some(sel))
+        }
+        DirectLoadCheck::PlayerGone => Err(()),
+        DirectLoadCheck::Failed => Ok(None),
+    }
 }
 
 fn load_resolved_or_fallback(
@@ -2055,59 +2302,20 @@ fn load_resolved_or_fallback(
     let height = target.height;
     let start = target.start;
     let fmt = player::format_string(height, s.codec, s.hdr, s.low_power);
-    if let Some(Ok(resolved)) = resolved_res
-        && let Some(sel) = stream::select_stream(&resolved, height, s.codec, s.hdr, s.low_power)
-    {
-        if !wait_available_at(player, sel.available_at) {
-            return Err(());
+    if let Some(Ok(resolved)) = resolved_res {
+        if let Some(sel) = try_load_resolved(conn, player, s, &target, &resolved, chapter_file)? {
+            return Ok(Some((resolved, sel)));
         }
-        let ch_path = write_chapters_file(&resolved.chapters, resolved.duration);
-        chapter_file.replace(ch_path);
-        let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("yes")]);
-        let _ = conn.command(&[
-            Arg::Str("set_property"),
-            Arg::Str("ytdl-format"),
-            Arg::Str(&fmt),
-        ]);
-        let _ = conn.command(&[
-            Arg::Str("set_property"),
-            Arg::Str("user-data/cattube/loaded"),
-            Arg::Str(""),
-        ]);
-        conn.clear_observed("eof-reached");
-        conn.clear_observed("duration");
-        conn.clear_observed("metadata/by-key/ytdl_is_live");
-        conn.clear_observed("user-data/cattube/loaded");
-        let _ = conn.command(&[
-            Arg::Str("script-message"),
-            Arg::Str("cattube-video"),
-            Arg::Str(&cur.id),
-            Arg::Str(if sel.is_live { "yes" } else { "no" }),
-        ]);
-        let title = safe_media_title(if cur.title.trim().is_empty() {
-            &resolved.title
-        } else {
-            &cur.title
-        });
-        let uri = stream::edl_uri(&sel.video_url, sel.audio_url.as_deref());
-        let opts = stream::loadfile_options(
-            start,
-            sel.is_live,
-            &title,
-            &sel.user_agent,
-            chapter_file.path(),
-            &sel.headers,
-        );
-        loadfile_replace(conn, &uri, &opts);
-        let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("pause"), Arg::Str("no")]);
-        match wait_for_direct_load(conn, player, &cur.id) {
-            DirectLoadCheck::Loaded => {
-                let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("no")]);
-                attach_external_tracks(conn, &sel, &resolved, s.subs_on);
-                return Ok(Some((resolved, sel)));
+        if resolved.source == stream::StreamSource::Innertube {
+            record_fastpath_failure();
+            if resident_socket_up()
+                && let Ok(srv_resolved) =
+                    resolve_via_server(&cur.id, &s.sub_langs, cur.kind == yt::Kind::Live)
+                && let Some(sel) =
+                    try_load_resolved(conn, player, s, &target, &srv_resolved, chapter_file)?
+            {
+                return Ok(Some((srv_resolved, sel)));
             }
-            DirectLoadCheck::PlayerGone => return Err(()),
-            DirectLoadCheck::Failed => {}
         }
     }
 
@@ -2183,6 +2391,8 @@ fn spawn_related(
         hdr: s.hdr,
         sub_langs: String::new(),
         subs_on: false,
+        hl: String::new(),
+        gl: String::new(),
         start: 0.0,
         queue: Vec::new(),
         on_hide: None,
@@ -2415,12 +2625,11 @@ pub fn spawn_watcher(
                     fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
                 });
                 let mut pending_reattach: Option<stream::SelectedPlayback> = None;
+                let mut innertube_retried = false;
                 let mut prefetch_for: Option<String> = None;
-                let mut prefetch_rx: Option<
-                    std::sync::mpsc::Receiver<Result<ResolvedStream, String>>,
-                > = None;
+                let mut prefetch_rx: Option<ResolveRx> = None;
                 let mut last_prefetch_probe = Instant::now();
-                let video_started_at = Instant::now();
+                let mut video_started_at = Instant::now();
                 loop {
                     match next_rx.try_recv() {
                         Ok(next) => {
@@ -2589,13 +2798,11 @@ pub fn spawn_watcher(
                             .is_some_and(|d| d >= 60.0 && last.0 > 0.0 && (d - last.0) <= 45.0)
                             || (dur.is_none_or(|d| d < 60.0)
                                 && video_started_at.elapsed() >= Duration::from_secs(15));
-                        if should_prefetch && resident_socket_up() {
+                        if should_prefetch && can_direct_resolve(next.kind == yt::Kind::Live) {
                             prefetch_for = Some(next.id.clone());
-                            prefetch_rx = Some(spawn_resolve_task(
-                                next.id.clone(),
-                                s.sub_langs.clone(),
-                                next.kind == yt::Kind::Live,
-                            ));
+                            prefetch_rx = Some(spawn_resolve_task(ResolveParams::from_session(
+                                &s, next, cur_height,
+                            )));
                         }
                     }
                     let want = |name: &str| {
@@ -2678,6 +2885,44 @@ pub fn spawn_watcher(
                     } else {
                         conn.get_bool("eof-reached").unwrap_or(false)
                     } || skipped_to_end;
+                    if eof
+                        && !skipped_to_end
+                        && !innertube_retried
+                        && cur_resolved
+                            .as_ref()
+                            .is_some_and(|r| r.source == stream::StreamSource::Innertube)
+                        && video_started_at.elapsed() < Duration::from_secs(30)
+                        && dur.is_some_and(|d| d > 35.0 && last.0 < d - 10.0)
+                    {
+                        record_fastpath_failure();
+                        innertube_retried = true;
+                        conn.clear_observed("eof-reached");
+                        let srv_res = resident_socket_up().then(|| {
+                            resolve_via_server(&cur.id, &s.sub_langs, cur.kind == yt::Kind::Live)
+                        });
+                        match load_resolved_or_fallback(
+                            &mut conn,
+                            &player,
+                            &s,
+                            LoadTarget {
+                                tile: &cur,
+                                height: cur_height,
+                                start: last.0,
+                            },
+                            srv_res,
+                            &mut cur_chapter_file,
+                        ) {
+                            Ok(next_res) => {
+                                cur_resolved = next_res.map(|(r, _)| r);
+                                video_started_at = Instant::now();
+                                continue;
+                            }
+                            Err(()) => {
+                                initial_load_failed = !started_any_playback;
+                                break 'videos;
+                            }
+                        }
+                    }
                     // The end: "Up next" counts down five seconds.
                     if eof && !quit_sent && !next_pending && card_until.is_none() && jump.is_none()
                     {
@@ -2741,12 +2986,10 @@ pub fn spawn_watcher(
                             {
                                 pending_rx = prefetch_rx.take();
                                 need_load = true;
-                            } else if resident_socket_up() {
-                                pending_rx = Some(spawn_resolve_task(
-                                    cur.id.clone(),
-                                    s.sub_langs.clone(),
-                                    cur.kind == yt::Kind::Live,
-                                ));
+                            } else if can_direct_resolve(cur.kind == yt::Kind::Live) {
+                                pending_rx = Some(spawn_resolve_task(ResolveParams::from_session(
+                                    &s, &cur, cur_height,
+                                )));
                                 need_load = true;
                             } else {
                                 need_load = false;
@@ -3029,6 +3272,8 @@ mod player_tests {
                 hdr: false,
                 sub_langs: String::new(),
                 subs_on: false,
+                hl: "en".into(),
+                gl: "US".into(),
                 start: 0.0,
                 queue: Vec::new(),
                 on_hide: None,
@@ -3345,6 +3590,8 @@ mod player_tests {
             hdr: false,
             sub_langs: String::new(),
             subs_on: false,
+            hl: "en".into(),
+            gl: "US".into(),
             start: 0.0,
             queue: Vec::new(),
             on_hide: None,
@@ -3462,6 +3709,8 @@ mod player_tests {
             hdr: false,
             sub_langs: "en".into(),
             subs_on: true,
+            hl: "en".into(),
+            gl: "US".into(),
             start: 10.0,
             queue: Vec::new(),
             on_hide: None,
@@ -3504,5 +3753,58 @@ mod player_tests {
             .find(|c| c.first().map(String::as_str) == Some("loadfile"))
             .unwrap();
         assert_eq!(load[1], "https://www.youtube.com/watch?v=WhWc3b3KhnY");
+    }
+
+    #[test]
+    fn fastpath_circuit_opens_after_threshold_and_resets_after_cooldown_or_success() {
+        let mut c = FastPathCircuit::default();
+        let t0 = Instant::now();
+        assert!(c.allow_at(t0));
+        c.record_failure_at(t0);
+        assert!(c.allow_at(t0));
+        c.record_failure_at(t0);
+        assert!(c.allow_at(t0));
+        // 3rd consecutive failure opens the circuit for FASTPATH_COOLDOWN (30 min).
+        c.record_failure_at(t0);
+        assert!(!c.allow_at(t0 + Duration::from_secs(60)));
+        assert!(!c.allow_at(t0 + FASTPATH_COOLDOWN - Duration::from_secs(1)));
+        // After cooldown elapses, fast-path is allowed again.
+        assert!(c.allow_at(t0 + FASTPATH_COOLDOWN));
+        // Success resets failure counter so 1 failure does not immediately re-open.
+        c.record_success();
+        c.record_failure_at(t0 + FASTPATH_COOLDOWN);
+        assert!(c.allow_at(t0 + FASTPATH_COOLDOWN));
+    }
+
+    #[test]
+    fn probe_stream_url_checks_range_and_status_codes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for code in ["206 Partial Content", "200 OK", "403 Forbidden"] {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 2048];
+                let n = s.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                assert!(req.contains("range: bytes=0-0"), "{req}");
+                assert!(req.contains("user-agent: custom-probe/1.0"), "{req}");
+                let resp =
+                    format!("HTTP/1.1 {code}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx");
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(2))
+            .timeout_read(Duration::from_secs(2))
+            .build();
+        let url = format!("http://{addr}/videoplayback");
+        assert!(probe_stream_url_with(&agent, &url, "Custom-Probe/1.0"));
+        assert!(probe_stream_url_with(&agent, &url, "Custom-Probe/1.0"));
+        assert!(!probe_stream_url_with(&agent, &url, "Custom-Probe/1.0"));
+        server.join().unwrap();
     }
 }
