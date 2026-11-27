@@ -6,6 +6,7 @@ use cattube_core::community;
 use cattube_core::mpv::{self, Arg};
 use cattube_core::player::{self, PlayOptions};
 use cattube_core::process::{Cmd, Runner, SystemRunner};
+use cattube_core::stream::{self, ResolvedStream};
 use cattube_core::youtube::{self as yt, Details, Page};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -769,27 +770,98 @@ fn stale_after(p: &Path, every: Duration) -> bool {
 
 // ---------------------------------------------------------------- player
 
+/// Whether direct stream extraction (bypassing mpv's `ytdl_hook`) is enabled.
+/// `CATTUBE_YTDL_DIRECT=0` disables it and falls back to `ytdl_hook`.
+pub fn direct_extract_enabled() -> bool {
+    !std::env::var("CATTUBE_YTDL_DIRECT").is_ok_and(|v| v == "0")
+}
+
+fn resolve_via_socket(
+    socket: &Path,
+    video_id: &str,
+    sub_langs: &str,
+    is_live: bool,
+) -> Result<ResolvedStream, String> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::UnixStream;
+    let mut s = UnixStream::connect(socket).map_err(|e| e.to_string())?;
+    let _ = s.set_read_timeout(Some(Duration::from_secs(25)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    let req = format!(
+        "{{\"mode\":\"resolve\",\"video_id\":{},\"sub_langs\":{},\"is_live\":{}}}\n",
+        mpv::json_string(video_id),
+        mpv::json_string(sub_langs),
+        is_live
+    );
+    s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut br = BufReader::new(s.take(256 * 1024));
+    let mut line = String::new();
+    br.read_line(&mut line).map_err(|e| e.to_string())?;
+    if let Some(parsed) = stream::parse_resolved_stream(&line) {
+        return Ok(parsed);
+    }
+    let err = mpv::parse_json(line.trim())
+        .and_then(|v| {
+            v.get("error")
+                .and_then(mpv::Json::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "Could not resolve video streams".to_string());
+    Err(err)
+}
+
+/// Ask the resident `ytdl-server.py` (`mode == "resolve"`) for compact
+/// stream URLs, subtitles, and chapters without invoking `ytdl_hook`.
+pub fn resolve_via_server(
+    video_id: &str,
+    sub_langs: &str,
+    is_live: bool,
+) -> Result<ResolvedStream, String> {
+    resolve_via_socket(&player::ytdl_server_socket(), video_id, sub_langs, is_live)
+}
+
 /// Capture the actual player before replacing or closing it, not its last poll.
 pub fn checkpoint_player(data: &Path) {
     let Ok(mut conn) = mpv::IpcConn::connect(&player::player_socket()) else {
         return;
     };
     let budget = Duration::from_millis(80);
-    let Ok(path) = conn.command_with_timeout(&[Arg::Str("get_property"), Arg::Str("path")], budget)
-    else {
-        return;
-    };
-    let Some(path) = path.as_str() else { return };
-    let id = path
-        .split(['?', '&'])
-        .find_map(|part| part.strip_prefix("v="))
-        .or_else(|| path.split('?').next()?.rsplit('/').next())
-        .unwrap_or("");
-    if !yt::is_video_id(id) {
-        return;
-    }
+    let ud_id = conn
+        .command_with_timeout(
+            &[
+                Arg::Str("get_property"),
+                Arg::Str("user-data/cattube/video-id"),
+            ],
+            budget,
+        )
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_string))
+        .filter(|s| yt::is_video_id(s));
+    let path_str = conn
+        .command_with_timeout(&[Arg::Str("get_property"), Arg::Str("path")], budget)
+        .ok()
+        .and_then(|j| j.as_str().map(str::to_string));
+    let id = ud_id.or_else(|| {
+        let path = path_str.as_deref()?;
+        let found = path
+            .split(['?', '&'])
+            .find_map(|part| part.strip_prefix("v="))
+            .or_else(|| path.split('?').next()?.rsplit('/').next())?;
+        yt::is_video_id(found).then(|| found.to_string())
+    });
+    let Some(id) = id else { return };
     // Live streams keep no resume position: never write a checkpoint for them.
-    let is_live = conn
+    let ud_live = conn
+        .command_with_timeout(
+            &[
+                Arg::Str("get_property"),
+                Arg::Str("user-data/cattube/is-live"),
+            ],
+            budget,
+        )
+        .ok()
+        .is_some_and(|j| j.as_str() == Some("yes"));
+    let ytdl_live = conn
         .command_with_timeout(
             &[
                 Arg::Str("get_property"),
@@ -799,7 +871,7 @@ pub fn checkpoint_player(data: &Path) {
         )
         .ok()
         .is_some_and(|j| j.as_str() == Some("true"));
-    if is_live {
+    if ud_live || ytdl_live {
         return;
     }
     let get = |conn: &mut mpv::IpcConn, name: &str| {
@@ -809,18 +881,29 @@ pub fn checkpoint_player(data: &Path) {
     };
     if let Some(position) = get(&mut conn, "time-pos") {
         let duration = get(&mut conn, "duration");
-        let same_video = conn
-            .command_with_timeout(&[Arg::Str("get_property"), Arg::Str("path")], budget)
+        let same_ud = conn
+            .command_with_timeout(
+                &[
+                    Arg::Str("get_property"),
+                    Arg::Str("user-data/cattube/video-id"),
+                ],
+                budget,
+            )
             .ok()
-            .is_some_and(|j| j.as_str() == Some(path));
-        if !same_video {
+            .is_some_and(|j| j.as_str() == Some(id.as_str()));
+        let same_path = path_str.as_deref().is_some_and(|path| {
+            conn.command_with_timeout(&[Arg::Str("get_property"), Arg::Str("path")], budget)
+                .ok()
+                .is_some_and(|j| j.as_str() == Some(path))
+        });
+        if !same_ud && !same_path {
             return;
         }
         let finished =
-            player::checkpoint(data, id).is_some_and(|p| p.finished && position >= p.position);
+            player::checkpoint(data, &id).is_some_and(|p| p.finished && position >= p.position);
         let _ = player::store_checkpoint(
             data,
-            id,
+            &id,
             player::Checkpoint {
                 position,
                 duration,
@@ -832,6 +915,9 @@ pub fn checkpoint_player(data: &Path) {
 
 const MAX_PLAYER_LOG_BYTES: usize = 8 * 1024;
 const MAX_PLAYER_LOG_LINES: usize = 40;
+
+type ResolveRx = std::sync::mpsc::Receiver<Result<ResolvedStream, String>>;
+type SharedResolveRx = std::sync::Arc<Mutex<Option<ResolveRx>>>;
 
 struct PlayerState {
     child: Option<std::process::Child>,
@@ -848,6 +934,8 @@ struct PlayerState {
 #[derive(Clone)]
 pub struct PlayerHandle {
     state: std::sync::Arc<(Mutex<PlayerState>, std::sync::Condvar)>,
+    direct_idle: bool,
+    initial_resolve: SharedResolveRx,
 }
 
 impl PlayerHandle {
@@ -864,10 +952,17 @@ impl PlayerHandle {
                 }),
                 std::sync::Condvar::new(),
             )),
+            direct_idle: false,
+            initial_resolve: std::sync::Arc::new(Mutex::new(None)),
         }
     }
 
-    fn with_log_pipe(child: std::process::Child, reader: std::io::PipeReader) -> Self {
+    fn with_log_pipe(
+        child: std::process::Child,
+        reader: std::io::PipeReader,
+        direct_idle: bool,
+        initial_resolve: Option<ResolveRx>,
+    ) -> Self {
         let handle = Self {
             state: std::sync::Arc::new((
                 Mutex::new(PlayerState {
@@ -880,6 +975,8 @@ impl PlayerHandle {
                 }),
                 std::sync::Condvar::new(),
             )),
+            direct_idle,
+            initial_resolve: std::sync::Arc::new(Mutex::new(initial_resolve)),
         };
         let state = handle.state.clone();
         let _ = std::thread::Builder::new()
@@ -988,24 +1085,59 @@ impl PlayerHandle {
         }
         (guard.exit, guard.stopped_by_app, out)
     }
+
+    fn take_initial_resolve(&self) -> Option<ResolveRx> {
+        self.initial_resolve
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
 }
 
 /// How long a player from another CatTube process gets to close.
 const PLAYER_CLOSE_GRACE: Duration = Duration::from_millis(1500);
 
+fn resident_socket_up() -> bool {
+    !std::env::var("CATTUBE_YTDL_RESIDENT").is_ok_and(|v| v == "0")
+        && std::os::unix::net::UnixStream::connect(player::ytdl_server_socket()).is_ok()
+}
+
 /// Start mpv for a video (its own process group, stdin closed).
 pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String> {
     std::fs::create_dir_all(data.join("positions"))
         .map_err(|e| format!("Could not save playback positions ({e})"))?;
+    let direct_idle = direct_extract_enabled() && resident_socket_up();
+    let initial_resolve = if direct_idle {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (vid, langs, is_live) = (o.video_id.clone(), o.sub_langs.clone(), o.is_live);
+        let _ = std::thread::Builder::new()
+            .name("cattube-resolve".into())
+            .spawn(move || {
+                let _ = tx.send(resolve_via_server(&vid, &langs, is_live));
+            });
+        Some(rx)
+    } else {
+        None
+    };
     let find = |n: &str| cattube_core::process::find_executable(n);
     let js = player::js_runtime(data, &find);
-    let argv = player::mpv_argv(
-        o,
-        data,
-        &cattube_core::env::data_dir(),
-        &player::player_socket(),
-        js.as_deref(),
-    );
+    let argv = if direct_idle {
+        player::mpv_argv_idle(
+            o,
+            data,
+            &cattube_core::env::data_dir(),
+            &player::player_socket(),
+            js.as_deref(),
+        )
+    } else {
+        player::mpv_argv(
+            o,
+            data,
+            &cattube_core::env::data_dir(),
+            &player::player_socket(),
+            js.as_deref(),
+        )
+    };
     // One screen, one player: another CatTube (`--play`, a second window)
     // shares this socket, so whichever starts a video closes the other's
     // first (keeping its place).
@@ -1045,8 +1177,13 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
         _ => format!("Could not start the player ({e})"),
     })?;
     Ok(match reader {
-        Some(r) => PlayerHandle::with_log_pipe(child, r),
-        None => PlayerHandle::new(child),
+        Some(r) => PlayerHandle::with_log_pipe(child, r, direct_idle, initial_resolve),
+        None => {
+            let mut h = PlayerHandle::new(child);
+            h.direct_idle = direct_idle;
+            h.initial_resolve = std::sync::Arc::new(Mutex::new(initial_resolve));
+            h
+        }
     })
 }
 
@@ -1072,8 +1209,12 @@ pub struct Session {
     pub cache: PathBuf,
     pub autoplay: crate::prefs::Autoplay,
     pub sponsorblock: Option<Vec<String>>,
+    pub max_height: u32,
     pub codec: cattube_core::player::Codec,
     pub hdr: bool,
+    pub sub_langs: String,
+    pub subs_on: bool,
+    pub start: f64,
     /// Videos after this one (a playlist or a row), in order.
     pub queue: Vec<yt::Tile>,
     /// Back in the player hid the video (`hide_on_back`): told the title
@@ -1460,23 +1601,34 @@ enum ConnectError {
     TimedOut,
 }
 
-/// Wait for mpv to answer with a playing video (up to a minute).
-fn connect_to_player(player: &PlayerHandle, socket: &Path) -> Result<mpv::IpcConn, ConnectError> {
+/// Wait for mpv to answer (either actively playing or idle when booted for
+/// parallel direct-stream loading). Up to a minute.
+fn connect_to_player(
+    player: &PlayerHandle,
+    socket: &Path,
+    wait_playback: bool,
+) -> Result<mpv::IpcConn, ConnectError> {
     let started = Instant::now();
     loop {
         if player.exited() {
             return Err(ConnectError::Exited);
         }
-        if let Ok(mut c) = mpv::IpcConn::connect(socket)
-            && c.get_f64("time-pos").is_some()
-        {
-            return Ok(c);
+        if let Ok(mut c) = mpv::IpcConn::connect(socket) {
+            let ready = if wait_playback {
+                c.get_f64("time-pos").is_some()
+            } else {
+                c.command(&[Arg::Str("get_property"), Arg::Str("idle-active")])
+                    .is_ok()
+            };
+            if ready {
+                return Ok(c);
+            }
         }
         if started.elapsed() > Duration::from_secs(60) {
             player.stop_and_reap();
             return Err(ConnectError::TimedOut);
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(if wait_playback { 250 } else { 50 }));
     }
 }
 
@@ -1665,6 +1817,343 @@ fn change_quality(
     );
 }
 
+fn change_quality_direct(
+    conn: &mut mpv::IpcConn,
+    s: &Session,
+    title: &str,
+    sel: &stream::SelectedPlayback,
+    height: u32,
+    at: f64,
+    chapters_path: Option<&str>,
+) {
+    let fmt = player::format_string(height, s.codec, s.hdr, s.low_power);
+    let _ = conn.command(&[
+        Arg::Str("set_property"),
+        Arg::Str("ytdl-format"),
+        Arg::Str(&fmt),
+    ]);
+    let _ = conn.command(&[
+        Arg::Str("set_property"),
+        Arg::Str("user-data/cattube/loaded"),
+        Arg::Str(""),
+    ]);
+    conn.clear_observed("eof-reached");
+    conn.clear_observed("user-data/cattube/loaded");
+    let media_title = safe_media_title(title);
+    let uri = stream::edl_uri(&sel.video_url, sel.audio_url.as_deref());
+    let opts = stream::loadfile_options(
+        at,
+        sel.is_live,
+        &media_title,
+        &sel.user_agent,
+        chapters_path,
+        &sel.headers,
+    );
+    loadfile_replace(conn, &uri, &opts);
+    osd(
+        conn,
+        &format!("Quality: {}", player::resolution_label(height)),
+    );
+}
+
+struct ChapterFile(Option<PathBuf>);
+impl ChapterFile {
+    fn path(&self) -> Option<&str> {
+        self.0.as_deref().and_then(|p| p.to_str())
+    }
+    fn replace(&mut self, next: Option<PathBuf>) {
+        if let Some(old) = self.0.take() {
+            let _ = std::fs::remove_file(old);
+        }
+        self.0 = next;
+    }
+}
+impl Drop for ChapterFile {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+fn write_chapters_file(chapters: &[stream::Chapter], duration: Option<f64>) -> Option<PathBuf> {
+    if chapters.is_empty() {
+        return None;
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = player::player_socket()
+        .with_file_name(format!("cattube-ch-{}-{seq}.ffmeta", std::process::id()));
+    let content = stream::ffmetadata_chapters(chapters, duration);
+    cattube_core::util::write_atomic(&path, &content).ok()?;
+    Some(path)
+}
+
+fn attach_external_tracks(
+    conn: &mut mpv::IpcConn,
+    sel: &stream::SelectedPlayback,
+    resolved: &ResolvedStream,
+    subs_on: bool,
+) {
+    for a in &sel.extra_audios {
+        let _ = conn.command(&[
+            Arg::Str("audio-add"),
+            Arg::Str(&a.url),
+            Arg::Str("auto"),
+            Arg::Str(&a.title),
+            Arg::Str(&a.language),
+        ]);
+    }
+    if !subs_on {
+        let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("sid"), Arg::Str("no")]);
+    }
+    let pick_idx = subs_on.then(|| {
+        resolved
+            .subtitles
+            .iter()
+            .position(|sub| !sub.auto)
+            .unwrap_or(0)
+    });
+    let mut names = Vec::with_capacity(resolved.subtitles.len());
+    for (i, sub) in resolved.subtitles.iter().enumerate() {
+        let label = if sub.name.trim().is_empty() {
+            &sub.lang
+        } else {
+            &sub.name
+        };
+        let flag = if pick_idx == Some(i) {
+            "select"
+        } else {
+            "auto"
+        };
+        let _ = conn.command(&[
+            Arg::Str("sub-add"),
+            Arg::Str(&sub.url),
+            Arg::Str(flag),
+            Arg::Str(label),
+            Arg::Str(&sub.lang),
+        ]);
+        names.push(label.replace(';', ","));
+    }
+    let _ = conn.command(&[
+        Arg::Str("script-message"),
+        Arg::Str("cattube-subs"),
+        Arg::Str(&names.join(";")),
+    ]);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectLoadCheck {
+    Loaded,
+    Failed,
+    PlayerGone,
+}
+
+fn wait_available_at(player: &PlayerHandle, available_at: Option<u64>) -> bool {
+    let Some(target) = available_at else {
+        return true;
+    };
+    let current = now();
+    if target <= current {
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_secs((target - current).min(4));
+    while Instant::now() < deadline {
+        if player.exited() {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !player.exited()
+}
+
+fn wait_resolve(
+    player: &PlayerHandle,
+    rx: &std::sync::mpsc::Receiver<Result<ResolvedStream, String>>,
+) -> Option<Result<ResolvedStream, String>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if player.exited() {
+            return None;
+        }
+        match rx.try_recv() {
+            Ok(res) => return Some(res),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Some(Err("Stream resolver stopped".into()));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return Some(Err("Stream resolution timed out".into()));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_direct_load(
+    conn: &mut mpv::IpcConn,
+    player: &PlayerHandle,
+    id: &str,
+) -> DirectLoadCheck {
+    let started = Instant::now();
+    let mut saw_loading = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        if conn.closed() || player.exited() {
+            return DirectLoadCheck::PlayerGone;
+        }
+        let loaded = conn.get_str("user-data/cattube/loaded").as_deref() == Some(id)
+            || conn.get_str("path").is_some_and(|p| p.contains(id));
+        let has_pos = conn.get_f64("time-pos").is_some();
+        let eof = conn.get_bool("eof-reached").unwrap_or(false);
+        if loaded && has_pos && !eof {
+            return DirectLoadCheck::Loaded;
+        }
+        match conn.get_bool("idle-active") {
+            Some(false) => saw_loading = true,
+            Some(true)
+                if (saw_loading || started.elapsed() >= Duration::from_millis(1500))
+                    && !has_pos =>
+            {
+                return DirectLoadCheck::Failed;
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    DirectLoadCheck::Failed
+}
+
+fn spawn_resolve_task(
+    video_id: String,
+    sub_langs: String,
+    is_live: bool,
+) -> std::sync::mpsc::Receiver<Result<ResolvedStream, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _ = std::thread::Builder::new()
+        .name("cattube-resolve".into())
+        .spawn(move || {
+            let _ = tx.send(resolve_via_server(&video_id, &sub_langs, is_live));
+        });
+    rx
+}
+
+struct LoadTarget<'a> {
+    tile: &'a yt::Tile,
+    height: u32,
+    start: f64,
+}
+
+fn load_resolved_or_fallback(
+    conn: &mut mpv::IpcConn,
+    player: &PlayerHandle,
+    s: &Session,
+    target: LoadTarget<'_>,
+    resolved_res: Option<Result<ResolvedStream, String>>,
+    chapter_file: &mut ChapterFile,
+) -> Result<Option<(ResolvedStream, stream::SelectedPlayback)>, ()> {
+    let cur = target.tile;
+    let height = target.height;
+    let start = target.start;
+    let fmt = player::format_string(height, s.codec, s.hdr, s.low_power);
+    if let Some(Ok(resolved)) = resolved_res
+        && let Some(sel) = stream::select_stream(&resolved, height, s.codec, s.hdr, s.low_power)
+    {
+        if !wait_available_at(player, sel.available_at) {
+            return Err(());
+        }
+        let ch_path = write_chapters_file(&resolved.chapters, resolved.duration);
+        chapter_file.replace(ch_path);
+        let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("yes")]);
+        let _ = conn.command(&[
+            Arg::Str("set_property"),
+            Arg::Str("ytdl-format"),
+            Arg::Str(&fmt),
+        ]);
+        let _ = conn.command(&[
+            Arg::Str("set_property"),
+            Arg::Str("user-data/cattube/loaded"),
+            Arg::Str(""),
+        ]);
+        conn.clear_observed("eof-reached");
+        conn.clear_observed("duration");
+        conn.clear_observed("metadata/by-key/ytdl_is_live");
+        conn.clear_observed("user-data/cattube/loaded");
+        let _ = conn.command(&[
+            Arg::Str("script-message"),
+            Arg::Str("cattube-video"),
+            Arg::Str(&cur.id),
+            Arg::Str(if sel.is_live { "yes" } else { "no" }),
+        ]);
+        let title = safe_media_title(if cur.title.trim().is_empty() {
+            &resolved.title
+        } else {
+            &cur.title
+        });
+        let uri = stream::edl_uri(&sel.video_url, sel.audio_url.as_deref());
+        let opts = stream::loadfile_options(
+            start,
+            sel.is_live,
+            &title,
+            &sel.user_agent,
+            chapter_file.path(),
+            &sel.headers,
+        );
+        loadfile_replace(conn, &uri, &opts);
+        let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("pause"), Arg::Str("no")]);
+        match wait_for_direct_load(conn, player, &cur.id) {
+            DirectLoadCheck::Loaded => {
+                let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("no")]);
+                attach_external_tracks(conn, &sel, &resolved, s.subs_on);
+                return Ok(Some((resolved, sel)));
+            }
+            DirectLoadCheck::PlayerGone => return Err(()),
+            DirectLoadCheck::Failed => {}
+        }
+    }
+
+    // Fallback: let mpv's ytdl_hook resolve watch_url directly.
+    chapter_file.replace(None);
+    let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("ytdl"), Arg::Str("yes")]);
+    let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("idle"), Arg::Str("no")]);
+    let _ = conn.command(&[
+        Arg::Str("set_property"),
+        Arg::Str("ytdl-format"),
+        Arg::Str(&fmt),
+    ]);
+    let _ = conn.command(&[
+        Arg::Str("script-message"),
+        Arg::Str("cattube-video"),
+        Arg::Str(&cur.id),
+    ]);
+    let live = cur.kind == yt::Kind::Live;
+    let title = safe_media_title(&cur.title);
+    let opts = match (
+        live,
+        start.is_finite() && start > 0.0,
+        title.trim().is_empty(),
+    ) {
+        (true, _, true) | (false, false, true) => String::new(),
+        (true, _, false) | (false, false, false) => {
+            format!("force-media-title={}", mpv::option_value(&title))
+        }
+        (false, true, true) => format!("start={start:.3}"),
+        (false, true, false) => format!(
+            "start={start:.3},force-media-title={}",
+            mpv::option_value(&title)
+        ),
+    };
+    conn.clear_observed("eof-reached");
+    conn.clear_observed("duration");
+    conn.clear_observed("metadata/by-key/ytdl_is_live");
+    conn.clear_observed("user-data/cattube/loaded");
+    loadfile_replace(conn, &cur.watch_url(), &opts);
+    let _ = conn.command(&[Arg::Str("set_property"), Arg::Str("pause"), Arg::Str("no")]);
+    if !wait_for_video(conn, player, &cur.id) {
+        return Err(());
+    }
+    Ok(None)
+}
+
 /// The newest valid request for the related-videos browser.
 fn related_request(msgs: &[Vec<String>]) -> Option<String> {
     msgs.iter()
@@ -1689,8 +2178,12 @@ fn spawn_related(
         cache: s.cache.clone(),
         autoplay: s.autoplay,
         sponsorblock: None,
+        max_height: s.max_height,
         codec: s.codec,
         hdr: s.hdr,
+        sub_langs: String::new(),
+        subs_on: false,
+        start: 0.0,
         queue: Vec::new(),
         on_hide: None,
         on_video: None,
@@ -1735,7 +2228,8 @@ fn wait_for_video(conn: &mut mpv::IpcConn, player: &PlayerHandle, id: &str) -> b
         if conn.closed() || player.exited() {
             return false;
         }
-        let switched = conn.get_str("path").is_some_and(|p| p.contains(id));
+        let switched = conn.get_str("user-data/cattube/loaded").as_deref() == Some(id)
+            || conn.get_str("path").is_some_and(|p| p.contains(id));
         if switched
             && conn.get_f64("time-pos").is_some()
             && !conn.get_bool("eof-reached").unwrap_or(false)
@@ -1762,7 +2256,8 @@ pub fn spawn_watcher(
         .spawn(move || {
             let socket = player::player_socket();
             let mut ended = Ended::default();
-            let mut conn = match connect_to_player(&player, &socket) {
+            let initial_rx = player.take_initial_resolve();
+            let mut conn = match connect_to_player(&player, &socket, !player.direct_idle) {
                 Ok(conn) => conn,
                 Err(why) => {
                     let (status, stopped_by_app, log) =
@@ -1791,9 +2286,18 @@ pub fn spawn_watcher(
                 && conn
                     .observe_property(4, "metadata/by-key/ytdl_is_live")
                     .is_ok();
+            let _ = conn.observe_property(5, "user-data/cattube/loaded");
             let mut queue = s.queue.clone();
             let mut history: Vec<yt::Tile> = Vec::new();
             let mut cur = first;
+            let mut cur_height = s.max_height;
+            let mut cur_start = s.start;
+            let mut pending_rx = initial_rx;
+            let mut need_load = player.direct_idle;
+            let mut prefetched: Option<(String, ResolvedStream)> = None;
+            let mut cur_chapter_file = ChapterFile(None);
+            let mut started_any_playback = false;
+            let mut initial_load_failed = false;
             let related_requests = std::sync::Arc::new(RelatedRequests::default());
             'videos: loop {
                 cattube_core::watched::record(&player::data_home(), &cur);
@@ -1801,11 +2305,6 @@ pub fn spawn_watcher(
                     on_video(cur.clone());
                 }
                 related_requests.begin();
-                let _ = conn.command(&[
-                    Arg::Str("script-message"),
-                    Arg::Str("cattube-video"),
-                    Arg::Str(&cur.id),
-                ]);
                 // Network jobs never block Back, stop or the control bar.
                 let mut next_id = if s.autoplay == crate::prefs::Autoplay::Next {
                     queue.first().cloned()
@@ -1849,12 +2348,59 @@ pub fn spawn_watcher(
                     Arg::Str("cattube-segments"),
                     Arg::Str(""),
                 ]);
+
+                let mut cur_resolved: Option<ResolvedStream> = None;
+                if need_load {
+                    let resolved_res = if prefetched.as_ref().is_some_and(|(id, _)| id == &cur.id) {
+                        prefetched.take().map(|(_, r)| Ok(r))
+                    } else if let Some(rx) = pending_rx.take() {
+                        match wait_resolve(&player, &rx) {
+                            Some(res) => Some(res),
+                            None => {
+                                initial_load_failed = !started_any_playback;
+                                break 'videos;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    match load_resolved_or_fallback(
+                        &mut conn,
+                        &player,
+                        &s,
+                        LoadTarget {
+                            tile: &cur,
+                            height: cur_height,
+                            start: cur_start,
+                        },
+                        resolved_res,
+                        &mut cur_chapter_file,
+                    ) {
+                        Ok(Some((resolved, _sel))) => {
+                            cur_resolved = Some(resolved);
+                        }
+                        Ok(None) => {}
+                        Err(()) => {
+                            initial_load_failed = !started_any_playback;
+                            break 'videos;
+                        }
+                    }
+                } else {
+                    let _ = conn.command(&[
+                        Arg::Str("script-message"),
+                        Arg::Str("cattube-video"),
+                        Arg::Str(&cur.id),
+                    ]);
+                }
+                started_any_playback = true;
+
                 let mut skipped: Vec<f64> = Vec::new();
                 let mut last = (0.0f64, None::<f64>);
                 // A live stream has no place to come back to (its time is
                 // the stream's, and mpv cannot seek a start into it): it is
-                // never saved. Known from the card, else observed from mpv.
-                let mut live = cur.kind == yt::Kind::Live;
+                // never saved. Known from the card, resolver, else observed from mpv.
+                let mut live =
+                    cur.kind == yt::Kind::Live || cur_resolved.as_ref().is_some_and(|r| r.is_live);
                 let mut live_asked = live;
                 let mut card_until: Option<Instant> = None;
                 let mut last_count: Option<u64> = None;
@@ -1868,6 +2414,13 @@ pub fn spawn_watcher(
                 let mut thumb_job = next_id.as_ref().map(|n| {
                     fetch_card_thumbnail(s.cache.clone(), n.id.clone(), width, s.low_power)
                 });
+                let mut pending_reattach: Option<stream::SelectedPlayback> = None;
+                let mut prefetch_for: Option<String> = None;
+                let mut prefetch_rx: Option<
+                    std::sync::mpsc::Receiver<Result<ResolvedStream, String>>,
+                > = None;
+                let mut last_prefetch_probe = Instant::now();
+                let video_started_at = Instant::now();
                 loop {
                     match next_rx.try_recv() {
                         Ok(next) => {
@@ -1937,12 +2490,27 @@ pub fn spawn_watcher(
                             Err(_) => {}
                         }
                     }
+                    if let Some(rx) = &prefetch_rx {
+                        match rx.try_recv() {
+                            Ok(Ok(resolved)) => {
+                                if let Some(id) = prefetch_for.as_ref() {
+                                    prefetched = Some((id.clone(), resolved));
+                                }
+                                prefetch_rx = None;
+                            }
+                            Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                prefetch_rx = None;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
                     let paused = observed && conn.observed_bool("pause").unwrap_or(false);
                     let poll_pos = !segments.is_empty() && !paused;
                     let wait = if card_until.is_some()
                         || next_pending
                         || segments_pending
                         || thumb_job.is_some()
+                        || pending_reattach.is_some()
                     {
                         Duration::from_millis(250)
                     } else if poll_pos || !observed {
@@ -1956,6 +2524,16 @@ pub fn spawn_watcher(
                             ended.positions.push((cur.id.clone(), last.0, last.1));
                         }
                         break 'videos;
+                    }
+                    if pending_reattach.is_some()
+                        && let Some(resolved) = &cur_resolved
+                    {
+                        let loaded = (observed
+                            && conn.observed_str("user-data/cattube/loaded") == Some(&cur.id))
+                            || conn.get_str("user-data/cattube/loaded").as_deref() == Some(&cur.id);
+                        if loaded && let Some(sel) = pending_reattach.take() {
+                            attach_external_tracks(&mut conn, &sel, resolved, s.subs_on);
+                        }
                     }
                     let dur = if observed {
                         conn.observed_f64("duration").filter(|d| *d > 0.0)
@@ -1993,6 +2571,33 @@ pub fn spawn_watcher(
                     } else if dur.is_some() {
                         last.1 = dur;
                     }
+                    // Pre-resolve the upcoming video near the end of playback so
+                    // switching to Up Next avoids waiting on extraction.
+                    if direct_extract_enabled()
+                        && let Some(next) = &next_id
+                        && prefetch_rx.is_none()
+                        && prefetch_for.as_deref() != Some(next.id.as_str())
+                        && prefetched.as_ref().is_none_or(|(id, _)| id != &next.id)
+                    {
+                        if !poll_pos && last_prefetch_probe.elapsed() >= Duration::from_secs(5) {
+                            last_prefetch_probe = Instant::now();
+                            if let Some(p) = conn.get_f64("time-pos") {
+                                last = (p, dur);
+                            }
+                        }
+                        let should_prefetch = dur
+                            .is_some_and(|d| d >= 60.0 && last.0 > 0.0 && (d - last.0) <= 45.0)
+                            || (dur.is_none_or(|d| d < 60.0)
+                                && video_started_at.elapsed() >= Duration::from_secs(15));
+                        if should_prefetch && resident_socket_up() {
+                            prefetch_for = Some(next.id.clone());
+                            prefetch_rx = Some(spawn_resolve_task(
+                                next.id.clone(),
+                                s.sub_langs.clone(),
+                                next.kind == yt::Kind::Live,
+                            ));
+                        }
+                    }
                     let want = |name: &str| {
                         msgs.iter()
                             .filter(|m| m.first().map(String::as_str) == Some(name))
@@ -2018,11 +2623,41 @@ pub fn spawn_watcher(
                     }
                     // Quality from the control bar: same video, same place.
                     if let Some(h) = want("cattube-quality").and_then(|h| h.parse::<u32>().ok()) {
+                        cur_height = h;
                         if !live && let Some(p) = conn.get_f64("time-pos") {
                             last = (p, dur);
                         }
                         conn.clear_observed("eof-reached");
-                        change_quality(&mut conn, &s, &cur, h, last.0, live);
+                        if let Some(resolved) = &cur_resolved
+                            && let Some(sel) =
+                                stream::select_stream(resolved, h, s.codec, s.hdr, s.low_power)
+                        {
+                            let title = if cur.title.trim().is_empty() {
+                                resolved.title.as_str()
+                            } else {
+                                cur.title.as_str()
+                            };
+                            change_quality_direct(
+                                &mut conn,
+                                &s,
+                                title,
+                                &sel,
+                                h,
+                                last.0,
+                                cur_chapter_file.path(),
+                            );
+                            pending_reattach = Some(sel);
+                        } else {
+                            if cur_resolved.is_some() {
+                                let _ = conn.command(&[
+                                    Arg::Str("set_property"),
+                                    Arg::Str("ytdl"),
+                                    Arg::Str("yes"),
+                                ]);
+                                cur_resolved = None;
+                            }
+                            change_quality(&mut conn, &s, &cur, h, last.0, live);
+                        }
                     }
                     // A new request supersedes prior work, including replies from
                     // the previous video. The Lua browser preserves its focus as
@@ -2095,26 +2730,66 @@ pub fn spawn_watcher(
                                 queue.remove(0);
                             }
                         }
-                        let title = safe_media_title(&n.title);
-                        let opts = format!("force-media-title={}", mpv::option_value(&title));
-                        conn.clear_observed("eof-reached");
-                        conn.clear_observed("duration");
-                        conn.clear_observed("metadata/by-key/ytdl_is_live");
-                        loadfile_replace(&mut conn, &n.watch_url(), &opts);
-                        // The end left it paused on the last frame (for the card).
-                        let _ = conn.command(&[
-                            Arg::Str("set_property"),
-                            Arg::Str("pause"),
-                            Arg::Str("no"),
-                        ]);
                         cur = n;
-                        // Wait for the replacement video itself to load (not the previous
-                        // video's leftover `time-pos` or `eof-reached`).
-                        if !wait_for_video(&mut conn, &player, &cur.id) {
-                            break 'videos;
+                        cur_start = 0.0;
+                        if direct_extract_enabled() {
+                            if prefetched.as_ref().is_some_and(|(id, _)| id == &cur.id) {
+                                pending_rx = None;
+                                need_load = true;
+                            } else if prefetch_for.as_deref() == Some(cur.id.as_str())
+                                && prefetch_rx.is_some()
+                            {
+                                pending_rx = prefetch_rx.take();
+                                need_load = true;
+                            } else if resident_socket_up() {
+                                pending_rx = Some(spawn_resolve_task(
+                                    cur.id.clone(),
+                                    s.sub_langs.clone(),
+                                    cur.kind == yt::Kind::Live,
+                                ));
+                                need_load = true;
+                            } else {
+                                need_load = false;
+                            }
+                        } else {
+                            need_load = false;
+                        }
+                        if !need_load {
+                            let _ = conn.command(&[
+                                Arg::Str("set_property"),
+                                Arg::Str("ytdl"),
+                                Arg::Str("yes"),
+                            ]);
+                            let title = safe_media_title(&cur.title);
+                            let opts = format!("force-media-title={}", mpv::option_value(&title));
+                            conn.clear_observed("eof-reached");
+                            conn.clear_observed("duration");
+                            conn.clear_observed("metadata/by-key/ytdl_is_live");
+                            loadfile_replace(&mut conn, &cur.watch_url(), &opts);
+                            // The end left it paused on the last frame (for the card).
+                            let _ = conn.command(&[
+                                Arg::Str("set_property"),
+                                Arg::Str("pause"),
+                                Arg::Str("no"),
+                            ]);
+                            // Wait for the replacement video itself to load (not the previous
+                            // video's leftover `time-pos` or `eof-reached`).
+                            if !wait_for_video(&mut conn, &player, &cur.id) {
+                                break 'videos;
+                            }
                         }
                         continue 'videos;
                     }
+                }
+            }
+            drop(cur_chapter_file);
+            if initial_load_failed {
+                let (status, stopped_by_app, log) = player.failure_info(Duration::from_millis(200));
+                if let Some(msg) = classify_player_error(status, stopped_by_app, &log, false) {
+                    if !log.trim().is_empty() {
+                        eprintln!("cattube: playback failed:\n{}", log.trim());
+                    }
+                    ended.error = Some(msg.to_string());
                 }
             }
             related_requests.begin();
@@ -2220,7 +2895,7 @@ mod player_tests {
             .stderr(std::process::Stdio::from(writer2))
             .spawn()
             .unwrap();
-        let handle = PlayerHandle::with_log_pipe(child, reader);
+        let handle = PlayerHandle::with_log_pipe(child, reader, false, None);
         let t0 = Instant::now();
         while !handle.exited() && t0.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(10));
@@ -2349,8 +3024,12 @@ mod player_tests {
                 cache: PathBuf::new(),
                 autoplay: crate::prefs::Autoplay::Off,
                 sponsorblock: None,
+                max_height: 720,
                 codec: cattube_core::player::Codec::Avc,
                 hdr: false,
+                sub_langs: String::new(),
+                subs_on: false,
+                start: 0.0,
                 queue: Vec::new(),
                 on_hide: None,
                 on_video: None,
@@ -2577,5 +3256,253 @@ mod player_tests {
         assert!(marker.is_file());
         assert!(!sock.exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resolve_via_socket_parses_stream_and_reports_errors() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let sock = PathBuf::from(format!("/tmp/ct-res-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let server = std::thread::spawn(move || {
+            for i in 0..2 {
+                let (mut conn, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req = mpv::parse_json(line.trim()).unwrap();
+                assert_eq!(req.get("mode").and_then(mpv::Json::as_str), Some("resolve"));
+                if i == 0 {
+                    assert_eq!(
+                        req.get("video_id").and_then(mpv::Json::as_str),
+                        Some("WhWc3b3KhnY")
+                    );
+                    assert_eq!(req.get("sub_langs").and_then(mpv::Json::as_str), Some("en"));
+                    writeln!(
+                        conn,
+                        r#"{{"ok":true,"stream":{{"video_id":"WhWc3b3KhnY","title":"Spring","is_live":false,"duration":120.0,"user_agent":"UA","headers":{{}},"videos":[{{"url":"https://cdn.example/v.mp4","height":720,"fps":30,"vcodec":"avc1.64001f","acodec":"none","hdr":false,"protocol":"https","tbr":1800,"format_id":"136"}}],"audios":[{{"url":"https://cdn.example/a.webm","acodec":"opus","abr":128,"language":"en","title":"English","is_default":true,"protocol":"https"}}],"subtitles":[],"chapters":[]}}}}"#
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(conn, r#"{{"ok":false,"error":"blocked"}}"#).unwrap();
+                }
+            }
+        });
+
+        let ok = resolve_via_socket(&sock, "WhWc3b3KhnY", "en", false).unwrap();
+        assert_eq!(ok.video_id, "WhWc3b3KhnY");
+        assert_eq!(ok.videos.len(), 1);
+        assert_eq!(ok.audios.len(), 1);
+
+        let err = resolve_via_socket(&sock, "bad", "en", false).unwrap_err();
+        assert_eq!(err, "blocked");
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn change_quality_direct_sends_edl_and_ytdl_no() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(b.try_clone().unwrap());
+            let mut cmds = Vec::new();
+            while {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap_or(0) > 0 && {
+                    let req = mpv::parse_json(line.trim()).unwrap();
+                    let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+                    let cmd: Vec<String> = req
+                        .get("command")
+                        .unwrap()
+                        .as_arr()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    cmds.push(cmd);
+                    writeln!(b, r#"{{"error":"success","data":null,"request_id":{id}}}"#).is_ok()
+                }
+            } {}
+            cmds
+        });
+
+        let mut conn = mpv::IpcConn::from_stream(a).unwrap();
+        let s = Session {
+            low_power: true,
+            ctx: String::new(),
+            cache: PathBuf::new(),
+            autoplay: crate::prefs::Autoplay::Off,
+            sponsorblock: None,
+            max_height: 720,
+            codec: cattube_core::player::Codec::Avc,
+            hdr: false,
+            sub_langs: String::new(),
+            subs_on: false,
+            start: 0.0,
+            queue: Vec::new(),
+            on_hide: None,
+            on_video: None,
+        };
+        let sel = stream::SelectedPlayback {
+            video_url: "https://cdn.example/v.mp4".into(),
+            audio_url: Some("https://cdn.example/a.webm".into()),
+            extra_audios: Vec::new(),
+            is_live: false,
+            height: 720,
+            available_at: None,
+            user_agent: "UA/1.0".into(),
+            headers: Vec::new(),
+        };
+
+        change_quality_direct(&mut conn, &s, "Direct Quality", &sel, 720, 42.5, None);
+        drop(conn);
+        let cmds = server.join().unwrap();
+
+        assert!(
+            cmds.iter()
+                .any(|c| c.first().map(String::as_str) == Some("set_property")
+                    && c.get(1).map(String::as_str) == Some("ytdl-format"))
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.first().map(String::as_str) == Some("set_property")
+                    && c.get(1).map(String::as_str) == Some("user-data/cattube/loaded")
+                    && c.get(2).map(String::as_str) == Some(""))
+        );
+        let load = cmds
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("loadfile"))
+            .unwrap();
+        assert!(load[1].starts_with("edl://"));
+        assert!(load[1].contains("https://cdn.example/v.mp4"));
+        assert!(load[1].contains("https://cdn.example/a.webm"));
+        let opts = load.last().unwrap();
+        assert!(opts.contains("ytdl=no"));
+        assert!(opts.contains("start=42.500"));
+        assert!(
+            cmds.iter()
+                .any(|c| c.first().map(String::as_str) == Some("show-text")
+                    && c.get(1).is_some_and(|t| t == "Quality: 720p"))
+        );
+    }
+
+    #[test]
+    fn load_resolved_or_fallback_reverts_to_ytdl_hook_when_resolve_fails() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(b.try_clone().unwrap());
+            let mut cmds = Vec::new();
+            while {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap_or(0) > 0
+                    && {
+                        let req = mpv::parse_json(line.trim()).unwrap();
+                        let id = req.get("request_id").unwrap().as_f64().unwrap() as u64;
+                        let cmd: Vec<String> = req
+                            .get("command")
+                            .unwrap()
+                            .as_arr()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect();
+                        let reply = if cmd.first().map(String::as_str) == Some("get_property") {
+                            match cmd.get(1).map(String::as_str) {
+                                Some("user-data/cattube/loaded") => {
+                                    format!(
+                                        r#"{{"error":"success","data":"WhWc3b3KhnY","request_id":{id}}}"#
+                                    )
+                                }
+                                Some("time-pos") => {
+                                    format!(r#"{{"error":"success","data":1.5,"request_id":{id}}}"#)
+                                }
+                                Some("eof-reached") => {
+                                    format!(
+                                        r#"{{"error":"success","data":false,"request_id":{id}}}"#
+                                    )
+                                }
+                                _ => format!(
+                                    r#"{{"error":"success","data":null,"request_id":{id}}}"#
+                                ),
+                            }
+                        } else {
+                            format!(r#"{{"error":"success","data":null,"request_id":{id}}}"#)
+                        };
+                        cmds.push(cmd);
+                        writeln!(b, "{reply}").is_ok()
+                    }
+            } {}
+            cmds
+        });
+
+        let child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let player = PlayerHandle::new(child);
+        let mut conn = mpv::IpcConn::from_stream(a).unwrap();
+        let s = Session {
+            low_power: false,
+            ctx: String::new(),
+            cache: PathBuf::new(),
+            autoplay: crate::prefs::Autoplay::Off,
+            sponsorblock: None,
+            max_height: 1080,
+            codec: cattube_core::player::Codec::Vp9,
+            hdr: false,
+            sub_langs: "en".into(),
+            subs_on: true,
+            start: 10.0,
+            queue: Vec::new(),
+            on_hide: None,
+            on_video: None,
+        };
+        let cur = yt::Tile {
+            id: "WhWc3b3KhnY".into(),
+            title: "Fallback Test".into(),
+            ..Default::default()
+        };
+        let mut cf = ChapterFile(None);
+
+        let res = load_resolved_or_fallback(
+            &mut conn,
+            &player,
+            &s,
+            LoadTarget {
+                tile: &cur,
+                height: 1080,
+                start: 10.0,
+            },
+            Some(Err("boom".into())),
+            &mut cf,
+        );
+        drop(conn);
+        player.stop_and_reap();
+        let cmds = server.join().unwrap();
+
+        assert!(matches!(res, Ok(None)));
+        assert!(
+            cmds.iter()
+                .any(|c| c.as_slice() == ["set_property", "ytdl", "yes"])
+        );
+        assert!(
+            cmds.iter()
+                .any(|c| c.as_slice() == ["set_property", "idle", "no"])
+        );
+        let load = cmds
+            .iter()
+            .find(|c| c.first().map(String::as_str) == Some("loadfile"))
+            .unwrap();
+        assert_eq!(load[1], "https://www.youtube.com/watch?v=WhWc3b3KhnY");
     }
 }

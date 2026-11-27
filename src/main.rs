@@ -623,6 +623,7 @@ impl App {
             low_power: self.low_power,
             video_id: tile.id.clone(),
             title: tile.title.clone(),
+            is_live: tile.kind == ytc::Kind::Live,
             start,
             max_height: self.prefs.max_height,
             codec: self.prefs.codec,
@@ -673,8 +674,12 @@ impl App {
                         .prefs
                         .sponsorblock
                         .then(|| self.prefs.sb_categories.clone()),
+                    max_height: self.prefs.max_height,
                     codec: self.prefs.codec,
                     hdr: self.prefs.hdr,
+                    sub_langs: self.prefs.sub_lang.clone(),
+                    subs_on: self.prefs.subs_on,
+                    start,
                     queue,
                     on_video: Some(Box::new(move |tile| {
                         let _ = vtx.send(Msg::PlayerChanged(seq, tile));

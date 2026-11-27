@@ -17,18 +17,26 @@ switched off), and runs each request in a fork of the loaded process.
 """
 
 import array
+from collections import OrderedDict
 import json
 import os
+import re
 import select
 import signal
 import socket
 import stat
 import struct
 import sys
+import time
+from urllib.parse import parse_qs, urlparse
 
 # Preprocessed players kept (about 4 MB each; YouTube changes it every few days).
 KEEP_PLAYERS = 2
 MAX_REQUEST = 1 << 20
+RESOLVE_CACHE_MAX = 6
+RESOLVE_CACHE_TTL = 900
+_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_SUB_EXT_ORDER = ("vtt", "srt", "ttml", "srv3", "srv2", "srv1")
 
 
 def fallback(ytdlp_dir, args):
@@ -213,6 +221,16 @@ def start_jsc(deno, sock_path):
     return proc
 
 
+def _reap_children(child_pids):
+    for pid in list(child_pids):
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done != 0:
+                child_pids.discard(pid)
+        except ChildProcessError:
+            child_pids.discard(pid)
+
+
 def serve(sock_path, ytdlp_dir, deno=None):
     sys.path.insert(0, ytdlp_dir)
     import yt_dlp  # noqa: F401  (the slow part, done once)
@@ -244,6 +262,12 @@ def serve(sock_path, ytdlp_dir, deno=None):
         pass
 
     parent = os.getppid()
+    resolver_state = {
+        "yt_dlp": yt_dlp,
+        "js_runtimes": {"deno": {"path": deno}} if deno else {},
+        "ydl": {},
+        "cache": OrderedDict(),
+    }
     try:
         os.unlink(sock_path)
     except FileNotFoundError:
@@ -253,10 +277,11 @@ def serve(sock_path, ytdlp_dir, deno=None):
     os.chmod(sock_path, 0o600)
     srv.listen(8)
     srv.setblocking(False)
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # no zombies
+    child_pids = set()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         while os.getppid() == parent:
+            _reap_children(child_pids)
             read_fds = [srv]
             if watch_stdin:
                 read_fds.append(0)
@@ -278,7 +303,27 @@ def serve(sock_path, ytdlp_dir, deno=None):
                 continue
             if cache_dir:
                 prune_players(cache_dir)
-            if os.fork() == 0:
+            conn.setblocking(True)
+            conn.settimeout(5.0)
+            try:
+                req, fds = recv_request(conn)
+            except (OSError, ValueError):
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            if not fds and req.get("mode") == "resolve":
+                try:
+                    handle_resolve(conn, req, resolver_state)
+                finally:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                continue
+            pid = os.fork()
+            if pid == 0:
                 srv.close()
                 if jsc_proc and jsc_proc.stdin:
                     try:
@@ -293,9 +338,16 @@ def serve(sock_path, ytdlp_dir, deno=None):
                             os.close(devnull)
                     except OSError:
                         pass
-                handle(conn)  # never returns
+                handle_parsed(conn, req, fds)  # never returns
+            child_pids.add(pid)
             conn.close()
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     finally:
+        _reap_children(child_pids)
         if jsc_proc:
             try:
                 if jsc_proc.stdin:
@@ -481,13 +533,362 @@ def handle_stream(conn, req):
                 pass
 
 
+def _is_http_url(url):
+    return isinstance(url, str) and (url.startswith("https://") or url.startswith("http://"))
+
+
+def _url_expire_ts(url):
+    try:
+        parsed = urlparse(url)
+        q = parse_qs(parsed.query)
+        if "expire" in q and q["expire"]:
+            return int(q["expire"][0])
+        m = re.search(r"/expire/(\d+)(?:/|$)", parsed.path)
+        if m:
+            return int(m.group(1))
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _codec_family(vcodec):
+    if not vcodec or vcodec == "none":
+        return ""
+    if vcodec.startswith("av01"):
+        return "av01"
+    if vcodec.startswith("vp09") or vcodec == "vp9":
+        return "vp09"
+    if vcodec.startswith("avc1"):
+        return "avc1"
+    return vcodec.split(".", 1)[0]
+
+
+def _compact_videos(formats, is_live):
+    buckets = {}
+    for f in formats or ():
+        url = f.get("url")
+        if not _is_http_url(url):
+            continue
+        vcodec = f.get("vcodec") or ""
+        if not vcodec or vcodec == "none":
+            continue
+        proto = f.get("protocol") or ""
+        fid = str(f.get("format_id") or "")
+        note = (f.get("format_note") or "").lower()
+        if proto == "mhtml" or fid.startswith("sb") or "storyboard" in note:
+            continue
+        height = int(f.get("height") or 0)
+        fps = float(f.get("fps") or 0.0)
+        acodec = f.get("acodec") or "none"
+        dr = f.get("dynamic_range") or ""
+        hdr = bool(dr and dr != "SDR")
+        tbr = float(f.get("tbr") or f.get("vbr") or 0.0)
+        avail = f.get("available_at")
+        entry = {
+            "url": url,
+            "height": height,
+            "fps": fps,
+            "vcodec": vcodec,
+            "acodec": acodec,
+            "hdr": hdr,
+            "protocol": proto,
+            "tbr": tbr,
+            "format_id": fid,
+            "available_at": int(avail) if avail else None,
+            "_headers": f.get("http_headers") or {},
+        }
+        fps_bucket = 30 if fps <= 30.5 else 60
+        is_muxed = acodec not in ("", "none")
+        key = (height, _codec_family(vcodec), hdr, fps_bucket, is_muxed)
+        prev = buckets.get(key)
+        if prev is None or entry["tbr"] > prev["tbr"]:
+            buckets[key] = entry
+    ranked = sorted(
+        buckets.values(),
+        key=lambda x: (
+            1 if (is_live and x["acodec"] not in ("", "none")) or (not is_live and x["acodec"] in ("", "none")) else 0,
+            x["height"],
+            x["tbr"],
+        ),
+        reverse=True,
+    )
+    return ranked[:18]
+
+
+def _compact_audios(formats):
+    buckets = {}
+    for f in formats or ():
+        url = f.get("url")
+        if not _is_http_url(url):
+            continue
+        if (f.get("vcodec") or "none") != "none":
+            continue
+        acodec = f.get("acodec") or ""
+        if not acodec or acodec == "none":
+            continue
+        track = f.get("audio_track") if isinstance(f.get("audio_track"), dict) else {}
+        lang = str(f.get("language") or track.get("language") or "")
+        track_id = str(track.get("id") or "")
+        note = str(f.get("format_note") or "")
+        title = str(track.get("displayName") or note or lang)
+        is_default = bool(
+            track.get("audioIsDefault")
+            or (f.get("language_preference") or 0) > 0
+            or "original" in note.lower()
+            or "default" in note.lower()
+        )
+        abr = float(f.get("abr") or f.get("tbr") or 0.0)
+        avail = f.get("available_at")
+        ac_fam = "opus" if "opus" in acodec else ("mp4a" if acodec.startswith("mp4a") else acodec.split(".", 1)[0])
+        key = (lang, track_id, ac_fam)
+        entry = {
+            "url": url,
+            "acodec": acodec,
+            "abr": abr,
+            "language": lang,
+            "title": title,
+            "is_default": is_default,
+            "protocol": f.get("protocol") or "",
+            "available_at": int(avail) if avail else None,
+        }
+        prev = buckets.get(key)
+        if prev is None or (entry["is_default"], entry["abr"]) > (prev["is_default"], prev["abr"]):
+            buckets[key] = entry
+    ranked = sorted(buckets.values(), key=lambda x: (x["is_default"], x["abr"]), reverse=True)
+    return ranked[:12]
+
+
+def _sub_lang_matches(lang, bases):
+    low = lang.lower()
+    base = low.split("-", 1)[0]
+    if base not in bases:
+        return False
+    if low == base or low == f"{base}-orig":
+        return True
+    suffix = lang[len(base) + 1 :]
+    return bool(suffix) and suffix[0].isupper()
+
+
+def _compact_subtitles(info, sub_langs):
+    bases = {
+        s.strip().split("-", 1)[0].lower()
+        for s in (sub_langs or "").split(",")
+        if s.strip() and re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]+)*", s.strip())
+    }
+    if not bases:
+        return []
+    out = []
+    seen = set()
+    for auto, field in ((False, "subtitles"), (True, "automatic_captions")):
+        tracks_by_lang = info.get(field) or {}
+        if not isinstance(tracks_by_lang, dict):
+            continue
+        for lang, variants in tracks_by_lang.items():
+            if not _sub_lang_matches(lang, bases) or not isinstance(variants, list):
+                continue
+            best = None
+            best_rank = len(_SUB_EXT_ORDER) + 1
+            for var in variants:
+                if not isinstance(var, dict):
+                    continue
+                url = var.get("url")
+                if not _is_http_url(url) or "tlang=" in url:
+                    continue
+                ext = str(var.get("ext") or "").lower()
+                rank = _SUB_EXT_ORDER.index(ext) if ext in _SUB_EXT_ORDER else len(_SUB_EXT_ORDER)
+                if rank < best_rank:
+                    best_rank = rank
+                    best = (url, str(var.get("name") or lang))
+            if best and (lang, auto) not in seen:
+                seen.add((lang, auto))
+                out.append({"lang": lang, "name": best[1], "url": best[0], "auto": auto})
+    return out
+
+
+def _compact_chapters(info):
+    out = []
+    for c in info.get("chapters") or ():
+        if not isinstance(c, dict):
+            continue
+        title = str(c.get("title") or "").strip()
+        start = c.get("start_time")
+        if title and isinstance(start, (int, float)) and start >= 0:
+            out.append({"start_time": float(start), "title": title})
+    return out
+
+
+def _has_adequate_formats(info, is_live):
+    fmts = info.get("formats") or []
+    if is_live:
+        return any(_is_http_url(f.get("url")) and (f.get("vcodec") or "none") != "none" for f in fmts)
+    return any(
+        _is_http_url(f.get("url"))
+        and (f.get("vcodec") or "none") != "none"
+        and ((f.get("acodec") or "none") == "none" or (f.get("height") or 0) > 360)
+        for f in fmts
+    )
+
+
+class _QuietLogger:
+    def __init__(self):
+        self.last_error = ""
+
+    def debug(self, msg):
+        pass
+
+    def warning(self, msg):
+        pass
+
+    def error(self, msg):
+        self.last_error = str(msg)
+
+
+def _get_ydl(state, fast, is_live):
+    key = (fast, is_live)
+    entry = state["ydl"].get(key)
+    if entry is not None:
+        return entry
+    yt_args = {"skip": ["translated_subs"]}
+    if fast:
+        yt_args = {
+            "skip": ["translated_subs"] if is_live else ["translated_subs", "dash"],
+            "player_skip": ["webpage", "configs"],
+        }
+    logger = _QuietLogger()
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "no_color": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "noprogress": True,
+        "logger": logger,
+        "extractor_args": {"youtube": yt_args},
+    }
+    if state.get("js_runtimes"):
+        opts["js_runtimes"] = state["js_runtimes"]
+    ydl = state["yt_dlp"].YoutubeDL(opts)
+    state["ydl"][key] = (ydl, logger)
+    return ydl, logger
+
+
+def _cache_valid(entry, mono_now, wall_now):
+    if mono_now - entry["mono"] > RESOLVE_CACHE_TTL:
+        return False
+    stream = entry["stream"]
+    for item in stream.get("videos", ()) + stream.get("audios", ()):
+        exp = _url_expire_ts(item.get("url", ""))
+        if exp is not None and wall_now + 60 >= exp:
+            return False
+    return True
+
+
+def _resolve_video(video_id, sub_langs, is_live, state):
+    if not isinstance(video_id, str) or not _VIDEO_ID_RE.fullmatch(video_id):
+        raise ValueError("invalid video_id")
+    mono_now = time.monotonic()
+    wall_now = time.time()
+    cache = state["cache"]
+    cache_key = (video_id, sub_langs)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        if _cache_valid(cached, mono_now, wall_now):
+            cache.move_to_end(cache_key)
+            return cached["stream"]
+        del cache[cache_key]
+
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    info = None
+    last_err = None
+    fast_ydl, fast_log = _get_ydl(state, True, is_live)
+    fast_log.last_error = ""
+    try:
+        info = fast_ydl.extract_info(url, download=False)
+    except Exception as e:  # noqa: BLE001
+        last_err = e
+        info = None
+    if not info or not _has_adequate_formats(info, bool(info.get("is_live") or is_live)):
+        full_ydl, full_log = _get_ydl(state, False, is_live)
+        full_log.last_error = ""
+        try:
+            info = full_ydl.extract_info(url, download=False)
+        except Exception as e:  # noqa: BLE001
+            msg = full_log.last_error or fast_log.last_error
+            if msg:
+                raise ValueError(msg) from e
+            raise last_err or e from e
+    if not isinstance(info, dict):
+        raise ValueError("no video info")
+
+    actual_live = bool(info.get("is_live") or is_live)
+    videos = _compact_videos(info.get("formats"), actual_live)
+    if not videos:
+        raise ValueError("no playable video formats")
+    audios = _compact_audios(info.get("formats"))
+    raw_headers = videos[0].pop("_headers", None) or info.get("http_headers") or {}
+    for v in videos[1:]:
+        v.pop("_headers", None)
+    user_agent = str(raw_headers.get("User-Agent") or "")
+    headers = {
+        str(k): str(v)
+        for k, v in raw_headers.items()
+        if str(k).lower() not in ("user-agent", "accept-encoding") and v
+    }
+    duration = info.get("duration")
+    stream = {
+        "video_id": video_id,
+        "title": str(info.get("title") or ""),
+        "is_live": actual_live,
+        "duration": float(duration) if isinstance(duration, (int, float)) and duration > 0 else None,
+        "user_agent": user_agent,
+        "headers": headers,
+        "videos": videos,
+        "audios": audios,
+        "subtitles": _compact_subtitles(info, sub_langs),
+        "chapters": _compact_chapters(info),
+    }
+    cache[cache_key] = {"mono": mono_now, "stream": stream}
+    cache.move_to_end(cache_key)
+    while len(cache) > RESOLVE_CACHE_MAX:
+        cache.popitem(last=False)
+    return stream
+
+
+def handle_resolve(conn, req, state):
+    try:
+        video_id = req.get("video_id") or ""
+        sub_langs = str(req.get("sub_langs") or "")
+        is_live = bool(req.get("is_live", False))
+        stream = _resolve_video(video_id, sub_langs, is_live, state)
+        resp = {"ok": True, "stream": stream}
+    except Exception as e:  # noqa: BLE001
+        resp = {"ok": False, "error": str(e)}
+    try:
+        conn.sendall((json.dumps(resp) + "\n").encode())
+    except OSError:
+        pass
+
+
 def handle(conn):
+    conn.setblocking(True)
+    conn.settimeout(None)
+    try:
+        req, fds = recv_request(conn)
+    except BaseException:  # noqa: BLE001
+        try:
+            conn.close()
+        except OSError:
+            pass
+        os._exit(0)
+    handle_parsed(conn, req, fds)
+
+
+def handle_parsed(conn, req, fds):
     code = 1
     legacy_mode = False
     try:
         conn.setblocking(True)
         conn.settimeout(None)
-        req, fds = recv_request(conn)
         if not fds and req.get("mode") == "stream":
             handle_stream(conn, req)
             os._exit(0)

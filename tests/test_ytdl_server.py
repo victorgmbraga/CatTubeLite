@@ -37,9 +37,41 @@ def make_fake_ytdlp(root):
         f.write("import yt_dlp; yt_dlp.main()\n")
     with open(os.path.join(pkg, "__init__.py"), "w", encoding="utf-8") as f:
         f.write(
-            "import sys\n"
+            "import json, os, sys\n"
+            "LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'extract_calls.jsonl')\n"
             "class YoutubeDL:\n"
             "    def __init__(self, opts=None): self.opts = opts or {}\n"
+            "    def extract_info(self, url, download=False):\n"
+            "        yt_args = (self.opts.get('extractor_args') or {}).get('youtube') or {}\n"
+            "        with open(LOG_PATH, 'a', encoding='utf-8') as lf:\n"
+            "            lf.write(json.dumps({'url': url, 'player_skip': yt_args.get('player_skip'), 'skip': yt_args.get('skip')}) + '\\n')\n"
+            "        if 'retry360vid' in url:\n"
+            "            if yt_args.get('player_skip'):\n"
+            "                return {\n"
+            "                    'title': 'Retry 360', 'is_live': False, 'duration': 90,\n"
+            "                    'http_headers': {'User-Agent': 'UA/Retry'},\n"
+            "                    'formats': [{'url': 'https://cdn.example/360.mp4', 'height': 360, 'fps': 30, 'vcodec': 'avc1.42001E', 'acodec': 'mp4a.40.2', 'protocol': 'https', 'tbr': 500, 'format_id': '18'}],\n"
+            "                }\n"
+            "            return {\n"
+            "                'title': 'Retry 1080', 'is_live': False, 'duration': 90,\n"
+            "                'http_headers': {'User-Agent': 'UA/Full'},\n"
+            "                'formats': [\n"
+            "                    {'url': 'https://cdn.example/1080.mp4', 'height': 1080, 'fps': 30, 'vcodec': 'avc1.640028', 'acodec': 'none', 'protocol': 'https', 'tbr': 3200, 'format_id': '137'},\n"
+            "                    {'url': 'https://cdn.example/audio.webm', 'vcodec': 'none', 'acodec': 'opus', 'abr': 128, 'language': 'en', 'format_note': 'Original', 'protocol': 'https'},\n"
+            "                ],\n"
+            "            }\n"
+            "        return {\n"
+            "            'title': 'Sample Video', 'is_live': False, 'duration': 200,\n"
+            "            'http_headers': {'User-Agent': 'UA/Test', 'Referer': 'https://www.youtube.com/'},\n"
+            "            'formats': [\n"
+            "                {'url': 'https://cdn.example/1080.mp4', 'height': 1080, 'fps': 30, 'vcodec': 'avc1.640028', 'acodec': 'none', 'protocol': 'https', 'tbr': 3200, 'format_id': '137'},\n"
+            "                {'url': 'https://cdn.example/360.mp4', 'height': 360, 'fps': 30, 'vcodec': 'avc1.42001E', 'acodec': 'mp4a.40.2', 'protocol': 'https', 'tbr': 500, 'format_id': '18'},\n"
+            "                {'url': 'https://cdn.example/audio.webm', 'vcodec': 'none', 'acodec': 'opus', 'abr': 128, 'language': 'en', 'format_note': 'Default', 'protocol': 'https'},\n"
+            "            ],\n"
+            "            'subtitles': {'en': [{'ext': 'vtt', 'url': 'https://www.youtube.com/api/timedtext?lang=en&fmt=vtt', 'name': 'English'}], 'fr': [{'ext': 'vtt', 'url': 'https://www.youtube.com/api/timedtext?lang=fr', 'name': 'French'}]},\n"
+            "            'automatic_captions': {'en': [{'ext': 'vtt', 'url': 'https://www.youtube.com/api/timedtext?lang=en&kind=asr&fmt=vtt', 'name': 'English (auto)'}], 'en-pt': [{'ext': 'vtt', 'url': 'https://www.youtube.com/api/timedtext?lang=pt&tlang=en', 'name': 'Translated'}]},\n"
+            "            'chapters': [{'start_time': 0, 'title': 'Intro'}, {'start_time': 60, 'title': 'Body'}],\n"
+            "        }\n"
             "def main():\n"
             "    args = sys.argv[1:]\n"
             "    sys.stdout.write('OUT:' + ' '.join(args) + '\\n')\n"
@@ -348,6 +380,84 @@ class YtdlServerTests(unittest.TestCase):
                     "assert.strictEqual(globalThis.__libLoaded, 1);\n"
                 )
             subprocess.run([shutil.which("node"), harness], check=True)
+
+    def test_serve_resolve_mode_cache_retry_and_validation(self):
+        def resolve_req(sock_path, payload):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.connect(sock_path)
+                s.sendall((json.dumps(payload) + "\n").encode())
+                chunks = []
+                while part := s.recv(65536):
+                    chunks.append(part)
+                return json.loads(b"".join(chunks))
+            finally:
+                s.close()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ytdlp_dir = os.path.join(tmp, "yt-dlp.d")
+            make_fake_ytdlp(ytdlp_dir)
+            sock_path = os.path.join(tmp, "ytdl.sock")
+            log_path = os.path.join(ytdlp_dir, "extract_calls.jsonl")
+
+            proc = subprocess.Popen(
+                [sys.executable, "-I", SERVER_PATH, "serve", sock_path, ytdlp_dir],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 5.0
+                while not os.path.exists(sock_path) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(os.path.exists(sock_path))
+
+                # 1. Resolve once -> uses player_skip fast path, filters tlang= & non-matching langs
+                r1 = resolve_req(sock_path, {"mode": "resolve", "video_id": "WhWc3b3KhnY", "sub_langs": "en", "is_live": False})
+                self.assertTrue(r1["ok"], r1)
+                stream = r1["stream"]
+                self.assertEqual(stream["title"], "Sample Video")
+                self.assertEqual([v["height"] for v in stream["videos"]], [1080, 360])
+                self.assertEqual(len(stream["audios"]), 1)
+                self.assertEqual(len(stream["chapters"]), 2)
+                sub_urls = [sub["url"] for sub in stream["subtitles"]]
+                self.assertFalse(any("tlang=" in u for u in sub_urls), sub_urls)
+                self.assertEqual({sub["lang"] for sub in stream["subtitles"]}, {"en"})
+
+                # 2. Second identical request hits RESOLVE_CACHE (extract_info not called again)
+                r2 = resolve_req(sock_path, {"mode": "resolve", "video_id": "WhWc3b3KhnY", "sub_langs": "en", "is_live": False})
+                self.assertTrue(r2["ok"])
+                self.assertEqual(r2["stream"]["videos"][0]["url"], stream["videos"][0]["url"])
+                with open(log_path, "r", encoding="utf-8") as f:
+                    calls = [json.loads(line) for line in f]
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0]["player_skip"], ["webpage", "configs"])
+
+                # 3. 360p-only fast-path triggers automatic retry without player_skip
+                r3 = resolve_req(sock_path, {"mode": "resolve", "video_id": "retry360vid", "sub_langs": "", "is_live": False})
+                self.assertTrue(r3["ok"], r3)
+                self.assertEqual([v["height"] for v in r3["stream"]["videos"]], [1080])
+                with open(log_path, "r", encoding="utf-8") as f:
+                    calls = [json.loads(line) for line in f]
+                self.assertEqual(len(calls), 3)
+                self.assertIsNotNone(calls[1]["player_skip"])
+                self.assertIsNone(calls[2]["player_skip"])
+
+                # 4. Invalid video_id returns ok=false error
+                r4 = resolve_req(sock_path, {"mode": "resolve", "video_id": "../bad", "sub_langs": "", "is_live": False})
+                self.assertEqual(r4, {"ok": False, "error": "invalid video_id"})
+
+                proc.stdin.close()
+                proc.stdin = None
+                self.assertEqual(proc.wait(timeout=5), 0)
+            finally:
+                if proc.stdin:
+                    proc.stdin.close()
+                if proc.stderr:
+                    proc.stderr.close()
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2)
 
 
 if __name__ == "__main__":
