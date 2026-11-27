@@ -77,15 +77,58 @@ pub fn yt_dlp_launcher(data: &Path) -> PathBuf {
     data.join("yt-dlp-unpacked")
 }
 
-/// The launcher's text: Python running the unpacked folder.
+/// The launcher's text: Python running the unpacked folder, or, while
+/// CatTube keeps yt-dlp loaded ([`ytdl_server_argv`]; mpv gets the two
+/// variables), a request to that copy.
 pub fn yt_dlp_launcher_script(data: &Path) -> String {
     let dir = yt_dlp_dir(data)
         .display()
         .to_string()
         .replace('\'', "'\\''");
     format!(
-        "#!/bin/sh\n# yt-dlp unpacked by CatTube, so Python keeps its compiled modules.\nexec python3 '{dir}' \"$@\"\n"
+        "#!/bin/sh\n# yt-dlp unpacked by CatTube, so Python keeps its compiled modules.\n\
+         if [ -n \"${YTDL_SERVER_ENV}\" ] && [ -S \"${YTDL_SOCKET_ENV}\" ]; then\n  \
+         exec python3 -I -S \"${YTDL_SERVER_ENV}\" run \"${YTDL_SOCKET_ENV}\" '{dir}' \"$@\"\nfi\n\
+         exec python3 '{dir}' \"$@\"\n"
     )
+}
+
+/// Set for mpv while the resident yt-dlp runs: its script and socket.
+pub const YTDL_SERVER_ENV: &str = "CATTUBE_YTDL_SERVER";
+pub const YTDL_SOCKET_ENV: &str = "CATTUBE_YTDL_SOCKET";
+
+/// The resident yt-dlp's script (in the player's UI folder).
+pub fn ytdl_server_script(ui: &Path) -> PathBuf {
+    ui.join("ytdl-server.py")
+}
+
+pub fn ytdl_server_socket() -> PathBuf {
+    crate::env::runtime_dir().join("cattube-ytdl.sock")
+}
+
+/// The command that keeps yt-dlp loaded between videos (`ytdl-server.py`):
+/// on a TV box starting yt-dlp, and the Deno that solves YouTube's
+/// JavaScript challenge, costs most of the wait for a video. `None` without
+/// the unpacked yt-dlp or the script. With Deno as `js`, it keeps one Deno
+/// with the player's functions ready too.
+pub fn ytdl_server_argv(data: &Path, ui: &Path, socket: &Path, js: Option<&str>) -> Option<Vec<String>> {
+    let script = ytdl_server_script(ui);
+    let dir = yt_dlp_dir(data);
+    if !script.is_file() || !dir.join("__main__.py").is_file() {
+        return None;
+    }
+    let mut v = vec![
+        "python3".to_string(),
+        "-I".to_string(),
+        script.display().to_string(),
+        "serve".to_string(),
+        socket.display().to_string(),
+        dir.display().to_string(),
+    ];
+    if let Some(deno) = js.and_then(|j| j.strip_prefix("deno:")) {
+        v.push(deno.to_string());
+    }
+    Some(v)
 }
 
 /// What mpv runs as yt-dlp: the unpacked copy once it is in place, else
@@ -1346,6 +1389,30 @@ mod tests {
             s.ends_with("exec python3 '/home/o'\\''neil/d/yt-dlp.d' \"$@\"\n"),
             "{s}"
         );
+        assert!(
+            s.contains("exec python3 -I -S \"$CATTUBE_YTDL_SERVER\" run \"$CATTUBE_YTDL_SOCKET\" '/home/o'\\''neil/d/yt-dlp.d' \"$@\""),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn resident_yt_dlp_needs_its_script_and_the_unpacked_copy() {
+        let root = std::env::temp_dir().join(format!("cattube-ytdl-srv-{}", std::process::id()));
+        let ui = root.join("ui");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(yt_dlp_dir(&root)).unwrap();
+        std::fs::create_dir_all(&ui).unwrap();
+        let sock = Path::new("/run/y.sock");
+        assert_eq!(ytdl_server_argv(&root, &ui, sock, None), None);
+        std::fs::write(ytdl_server_script(&ui), "").unwrap();
+        assert_eq!(ytdl_server_argv(&root, &ui, sock, None), None);
+        std::fs::write(yt_dlp_dir(&root).join("__main__.py"), "").unwrap();
+        let v = ytdl_server_argv(&root, &ui, sock, Some("quickjs:/usr/bin/qjs")).unwrap();
+        assert_eq!(v[3..5], ["serve".to_string(), "/run/y.sock".to_string()]);
+        assert_eq!(v.len(), 6, "only Deno is kept running: {v:?}");
+        let v = ytdl_server_argv(&root, &ui, sock, Some("deno:/d/deno")).unwrap();
+        assert_eq!(v.last().map(String::as_str), Some("/d/deno"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
