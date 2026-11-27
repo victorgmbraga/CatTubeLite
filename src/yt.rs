@@ -384,6 +384,34 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
     Ok(ytdlp_version(data))
 }
 
+/// Start (or restart, after yt-dlp changed) the yt-dlp that stays loaded
+/// between videos (see [`player::ytdl_server_argv`]). It ends by itself
+/// when CatTube does. `CATTUBE_YTDL_RESIDENT=0` turns it off.
+pub fn start_ytdl_server(data: &Path, old: Option<std::process::Child>) -> Option<std::process::Child> {
+    if let Some(mut c) = old {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if std::env::var("CATTUBE_YTDL_RESIDENT").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let find = |n: &str| cattube_core::process::find_executable(n);
+    let js = player::js_runtime(data, &find);
+    let argv = player::ytdl_server_argv(
+        data,
+        &cattube_core::env::data_dir(),
+        &player::ytdl_server_socket(),
+        js.as_deref(),
+    )?;
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| eprintln!("cattube: resident yt-dlp: {e}"))
+        .ok()
+}
+
 /// Which single-file yt-dlp an unpacked copy came from (kept in it).
 const YT_DLP_SOURCE: &str = ".cattube-source";
 
@@ -826,6 +854,12 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
     });
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).stdin(std::process::Stdio::null());
+    // mpv's yt-dlp launcher asks the resident yt-dlp when its socket is up.
+    cmd.env(
+        player::YTDL_SERVER_ENV,
+        player::ytdl_server_script(&cattube_core::env::data_dir()),
+    )
+    .env(player::YTDL_SOCKET_ENV, player::ytdl_server_socket());
     let reader = if let Some((reader, out_w, err_w)) = pipe {
         cmd.stdout(std::process::Stdio::from(out_w))
             .stderr(std::process::Stdio::from(err_w));

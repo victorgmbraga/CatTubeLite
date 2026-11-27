@@ -9,6 +9,7 @@ uninstall=0
 if [ "${1:-}" = "--uninstall" ]; then uninstall=1; shift; fi
 prefix="${1:-$HOME/.local}"
 files="bin/cattube share/cattube/cattube-osd.lua share/cattube/cattube-input.conf
+share/cattube/ytdl-server.py share/cattube/ytdl-jsc.js
 share/applications/io.github.coderastic.CatTube.desktop
 share/icons/hicolor/scalable/apps/io.github.coderastic.CatTube.svg
 share/pixmaps/io.github.coderastic.CatTube.png

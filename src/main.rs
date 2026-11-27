@@ -124,6 +124,8 @@ struct App {
     positions: HashMap<String, f64>,
     tools: Scan<String>,
     yt_dlp_ready: bool,
+    /// yt-dlp kept loaded between videos (`ytdl-server.py`).
+    ytdl_server: Option<std::process::Child>,
     /// Started with `--play`: close when the video ends.
     quit_after_play: bool,
     was_focused: bool,
@@ -186,6 +188,7 @@ impl App {
             positions: HashMap::new(),
             tools: Scan::Busy,
             yt_dlp_ready,
+            ytdl_server: None,
             quit_after_play: false,
             was_focused: true,
             search_generation: 0,
@@ -762,6 +765,10 @@ impl App {
             Msg::Tools(r) => {
                 let ok = r.is_ok();
                 self.yt_dlp_ready = ok || player::yt_dlp_path(&self.data).is_file();
+                if ok {
+                    // after ensure_tools: the unpacked yt-dlp is current
+                    self.ytdl_server = yt::start_ytdl_server(&self.data, self.ytdl_server.take());
+                }
                 self.tools = match r {
                     Ok(v) => Scan::Done(vec![v]),
                     Err(e) => {
@@ -1164,6 +1171,10 @@ impl eframe::App for App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        if let Some(mut s) = self.ytdl_server.take() {
+            let _ = s.kill();
+            let _ = s.wait();
+        }
         if let Some(p) = self.player.take() {
             if !p.exited() {
                 yt::checkpoint_player(&self.data);

@@ -18,6 +18,8 @@ D="dist/$NAME"
 install -Dm755 "${CARGO_TARGET_DIR:-target}/release/cattube" "$D/bin/cattube"
 install -Dm644 assets/cattube-osd.lua "$D/share/cattube/cattube-osd.lua"
 install -Dm644 assets/cattube-input.conf "$D/share/cattube/cattube-input.conf"
+install -Dm644 assets/ytdl-server.py "$D/share/cattube/ytdl-server.py"
+install -Dm644 assets/ytdl-jsc.js "$D/share/cattube/ytdl-jsc.js"
 install -Dm644 packaging/io.github.coderastic.CatTube.desktop "$D/share/applications/io.github.coderastic.CatTube.desktop"
 if [[ -n "${CATTUBE_LOGO:-}" ]]; then
   install -Dm644 "$CATTUBE_LOGO" "$D/share/pixmaps/io.github.coderastic.CatTube.png"
