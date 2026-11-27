@@ -1,13 +1,31 @@
-// Kept running by ytdl-server.py, after yt-dlp's own challenge solver (lib
-// and core). yt-dlp runs a new Deno for every video, which parses the whole
-// (preprocessed) YouTube player again: seconds on a TV box. Here the
-// player's n and sig functions are built once per player and reused.
-//   deno run ... ytdl-jsc.js SOCKET     until stdin closes
-// Request: what yt-dlp would pass to jsc(), plus `key` (the player's URL).
-// Answer: what jsc() would return.
+// Kept running by ytdl-server.py. yt-dlp runs a new Deno for every video,
+// which parses the whole (preprocessed) YouTube player again: seconds on a TV
+// box. Here the player's n and sig functions are built once per player and
+// reused, and yt-dlp's solver library (meriyah/astring) is loaded lazily only
+// on a full-player miss.
+//   deno run ... ytdl-jsc.js SOCKET [LIB_JS]     until stdin closes
+// Request: `cached` probe, `preprocessed`, or `player`, plus `key` (player URL).
+// Answer: `{type: 'miss'}` for an uncached probe, or what jsc() would return.
 
+const [sockPath, libPath] = Deno.args;
 const KEEP = 2;
 const solvers = new Map();
+let jscFn = typeof globalThis.__cattube_jsc === 'function'
+  ? globalThis.__cattube_jsc
+  : (typeof jsc === 'function' ? jsc : null);
+
+function loadJsc() {
+  if (jscFn) return jscFn;
+  if (libPath) {
+    const code = Deno.readTextFileSync(libPath);
+    (0, eval)(code);
+    jscFn = typeof globalThis.__cattube_jsc === 'function'
+      ? globalThis.__cattube_jsc
+      : (typeof jsc === 'function' ? jsc : null);
+  }
+  if (!jscFn) throw new Error('jsc solver library not loaded');
+  return jscFn;
+}
 
 function solversFor(key, prepared) {
   let s = solvers.get(key);
@@ -20,18 +38,10 @@ function solversFor(key, prepared) {
   return s;
 }
 
-function solve(input) {
-  if (input.type === 'player') {
-    const output = jsc({ ...input, output_preprocessed: true });
-    if (output.type === 'result' && output.preprocessed_player) {
-      solversFor(input.key, output.preprocessed_player);
-    }
-    return output;
-  }
-  const s = solversFor(input.key, input.preprocessed_player);
+function runSolvers(s, requests) {
   return {
     type: 'result',
-    responses: input.requests.map((req) => {
+    responses: requests.map((req) => {
       const solver = s[req.type];
       if (!solver) return { type: 'error', error: `Failed to extract ${req.type} function` };
       try {
@@ -44,6 +54,26 @@ function solve(input) {
       }
     }),
   };
+}
+
+function solve(input) {
+  if (input.type === 'cached') {
+    const s = solvers.get(input.key);
+    if (!s) return { type: 'miss' };
+    // Refresh insertion order so the active player stays cached.
+    solvers.delete(input.key);
+    solvers.set(input.key, s);
+    return runSolvers(s, input.requests);
+  }
+  if (input.type === 'player') {
+    const output = loadJsc()({ ...input, output_preprocessed: true });
+    if (output.type === 'result' && output.preprocessed_player) {
+      solversFor(input.key, output.preprocessed_player);
+    }
+    return output;
+  }
+  const s = solversFor(input.key, input.preprocessed_player);
+  return runSolvers(s, input.requests);
 }
 
 async function readAll(conn) {
@@ -90,5 +120,5 @@ async function handle(conn) {
   Deno.exit(0);
 })();
 
-const listener = Deno.listen({ transport: 'unix', path: Deno.args[0] });
+const listener = Deno.listen({ transport: 'unix', path: sockPath });
 for await (const conn of listener) await handle(conn);

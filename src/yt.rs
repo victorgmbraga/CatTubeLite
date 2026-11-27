@@ -328,22 +328,32 @@ fn prune_image_cache_with_age(
 
 static TOOLS_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolsStatus {
+    pub version: String,
+    pub updated: bool,
+}
+
 /// Make sure yt-dlp (and a JavaScript runtime for it) are there, and keep
-/// yt-dlp up to date. Returns a line for Settings.
-pub fn ensure_tools(data: &Path) -> Result<String, String> {
+/// yt-dlp up to date. Returns a line for Settings and whether anything changed.
+pub fn ensure_tools(data: &Path) -> Result<ToolsStatus, String> {
     ensure_tools_inner(data, false)
 }
 
 /// Update yt-dlp now (Settings).
-pub fn update_tools(data: &Path) -> Result<String, String> {
+pub fn update_tools(data: &Path) -> Result<ToolsStatus, String> {
     ensure_tools_inner(data, true)
 }
 
-fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String> {
+fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<ToolsStatus, String> {
     let _guard = TOOLS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _ = std::fs::create_dir_all(data);
     let ytdlp = player::yt_dlp_path(data);
     let checked = data.join("yt-dlp.checked");
+    let find = |n: &str| cattube_core::process::find_executable(n);
+    let before_ytdlp = yt_dlp_stamp(&ytdlp);
+    let before_deno = std::fs::read_to_string(data.join(DENO_SHA256)).ok();
+    let before_js = player::js_runtime(data, &find);
     if !ytdlp.is_file() {
         let tmp = cattube_core::util::unique_tmp_path(&ytdlp, "part");
         if let Err(e) = download_verified(
@@ -370,7 +380,6 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
         }
     }
     unpack_yt_dlp(data);
-    let find = |n: &str| cattube_core::process::find_executable(n);
     let own_deno = player::own_deno_path(data);
     let selected = player::js_runtime(data, &find);
     if selected.is_none() {
@@ -381,38 +390,194 @@ fn ensure_tools_inner(data: &Path, force_update: bool) -> Result<String, String>
     } else if selected.as_deref() == Some(format!("deno:{}", own_deno.display()).as_str()) {
         refresh_deno(data, force_update);
     }
-    Ok(ytdlp_version(data))
+    let after_ytdlp = yt_dlp_stamp(&ytdlp);
+    let after_deno = std::fs::read_to_string(data.join(DENO_SHA256)).ok();
+    let after_js = player::js_runtime(data, &find);
+    let updated = before_ytdlp != after_ytdlp || before_deno != after_deno || before_js != after_js;
+    Ok(ToolsStatus {
+        version: ytdlp_version(data),
+        updated,
+    })
+}
+
+/// Handle for the resident `yt-dlp` process (`ytdl-server.py`), keeping its
+/// stdin pipe open so dropping/stopping asks it to exit cleanly and unlink
+/// its socket files before falling back to `kill`.
+pub struct YtdlServer {
+    child: Option<std::process::Child>,
+    stdin: Option<std::process::ChildStdin>,
+    socket: PathBuf,
+}
+
+impl YtdlServer {
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
+        // Closing stdin signals EOF to serve(), running its finally cleanup.
+        drop(self.stdin.take());
+        if let Some(mut child) = self.child.take() {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let mut exited = false;
+            while Instant::now() < deadline {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => {
+                        exited = true;
+                        break;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+                }
+            }
+            if !exited {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        if std::os::unix::net::UnixStream::connect(&self.socket).is_err() {
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+}
+
+impl Drop for YtdlServer {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
 }
 
 /// Start (or restart, after yt-dlp changed) the yt-dlp that stays loaded
 /// between videos (see [`player::ytdl_server_argv`]). It ends by itself
 /// when CatTube does. `CATTUBE_YTDL_RESIDENT=0` turns it off.
-pub fn start_ytdl_server(
-    data: &Path,
-    old: Option<std::process::Child>,
-) -> Option<std::process::Child> {
-    if let Some(mut c) = old {
-        let _ = c.kill();
-        let _ = c.wait();
+pub fn start_ytdl_server(data: &Path, old: Option<YtdlServer>) -> Option<YtdlServer> {
+    if let Some(old) = old {
+        old.stop();
     }
+    let socket = player::ytdl_server_socket();
     if std::env::var("CATTUBE_YTDL_RESIDENT").is_ok_and(|v| v == "0") {
+        if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            let _ = std::fs::remove_file(&socket);
+        }
         return None;
     }
     let find = |n: &str| cattube_core::process::find_executable(n);
     let js = player::js_runtime(data, &find);
-    let argv = player::ytdl_server_argv(
-        data,
-        &cattube_core::env::data_dir(),
-        &player::ytdl_server_socket(),
-        js.as_deref(),
-    )?;
-    std::process::Command::new(&argv[0])
+    let argv =
+        player::ytdl_server_argv(data, &cattube_core::env::data_dir(), &socket, js.as_deref())?;
+    let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(|e| eprintln!("cattube: resident yt-dlp: {e}"))
+        .ok()?;
+    let stdin = child.stdin.take();
+    Some(YtdlServer {
+        child: Some(child),
+        stdin,
+        socket,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEarlyError {
+    Fallback,
+    BrokenPipe,
+}
+
+fn build_ytdl_stream_request(args: &[String], cwd: &str) -> String {
+    let args_json: Vec<String> = args.iter().map(|a| mpv::json_string(a)).collect();
+    format!(
+        "{{\"mode\":\"stream\",\"args\":[{}],\"cwd\":{}}}\n",
+        args_json.join(","),
+        mpv::json_string(cwd)
+    )
+}
+
+fn run_ytdl_stream<R: std::io::Read>(
+    stream: &mut R,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> Result<i32, StreamEarlyError> {
+    const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+    let mut received_any = false;
+    let mut hdr = [0u8; 5];
+    let mut buf = Vec::new();
+    loop {
+        if stream.read_exact(&mut hdr).is_err() {
+            return Err(if received_any {
+                StreamEarlyError::BrokenPipe
+            } else {
+                StreamEarlyError::Fallback
+            });
+        }
+        received_any = true;
+        let tag = hdr[0];
+        let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(StreamEarlyError::BrokenPipe);
+        }
+        buf.resize(len, 0);
+        if len > 0 && stream.read_exact(&mut buf).is_err() {
+            return Err(StreamEarlyError::BrokenPipe);
+        }
+        match tag {
+            1 => {
+                let _ = out.write_all(&buf);
+                let _ = out.flush();
+            }
+            2 => {
+                let _ = err.write_all(&buf);
+                let _ = err.flush();
+            }
+            3 => {
+                if len != 4 {
+                    return Err(StreamEarlyError::BrokenPipe);
+                }
+                return Ok(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]));
+            }
+            _ => return Err(StreamEarlyError::BrokenPipe),
+        }
+    }
+}
+
+fn exec_python_ytdlp(ytdlp_dir: &str, args: &[String]) -> ! {
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new("python3")
+        .arg(ytdlp_dir)
+        .args(args)
+        .exec();
+    eprintln!("cattube: yt-dlp: {err}");
+    std::process::exit(127);
+}
+
+/// Run yt-dlp via the resident server's framed `stream` protocol, falling back
+/// directly to `python3 <ytdlp_dir>` if the server is unavailable or fails
+/// before sending any frame.
+pub fn ytdl_run(socket: &Path, ytdlp_dir: &str, args: &[String]) -> ! {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        exec_python_ytdlp(ytdlp_dir, args);
+    };
+    let cwd = std::env::current_dir()
         .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_string());
+    let req = build_ytdl_stream_request(args, &cwd);
+    if req.len() >= (1 << 20)
+        || stream.write_all(req.as_bytes()).is_err()
+        || stream.flush().is_err()
+    {
+        exec_python_ytdlp(ytdlp_dir, args);
+    }
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    match run_ytdl_stream(&mut stream, &mut out, &mut err) {
+        Ok(code) => std::process::exit(code),
+        Err(StreamEarlyError::Fallback) => exec_python_ytdlp(ytdlp_dir, args),
+        Err(StreamEarlyError::BrokenPipe) => std::process::exit(1),
+    }
 }
 
 /// Which single-file yt-dlp an unpacked copy came from (kept in it).
@@ -858,6 +1023,9 @@ pub fn start_player(o: &PlayOptions, data: &Path) -> Result<PlayerHandle, String
     let mut cmd = std::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).stdin(std::process::Stdio::null());
     // mpv's yt-dlp launcher asks the resident yt-dlp when its socket is up.
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env(player::YTDL_BIN_ENV, exe);
+    }
     cmd.env(
         player::YTDL_SERVER_ENV,
         player::ytdl_server_script(&cattube_core::env::data_dir()),
@@ -2317,6 +2485,97 @@ mod player_tests {
             .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
             .collect();
         assert!(parts.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn ytdl_stream_protocol_reads_frames_and_falls_back_on_early_eof() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let req = build_ytdl_stream_request(&["-J".into(), "a\"b".into()], "/tmp/w");
+        assert_eq!(
+            req,
+            "{\"mode\":\"stream\",\"args\":[\"-J\",\"a\\\"b\"],\"cwd\":\"/tmp/w\"}\n"
+        );
+
+        let (mut a, mut b) = UnixStream::pair().unwrap();
+        let frame = |tag: u8, payload: &[u8]| -> Vec<u8> {
+            let mut v = Vec::with_capacity(5 + payload.len());
+            v.push(tag);
+            v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            v.extend_from_slice(payload);
+            v
+        };
+        let writer = std::thread::spawn(move || {
+            b.write_all(&frame(1, b"hello ")).unwrap();
+            b.write_all(&frame(2, b"warn\n")).unwrap();
+            b.write_all(&frame(1, b"world")).unwrap();
+            b.write_all(&frame(3, &42i32.to_be_bytes())).unwrap();
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_ytdl_stream(&mut a, &mut out, &mut err).unwrap();
+        writer.join().unwrap();
+        assert_eq!(code, 42);
+        assert_eq!(out, b"hello world");
+        assert_eq!(err, b"warn\n");
+
+        // Closing immediately before any frame asks caller to fall back.
+        let (mut a2, b2) = UnixStream::pair().unwrap();
+        drop(b2);
+        let (mut out2, mut err2) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run_ytdl_stream(&mut a2, &mut out2, &mut err2),
+            Err(StreamEarlyError::Fallback)
+        );
+
+        // Closing mid-stream after receiving a frame is an error, not fallback.
+        let (mut a3, mut b3) = UnixStream::pair().unwrap();
+        b3.write_all(&frame(1, b"partial")).unwrap();
+        drop(b3);
+        assert_eq!(
+            run_ytdl_stream(&mut a3, &mut out2, &mut err2),
+            Err(StreamEarlyError::BrokenPipe)
+        );
+    }
+
+    #[test]
+    fn ytdl_server_stops_cleanly_on_stdin_eof_and_cleans_socket() {
+        let root = PathBuf::from(format!("/tmp/ct-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let sock = root.join("srv.sock");
+        let marker = root.join("clean");
+        let py = concat!(
+            "import os,select,socket,sys\n",
+            "s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)\n",
+            "s.bind(sys.argv[1]); s.listen(1)\n",
+            "while True:\n",
+            "  r,_,_=select.select([0,s],[],[],5)\n",
+            "  if 0 in r and not os.read(0,64): break\n",
+            "open(sys.argv[2],'w').write('ok')\n",
+            "os.unlink(sys.argv[1])\n",
+        );
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", py, &sock.to_string_lossy(), &marker.to_string_lossy()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let srv = YtdlServer {
+            child: Some(child),
+            stdin,
+            socket: sock.clone(),
+        };
+        let t0 = Instant::now();
+        while !sock.exists() && t0.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sock.exists());
+        srv.stop();
+        assert!(marker.is_file());
+        assert!(!sock.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

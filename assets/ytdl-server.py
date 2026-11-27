@@ -19,8 +19,10 @@ switched off), and runs each request in a fork of the loaded process.
 import array
 import json
 import os
+import select
 import signal
 import socket
+import stat
 import struct
 import sys
 
@@ -33,13 +35,32 @@ def fallback(ytdlp_dir, args):
     os.execvp("python3", ["python3", ytdlp_dir, *args])
 
 
+def _write_private_file(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
 def recv_request(conn):
     fds = array.array("i")
     data, anc, _flags, _addr = conn.recvmsg(MAX_REQUEST, socket.CMSG_LEN(3 * fds.itemsize))
     for level, kind, payload in anc:
         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
             fds.frombytes(payload[: len(payload) - (len(payload) % fds.itemsize)])
-    return json.loads(data), list(fds)
+    if fds:
+        return json.loads(data), list(fds)
+    buf = bytearray(data)
+    while b"\n" not in buf:
+        if len(buf) >= MAX_REQUEST:
+            raise ValueError("request too long")
+        part = conn.recv(min(4096, MAX_REQUEST - len(buf)))
+        if not part:
+            break
+        buf += part
+    line = bytes(buf).split(b"\n", 1)[0]
+    if not line:
+        raise ValueError("empty request")
+    return json.loads(line), []
 
 
 def run(sock_path, ytdlp_dir, args):
@@ -77,7 +98,7 @@ def prune_players(cache_dir):
 
 
 class _Stdin(str):
-    """yt-dlp's Deno script, carrying the request for the resident Deno."""
+    """Lazy yt-dlp Deno stdin: avoids building the ~4 MB JS payload unless fallback is needed."""
 
     data = None
 
@@ -95,9 +116,7 @@ def jsc_request(sock_path, data):
     finally:
         s.close()
     text = out.decode()
-    if json.loads(text).get("type") != "result":
-        raise OSError(text[:300])
-    return text
+    return text, json.loads(text)
 
 
 def start_jsc(deno, sock_path):
@@ -107,15 +126,18 @@ def start_jsc(deno, sock_path):
     try:
         import yt_dlp_ejs.yt.solver as ejs_solver
         from yt_dlp.extractor.youtube.jsc._builtin import deno as deno_jcp
-        from yt_dlp.extractor.youtube.jsc._builtin import ejs
     except ImportError:
         return None
     here = os.path.dirname(os.path.abspath(__file__))
     with open(os.path.join(here, "ytdl-jsc.js"), encoding="utf-8") as f:
         daemon = f.read()
+    lib_path = sock_path + ".lib.js"
     script = sock_path + ".js"
-    with open(script, "w", encoding="utf-8") as f:
-        f.write(f"{ejs_solver.lib()}\nObject.assign(globalThis, lib);\n{ejs_solver.core()}\n{daemon}")
+    _write_private_file(
+        lib_path,
+        f"{ejs_solver.lib()}\nObject.assign(globalThis, lib);\n{ejs_solver.core()}\nglobalThis.__cattube_jsc = jsc;\n",
+    )
+    _write_private_file(script, daemon)
     try:
         os.unlink(sock_path)
     except FileNotFoundError:
@@ -123,33 +145,70 @@ def start_jsc(deno, sock_path):
     import subprocess
 
     proc = subprocess.Popen(
-        [deno, "run", "--no-prompt", "--no-remote", "--no-npm", "--no-lock", "--no-config", "--cached-only",
-         f"--allow-read={sock_path}", f"--allow-write={sock_path}", f"--allow-net=unix:{sock_path}",
-         script, sock_path],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+        [
+            deno, "run", "--no-prompt", "--no-remote", "--no-npm", "--no-lock",
+            "--no-config", "--cached-only",
+            f"--allow-read={sock_path},{lib_path}",
+            f"--allow-write={sock_path}",
+            f"--allow-net=unix:{sock_path}",
+            script, sock_path, lib_path,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+    )
 
-    orig_construct = ejs.EJSBaseJCP._construct_stdin
+    orig_construct = deno_jcp.DenoJCP._construct_stdin
     orig_run = deno_jcp.DenoJCP._run_js_runtime
 
     def construct(self, player, preprocessed, requests, /):
-        out = _Stdin(orig_construct(self, player, preprocessed, requests))
+        out = _Stdin(" ")
         reqs = [{"type": r.type.value, "challenges": r.input.challenges} for r in requests]
-        out.data = {"key": requests[0].input.player_url if requests else "",
-                    "type": "preprocessed", "preprocessed_player": player, "requests": reqs} if preprocessed else {
-                    "key": requests[0].input.player_url if requests else "",
-                    "type": "player", "player": player, "requests": reqs, "output_preprocessed": True}
+        key = requests[0].input.player_url if requests else ""
+        out.data = (self, player, preprocessed, requests, key, reqs)
         return out
 
     def run_js(self, stdin, /):
-        data = getattr(stdin, "data", None)
-        if data is not None and os.path.exists(sock_path):
+        lazy = getattr(stdin, "data", None)
+        if lazy is None:
+            return orig_run(self, stdin)
+        owner, player, preprocessed, requests, key, reqs = lazy
+        if os.path.exists(sock_path):
             try:
-                return jsc_request(sock_path, data)
+                if key:
+                    text, parsed = jsc_request(
+                        sock_path,
+                        {"type": "cached", "key": key, "requests": reqs},
+                    )
+                    if parsed.get("type") == "result":
+                        return text
+                    if parsed.get("type") != "miss":
+                        raise OSError(text[:300])
+                payload = (
+                    {
+                        "key": key,
+                        "type": "preprocessed",
+                        "preprocessed_player": player,
+                        "requests": reqs,
+                    }
+                    if preprocessed
+                    else {
+                        "key": key,
+                        "type": "player",
+                        "player": player,
+                        "requests": reqs,
+                        "output_preprocessed": True,
+                    }
+                )
+                text, parsed = jsc_request(sock_path, payload)
+                if parsed.get("type") == "result":
+                    return text
+                raise OSError(text[:300])
             except (OSError, ValueError) as e:
                 self.logger.debug(f"resident deno failed ({e}); running deno")
-        return orig_run(self, stdin)
+        real_stdin = orig_construct(owner, player, preprocessed, requests)
+        return orig_run(self, real_stdin)
 
-    ejs.EJSBaseJCP._construct_stdin = construct
+    deno_jcp.DenoJCP._construct_stdin = construct
     deno_jcp.DenoJCP._run_js_runtime = run_js
     return proc
 
@@ -178,6 +237,12 @@ def serve(sock_path, ytdlp_dir, deno=None):
     except Exception:
         cache_dir = None
 
+    watch_stdin = False
+    try:
+        watch_stdin = stat.S_ISFIFO(os.fstat(0).st_mode)
+    except OSError:
+        pass
+
     parent = os.getppid()
     try:
         os.unlink(sock_path)
@@ -187,25 +252,66 @@ def serve(sock_path, ytdlp_dir, deno=None):
     srv.bind(sock_path)
     os.chmod(sock_path, 0o600)
     srv.listen(8)
-    srv.settimeout(5)
+    srv.setblocking(False)
     signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # no zombies
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         while os.getppid() == parent:
+            read_fds = [srv]
+            if watch_stdin:
+                read_fds.append(0)
+            try:
+                ready, _, _ = select.select(read_fds, [], [], 5.0)
+            except InterruptedError:
+                continue
+            if watch_stdin and 0 in ready:
+                try:
+                    if not os.read(0, 64):
+                        break
+                except OSError:
+                    break
+            if srv not in ready:
+                continue
             try:
                 conn, _ = srv.accept()
-            except socket.timeout:
+            except BlockingIOError:
                 continue
             if cache_dir:
                 prune_players(cache_dir)
             if os.fork() == 0:
                 srv.close()
+                if jsc_proc and jsc_proc.stdin:
+                    try:
+                        jsc_proc.stdin.close()
+                    except OSError:
+                        pass
+                if watch_stdin:
+                    try:
+                        devnull = os.open(os.devnull, os.O_RDONLY)
+                        if devnull != 0:
+                            os.dup2(devnull, 0)
+                            os.close(devnull)
+                    except OSError:
+                        pass
                 handle(conn)  # never returns
             conn.close()
     finally:
         if jsc_proc:
-            jsc_proc.kill()
-        for p in (sock_path, sock_path + ".jsc", sock_path + ".jsc.js"):
+            try:
+                if jsc_proc.stdin:
+                    jsc_proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                jsc_proc.terminate()
+                jsc_proc.wait(timeout=1)
+            except Exception:  # noqa: BLE001
+                try:
+                    jsc_proc.kill()
+                    jsc_proc.wait(timeout=1)
+                except Exception:  # noqa: BLE001
+                    pass
+        for p in (sock_path, sock_path + ".jsc", sock_path + ".jsc.js", sock_path + ".jsc.lib.js"):
             try:
                 os.unlink(p)
             except OSError:
@@ -254,13 +360,140 @@ def limit_caption_translations(args):
     _video.traverse_obj = traverse_obj
 
 
+def _exit_code_from_waitstatus(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
+
+
+def handle_stream(conn, req):
+    args = req.get("args")
+    if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+        raise ValueError("invalid args")
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    pid = os.fork()
+    if pid == 0:
+        conn.close()
+        os.close(out_r)
+        os.close(err_r)
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        if devnull != 0:
+            os.dup2(devnull, 0)
+            os.close(devnull)
+        os.dup2(out_w, 1)
+        os.dup2(err_w, 2)
+        os.close(out_w)
+        os.close(err_w)
+        os.chdir(req.get("cwd") or "/")
+        sys.argv = ["yt-dlp", *args]
+        import yt_dlp
+
+        try:
+            limit_caption_translations(args)
+        except Exception:  # noqa: BLE001
+            pass
+        code = 1
+        try:
+            yt_dlp.main()
+            code = 0
+        except SystemExit as e:
+            code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        except BaseException as e:  # noqa: BLE001
+            print(f"ytdl-server: {e!r}", file=sys.stderr)
+            code = 1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
+
+    os.close(out_w)
+    os.close(err_w)
+    os.set_blocking(out_r, False)
+    os.set_blocking(err_r, False)
+
+    def kill_child(*_args):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, kill_child)
+    client_alive = True
+    try:
+        while out_r is not None or err_r is not None:
+            watch = [fd for fd in (out_r, err_r) if fd is not None]
+            if client_alive:
+                watch.append(conn)
+            try:
+                ready, _, _ = select.select(watch, [], [])
+            except InterruptedError:
+                continue
+            if client_alive and conn in ready:
+                try:
+                    if not conn.recv(64):
+                        client_alive = False
+                        kill_child()
+                        break
+                except OSError:
+                    client_alive = False
+                    kill_child()
+                    break
+            for fd, tag in ((out_r, 1), (err_r, 2)):
+                if fd is not None and fd in ready:
+                    try:
+                        chunk = os.read(fd, 16384)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        os.close(fd)
+                        if tag == 1:
+                            out_r = None
+                        else:
+                            err_r = None
+                    else:
+                        try:
+                            conn.sendall(struct.pack("!BI", tag, len(chunk)) + chunk)
+                        except OSError:
+                            client_alive = False
+                            kill_child()
+                            break
+            if not client_alive:
+                break
+    finally:
+        for fd in (out_r, err_r):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        _, status = os.waitpid(pid, 0)
+        code = _exit_code_from_waitstatus(status)
+        if client_alive:
+            try:
+                conn.sendall(struct.pack("!BI", 3, 4) + struct.pack("!i", code))
+            except OSError:
+                pass
+
+
 def handle(conn):
     code = 1
+    legacy_mode = False
     try:
+        conn.setblocking(True)
         conn.settimeout(None)
         req, fds = recv_request(conn)
+        if not fds and req.get("mode") == "stream":
+            handle_stream(conn, req)
+            os._exit(0)
         if len(fds) != 3:
             raise ValueError("expected stdin, stdout and stderr")
+        legacy_mode = True
         for fd, target in zip(fds, (0, 1, 2)):
             os.dup2(fd, target)
             os.close(fd)
@@ -296,12 +529,18 @@ def handle(conn):
         sys.stdout.flush()
         sys.stderr.flush()
     except BaseException as e:  # noqa: BLE001
+        if legacy_mode:
+            try:
+                os.write(2, f"ytdl-server: {e!r}\n".encode())
+            except OSError:
+                pass
+    if legacy_mode:
         try:
-            os.write(2, f"ytdl-server: {e!r}\n".encode())
+            conn.sendall(struct.pack("!i", code))
         except OSError:
             pass
     try:
-        conn.sendall(struct.pack("!i", code))
+        conn.close()
     except OSError:
         pass
     os._exit(0)
