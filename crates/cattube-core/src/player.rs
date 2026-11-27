@@ -480,6 +480,7 @@ pub struct PlayOptions {
     pub buffer_mib: u32,
     pub video_id: String,
     pub title: String,
+    pub is_live: bool,
     pub start: f64,
     pub max_height: u32,
     pub codec: Codec,
@@ -556,11 +557,39 @@ pub fn mpv_argv(
     socket: &Path,
     js: Option<&str>,
 ) -> Vec<String> {
+    mpv_argv_inner(o, data, ui, socket, js, false)
+}
+
+/// mpv's command line for parallel direct-stream startup: opens in `--idle=yes`
+/// without invoking `ytdl_hook` so stream resolution can run concurrently while
+/// mpv initializes its window and audio/video outputs.
+pub fn mpv_argv_idle(
+    o: &PlayOptions,
+    data: &Path,
+    ui: &Path,
+    socket: &Path,
+    js: Option<&str>,
+) -> Vec<String> {
+    mpv_argv_inner(o, data, ui, socket, js, true)
+}
+
+fn mpv_argv_inner(
+    o: &PlayOptions,
+    data: &Path,
+    ui: &Path,
+    socket: &Path,
+    js: Option<&str>,
+    idle_direct: bool,
+) -> Vec<String> {
     let mut v: Vec<String> = [
         "mpv",
         "--fullscreen",
         "--force-window=immediate",
-        "--idle=no",
+        if idle_direct {
+            "--idle=yes"
+        } else {
+            "--idle=no"
+        },
         "--keep-open=no",
         // CatTube keeps its own places; a system mpv.conf that saves and
         // restores them (volume too) would fight the start time.
@@ -586,6 +615,9 @@ pub fn mpv_argv(
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if idle_direct {
+        v.push("--ytdl=no".into());
+    }
     if o.low_power {
         v.extend(
             [
@@ -639,6 +671,14 @@ pub fn mpv_argv(
     if o.stats {
         opts.push("cattube_osd-stats=yes".into());
     }
+    if idle_direct {
+        if crate::youtube::is_video_id(&o.video_id) {
+            opts.push(format!("cattube_osd-video_id={}", o.video_id));
+        }
+        if o.is_live {
+            opts.push("cattube_osd-is_live=yes".into());
+        }
+    }
     opts.push(format!(
         "cattube_osd-position_dir={}",
         data.join("positions").display()
@@ -679,23 +719,25 @@ pub fn mpv_argv(
     });
     // Always normal speed, even when a user mpv.conf sets another.
     v.push("--speed=1".into());
-    let title: String = o
-        .title
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(120)
-        .collect();
-    // No title known: yt-dlp's (the video's own) shows.
-    if !title.trim().is_empty() {
-        v.push(format!("--force-media-title={title}"));
-    }
-    if o.start.is_finite() && o.start > 0.0 {
-        v.push(format!("--start={:.3}", o.start));
-    }
     v.push("--osd-duration=1500".into());
     v.push("--osd-bar-align-y=0.86".into());
-    v.push("--".into());
-    v.push(crate::youtube::watch_url(&o.video_id));
+    if !idle_direct {
+        let title: String = o
+            .title
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        // No title known: yt-dlp's (the video's own) shows.
+        if !title.trim().is_empty() {
+            v.push(format!("--force-media-title={title}"));
+        }
+        if o.start.is_finite() && o.start > 0.0 {
+            v.push(format!("--start={:.3}", o.start));
+        }
+        v.push("--".into());
+        v.push(crate::youtube::watch_url(&o.video_id));
+    }
     v
 }
 
@@ -1225,6 +1267,7 @@ mod tests {
             buffer_mib: 256,
             video_id: "WhWc3b3KhnY".into(),
             title: "Spring\n".into(),
+            is_live: false,
             start: 61.4,
             max_height: 2160,
             codec: Codec::Vp9,
@@ -1302,6 +1345,26 @@ mod tests {
             v2.iter()
                 .any(|a| a.starts_with("--ytdl-format=") && a.contains("[fps<=30]"))
         );
+
+        let mut live_opts = o2.clone();
+        live_opts.is_live = true;
+        live_opts.start = 15.0;
+        let idle = mpv_argv_idle(
+            &live_opts,
+            Path::new("/d"),
+            Path::new("/ui"),
+            Path::new("/run/s.sock"),
+            None,
+        );
+        assert!(idle.contains(&"--idle=yes".to_string()));
+        assert!(idle.contains(&"--ytdl=no".to_string()));
+        assert!(
+            idle.iter()
+                .any(|a| a.contains("cattube_osd-video_id=WhWc3b3KhnY"))
+        );
+        assert!(idle.iter().any(|a| a.contains("cattube_osd-is_live=yes")));
+        assert!(!idle.iter().any(|a| a.contains("youtube.com/watch")));
+        assert!(!idle.iter().any(|a| a.starts_with("--start=")));
     }
 
     #[test]

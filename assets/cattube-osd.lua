@@ -45,23 +45,32 @@ local options = require "mp.options"
 local assdraw = require "mp.assdraw"
 local utils = require "mp.utils"
 
-local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "", low_power = false, stats = false }
+local opts = { accent = "7c6cf0", subs = "", hide = "no", position_dir = "", low_power = false, stats = false, video_id = "", is_live = false }
 options.read_options(opts, "cattube_osd")
 
 -- The player owns its last position. Watcher/network delays cannot lose it.
-local current_video = ""
+local current_video = opts.video_id or ""
+local current_live = opts.is_live == true
+local function is_live()
+    return current_live or mp.get_property("metadata/by-key/ytdl_is_live", "") == "true"
+end
+local function sync_user_data()
+    mp.set_property("user-data/cattube/video-id", current_video)
+    mp.set_property("user-data/cattube/is-live", is_live() and "yes" or "no")
+end
+sync_user_data()
 local last_point = nil
 local saved_at = -10
 local function checkpoint(force, finished)
     if opts.position_dir == "" then return end
     -- A live stream has no place to come back to (mpv cannot seek a start
     -- into it): nothing is saved.
-    if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then return end
+    if is_live() then return end
     local at = mp.get_time()
     local min_gap = opts.low_power and 30 or 5
     if not force and at - saved_at < min_gap then return end
     local path = mp.get_property("path", "")
-    local id = path:match("[?&]v=([%w_-]+)") or path:match("youtu%.be/([%w_-]+)") or current_video
+    local id = (current_video ~= "" and current_video) or path:match("[?&]v=([%w_-]+)") or path:match("youtu%.be/([%w_-]+)") or ""
     if #id ~= 11 or id:find("[^%w_-]") then return end
     local pos = mp.get_property_number("time-pos")
     local dur = mp.get_property_number("duration", 0)
@@ -390,7 +399,7 @@ local function render()
     a:new_event()
     a:append("{\\an1\\pos(120,846)\\bord0\\shad0\\fs44\\b1\\1c&HFFFFFF&\\1a&H08&}" .. title_clean)
     -- When it ends, like a TV guide (a stream: that it is live).
-    if mp.get_property("metadata/by-key/ytdl_is_live", "") == "true" then
+    if is_live() then
         a:new_event()
         a:append("{\\an3\\pos(1800,846)\\bord0\\shad0\\fs28\\b1\\1c&H4444FF&\\1a&H00&}● LIVE")
     elseif dur > 0 then
@@ -1234,11 +1243,16 @@ mp.register_script_message("cattube-related-data", function(id, json, request)
     render()
 end)
 
-mp.register_script_message("cattube-video", function(id)
+mp.register_script_message("cattube-video", function(id, live)
     current_video = id or ""
+    current_live = (live == "yes" or live == "true")
+    sync_user_data()
     if related then related_close() end
 end)
 mp.register_event("file-loaded", function()
+    if current_video ~= "" then
+        mp.set_property("user-data/cattube/loaded", current_video)
+    end
     if related then related_close() end
 end)
 

@@ -12,6 +12,7 @@ pub mod osk;
 pub mod player;
 pub mod process;
 pub mod scan;
+pub mod stream;
 pub mod tube;
 pub mod util;
 pub mod watched;
